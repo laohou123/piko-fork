@@ -28,6 +28,21 @@ class MetaTubeScraper(
     override val providerId: String = PROVIDER_ID
     override val displayName: String = "MetaTube"
 
+    /**
+     * 探一下服务通不通：拿 MetaTube 自己的 `/v1/db/version` 试一次（与设置里「测试连接」同一个端点）。
+     * 通就返回 null；不通给出一句用户看得懂的原因，好区分「服务不通」与「这片子没有」。
+     */
+    override suspend fun probe(): String? {
+        val base = preferences.metaTubeUrlFlow.first().trim()
+        if (base.isEmpty()) return "设置里还没填 MetaTube 地址"
+        val client = MetaTubeClient(http, base, preferences.metaTubeTokenFlow.first())
+        return client.checkToken().exceptionOrNull()?.let { error ->
+            PikoLog.w(TAG, "MetaTube 探测失败：${error.message}")
+            // 只留说得清的那部分：地址、令牌或超时，够用户知道下一步查什么
+            error.message?.takeIf { it.isNotBlank() } ?: "连接失败"
+        }
+    }
+
     override suspend fun scrape(code: String): ScrapedMovie? {
         // 文件名认不出番号的作品（key 就是文件名）不可能搜到，直接跳过，不发无谓请求
         if (matchAvFile(code) == null) return null

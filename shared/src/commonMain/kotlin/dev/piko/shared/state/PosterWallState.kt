@@ -176,7 +176,7 @@ class PosterWallState(
             refresh()
             // 上一轮扫描有没刮到的作品（MetaTube 不通、查询失败）：进海报墙就补，
             // 不用等用户手动再扫一轮。没有待刮作品时 enrich 空转返回，不弹消息
-            enrich()
+            enrich(silent = true)
         }
     }
 
@@ -197,7 +197,7 @@ class PosterWallState(
             filterName = null
             refresh()
             // 换号后同样把没刮到的补上：新账号的库可能是旧版本扫的，一样会留着没封面的作品
-            enrich()
+            enrich(silent = true)
         }
     }
 
@@ -247,7 +247,7 @@ class PosterWallState(
                             store.setScanning(false)
                             workCount = store.workCount()
                             refresh()
-                            if (grouped.isNotEmpty()) enrich()
+                            if (grouped.isNotEmpty()) enrich(silent = true)
                         }
                     }
                 }
@@ -301,7 +301,7 @@ class PosterWallState(
      * 触发时机：扫描完成后、进海报墙（启动/换号）时、用户更换刮削源后——失败的作品
      * 在这些时机自动重试，不用用户手动干预。
      */
-    fun enrich() {
+    fun enrich(silent: Boolean = false) {
         val scraper = scraper
         if (scraper == null || enriching) return
         enrichJob?.cancel()
@@ -314,6 +314,15 @@ class PosterWallState(
                 enrichTotal = pending.size
                 // 没有待刮作品：静默返回，不打扰用户（启动与换源都会调到这里）
                 if (pending.isEmpty()) return@launch
+                // 先探一次源站：不通就别挨个刮了——八百部逐个超时要很久，且每一部都会被算成
+                // 「没刮到」，最后只能笼统报一句不可达，分不清是源站不通还是这片子源站里没有
+                val unreachable = scraper.probe()
+                if (unreachable != null) {
+                    PikoLog.w(TAG, "补刮前探测未通过：$unreachable，跳过这一轮（待刮 $enrichTotal 部）")
+                    // 自动补刮（启动、换号、扫完）不弹提示：没人在等这个结果，之后还会再试
+                    if (!silent) _messages.tryEmit("MetaTube 连不上：$unreachable")
+                    return@launch
+                }
                 for (code in pending) {
                     val movie = runCatching { scraper.scrape(code) }.getOrNull()
                     if (movie == null) {
@@ -340,14 +349,9 @@ class PosterWallState(
                     }
                     refresh()
                 }
+                // 源站已经探通了，剩下的失败就是「这部片子源站里没有」，不再说成不可达
                 _messages.tryEmit(
-                    when {
-                        // 一部都没刮到：多半是 MetaTube 地址不通或没配，说清楚下一步干嘛
-                        enrichDone == 0 && enrichFailed > 0 ->
-                            "MetaTube 暂时不可达：$enrichFailed 部没刮到。请检查设置里的 MetaTube 地址与令牌，之后会自动重试"
-                        else ->
-                            "元数据补刮完成：新刮到 $enrichDone 部" + (if (enrichFailed > 0) "，$enrichFailed 部没找到" else "")
-                    }
+                    "元数据补刮完成：新刮到 $enrichDone 部" + (if (enrichFailed > 0) "，$enrichFailed 部没找到" else "")
                 )
             } catch (e: CancellationException) {
                 throw e

@@ -58,7 +58,7 @@ Any provider that speaks `POST /chat/completions`: DeepSeek, OpenAI, Qwen, proxi
 
 Download from [Releases](../../releases/latest).
 
-- **Android**: `piko-0.5.2-universal.apk`, Android 8.0+, ~40 MB (three ABIs of libmpv)
+- **Android**: `piko-0.5.3-universal.apk`, Android 8.0+, ~40 MB (three ABIs of libmpv)
 - **Desktop**: build from source with the commands below
 
 > The APK is signed with this branch's own key. It uses a different package name than the official or debug builds, so both can coexist, but **data is not shared**.
@@ -83,8 +83,8 @@ export ANDROID_KEYSTORE_PATH=/path/to/release.jks
 export ANDROID_KEYSTORE_PASSWORD='<your-store-password>'
 export ANDROID_KEY_ALIAS='<your-key-alias>'
 export ANDROID_KEY_PASSWORD='<your-key-password>'
-export PIKO_VERSION_NAME=0.5.2
-export PIKO_VERSION_CODE=5002
+export PIKO_VERSION_NAME=0.5.3
+export PIKO_VERSION_CODE=5003
 ./gradlew :app:assembleRelease -Ppiko.enableAbiSplits=false
 ```
 

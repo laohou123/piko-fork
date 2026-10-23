@@ -56,4 +56,13 @@ interface LibraryScraper {
     val displayName: String
 
     suspend fun scrape(code: String): ScrapedMovie?
+
+    /**
+     * 刮之前先探一下源通不通：返回 null 表示能用，否则是一句说得清的原因（连不上、令牌不对等）。
+     * 默认给 null（不作探测的实现照旧直接刮）。
+     *
+     * 有它才分得清「源站连不上」与「这片子源站里没有」：以前两者都算 scrape 返回 null，
+     * 挨个刮完八百部全空就笼统报一句「暂时不可达」，明明源站是好的。
+     */
+    suspend fun probe(): String? = null
 }
