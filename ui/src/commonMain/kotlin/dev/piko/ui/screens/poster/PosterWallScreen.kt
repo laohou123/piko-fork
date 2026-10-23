@@ -72,6 +72,8 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextOverflow
@@ -139,7 +141,6 @@ fun PosterWallScreen(
     var showScrapeDialog by remember { mutableStateOf(false) }
     var showFolderPicker by remember { mutableStateOf(false) }
     var showFilterSheet by remember { mutableStateOf(false) }
-    var searchActive by remember { mutableStateOf(false) }
 
     LaunchedEffect(state) {
         state.messages.collect { snackbarHostState.showSnackbar(it, withDismissAction = true) }
@@ -152,7 +153,7 @@ fun PosterWallScreen(
                 title = "海报墙",
                 onBackClick = onBackClick,
                 actions = listOf(
-                    iconBarItem(Icons.Outlined.Search, "搜索影片", onClick = { searchActive = true }, priority = 2),
+                    iconBarItem(Icons.Outlined.Search, "搜索影片", onClick = { state.setSearchOpen(true) }, priority = 2),
                     iconBarItem(Icons.Outlined.FolderOpen, "扫描目录", onClick = { showScrapeDialog = true }, priority = 1),
                     iconBarItem(Icons.Outlined.AutoAwesome, "补刮元数据", priority = 1, enabled = !state.enriching, onClick = { state.enrich() }),
                     iconBarItem(Icons.Outlined.Refresh, "重新扫描", priority = 0, enabled = state.phase != PosterWallState.Phase.SCANNING, onClick = { state.startScan() }),
@@ -176,14 +177,12 @@ fun PosterWallScreen(
         },
     ) { padding ->
         Column(modifier = Modifier.fillMaxSize().padding(padding)) {
-            if (searchActive) {
+            // 展开状态存在 state 里：点进作品详情再返回，搜索框还在原来的样子
+            if (state.searchActive) {
                 SearchBar(
                     query = state.query,
                     onQueryChange = state::updateQuery,
-                    onClose = {
-                        searchActive = false
-                        state.updateQuery("")
-                    },
+                    onClose = { state.setSearchOpen(false) },
                 )
             }
             // 筛选行固定在顶部；目录与进度放在网格里，跟着列表一起滚走（参考图的行为）
@@ -512,9 +511,14 @@ private fun SearchBar(
         withFrameNanos { }
         runCatching { focusRequester.requestFocus() }
     }
+    // 光标跟着输入框走而不是留在开头：搜索框收起再展开、或从详情页返回时组件重建，
+    // 值还在而内部的光标位置丢了，直接敲字会插到已有文字的最前面
+    var field by remember(query) {
+        mutableStateOf(TextFieldValue(query, selection = TextRange(query.length)))
+    }
     OutlinedTextField(
-        value = query,
-        onValueChange = onQueryChange,
+        value = field,
+        onValueChange = { field = it; onQueryChange(it.text) },
         singleLine = true,
         placeholder = { Text("搜索番号、标题、女优或标签") },
         leadingIcon = { Icon(Icons.Outlined.Search, contentDescription = null) },

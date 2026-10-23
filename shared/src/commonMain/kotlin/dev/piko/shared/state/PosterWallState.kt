@@ -80,6 +80,20 @@ class PosterWallState(
         private set
 
     /**
+     * 搜索框是否展开。放在 state 里而不是界面的 remember：海报墙是底部导航的一页，
+     * 点进作品详情再返回时这一页会重新组合，remember 的值会丢，搜索框就自己收起来了。
+     */
+    var searchActive by mutableStateOf(false)
+        private set
+
+    // 不叫 setSearchActive：var searchActive 的属性 setter 会生成同 JVM 签名的方法，撞名
+    fun setSearchOpen(active: Boolean) {
+        searchActive = active
+        // 收起搜索就把词清掉：留下一个看不见的词，列表还按它过滤，摸不着头脑
+        if (!active && query.isNotEmpty()) updateQuery("")
+    }
+
+    /**
      * 海报墙的滚动位置（首项下标与像素偏移）。
      *
      * 故意**不是** Compose 的 mutableStateOf：界面只在首次组合时读一次作为初始值，
