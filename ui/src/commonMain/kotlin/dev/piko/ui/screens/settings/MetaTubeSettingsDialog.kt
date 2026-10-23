@@ -47,7 +47,7 @@ internal fun MetaTubeSettingsDialog(
     SettingsInputDialog(
         icon = Icons.Outlined.TravelExplore,
         title = "MetaTube",
-        description = "按番号命名时从自建的 MetaTube 服务获取片名。地址留空即不使用。",
+        description = "海报墙的封面、截图与元数据都从这里取；按番号命名时也用它查片名。地址留空则海报墙没有封面。",
         onSave = { onSave(trimmedUrl, token.trim()) },
         saveEnabled = !urlInvalid,
         onDismiss = onDismiss,

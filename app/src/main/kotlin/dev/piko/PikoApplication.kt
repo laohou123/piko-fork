@@ -6,6 +6,7 @@ import android.util.Log
 import coil3.ImageLoader
 import coil3.PlatformContext
 import coil3.SingletonImageLoader
+import coil3.disk.DiskCache
 import coil3.network.okhttp.OkHttpNetworkFetcherFactory
 import dev.piko.data.auth.AndroidPikoSessionStore
 import dev.piko.data.auth.SessionManager
@@ -13,16 +14,21 @@ import dev.piko.data.repository.DriveRepository
 import dev.piko.download.AndroidPikoDownloadStorage
 import dev.piko.download.AndroidPikoSegmentDownloader
 import dev.piko.download.WorkResultNotifier
+import dev.piko.library.AndroidLibraryDriverFactory
+import dev.piko.library.AndroidSubtitleFileSaver
 import dev.piko.platform.AndroidPikoPlatform
 import dev.piko.platform.followSystemAnimatorScale
 import dev.piko.shared.data.FilePikoCacheStore
+import dev.piko.shared.library.SubtitleCatSource
 import dev.piko.shared.sync.JvmSyncCipher
 import dev.piko.shared.scrape.MetaTubeService
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.okhttp.OkHttp
+import io.ktor.client.plugins.HttpTimeout
 import dev.piko.shared.data.InstantMagnetRepository
 import dev.piko.shared.data.PikoClientManager
 import java.io.File
+import okio.Path.Companion.toOkioPath
 import dev.piko.shared.download.PikoDownloadCoordinator
 import dev.piko.shared.log.LogLevel
 import dev.piko.shared.log.PikoLog
@@ -100,6 +106,30 @@ class PikoApplication : Application(), SingletonImageLoader.Factory {
             cacheStore = FilePikoCacheStore(File(cacheDir, "piko").path),
             syncCipher = JvmSyncCipher(),
             metaTube = MetaTubeService(sessionManager) { HttpClient(OkHttp) },
+            // 海报墙与刮削字幕：索引库按账号各一个 SQLite，刮削/字幕源共用一个客户端工厂。
+            // 带超时：源站不通时快速失败回 null，补刮计数为「没找到」，而不是无限期挂住
+            libraryDriverFactory = AndroidLibraryDriverFactory(this),
+            scrapeHttpClientFactory = {
+                HttpClient(OkHttp) {
+                    install(HttpTimeout) {
+                        requestTimeoutMillis = 30_000
+                        connectTimeoutMillis = 15_000
+                        socketTimeoutMillis = 30_000
+                    }
+                }
+            },
+            subtitleSourceFactory = { http -> SubtitleCatSource(http) },
+            translationHttpClientFactory = {
+                // 翻译一次要几十秒，超时按分钟级给；真正的单批上限在 TranslationClient 里控
+                HttpClient(OkHttp) {
+                    install(HttpTimeout) {
+                        requestTimeoutMillis = 120_000
+                        connectTimeoutMillis = 15_000
+                        socketTimeoutMillis = 120_000
+                    }
+                }
+            },
+            subtitleSaver = AndroidSubtitleFileSaver(this),
         )
         val motionScale = PikoMotionScale().apply { followSystemAnimatorScale(this@PikoApplication) }
         appScope.launch { sessionManager.reduceMotionFlow.collect { motionScale.appReduced = it } }
@@ -157,6 +187,15 @@ class PikoApplication : Application(), SingletonImageLoader.Factory {
         return ImageLoader.Builder(context)
             .components {
                 add(OkHttpNetworkFetcherFactory(callFactory = { okHttpClient }))
+            }
+            // 海报墙的封面与截图走 MetaTube 代理，每张都要服务端现取；落到磁盘后
+            // 第二次打开直接读本地，不进网络。放 cacheDir（系统空间紧张时可回收），
+            // 上限 200MB——按每部约 10 张 × 40KB 算，够存数千部。
+            .diskCache {
+                DiskCache.Builder()
+                    .directory(context.cacheDir.resolve("image_cache").toOkioPath())
+                    .maxSizeBytes(200L * 1024 * 1024)
+                    .build()
             }
             .build()
     }

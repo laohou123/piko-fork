@@ -21,6 +21,8 @@ import dev.piko.ui.workbench.AccountSettings
 import dev.piko.ui.screens.drive.SectionLabel
 import dev.piko.ui.screens.drive.icon
 import dev.piko.ui.screens.drive.selectedIcon
+import dev.piko.ui.screens.poster.PosterWallScreen
+import dev.piko.ui.screens.poster.WorkDetailScreen
 import dev.piko.shared.data.isPikoInternalFolder
 import dev.piko.shared.data.PikoDriveRepository
 import dev.piko.shared.data.DriveLibrary
@@ -32,6 +34,7 @@ import dev.piko.ui.components.LocalPaletteRegistry
 import dev.piko.ui.components.LocalShowExtensions
 import dev.piko.ui.components.PaletteRegistry
 import dev.piko.ui.components.PaletteItem
+import dev.piko.ui.components.PikoEmptyState
 import dev.piko.ui.components.CommandPalette
 import androidx.compose.material.icons.outlined.Settings
 import androidx.compose.material.icons.outlined.Delete
@@ -54,6 +57,7 @@ import dev.piko.ui.screens.drive.SidebarWidth
 import dev.piko.ui.screens.drive.SidebarItem
 import dev.piko.ui.screens.drive.QuickAccessSection
 import dev.piko.shared.state.QuickAccessState
+import dev.piko.shared.state.PosterWallState
 import androidx.compose.material3.adaptive.navigationsuite.NavigationSuiteType
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.ScrollState
@@ -80,9 +84,11 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.GridOn
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.SyncAlt
 import androidx.compose.material.icons.outlined.Folder
+import androidx.compose.material.icons.outlined.GridOn
 import androidx.compose.material.icons.outlined.Person
 import androidx.compose.material.icons.outlined.SyncAlt
 import androidx.compose.material3.Badge
@@ -275,9 +281,11 @@ private val NavKeyConfiguration = SavedStateConfiguration {
             subclass(Screen.Home::class)
             subclass(Screen.Library::class)
             subclass(Screen.MyShares::class)
+            subclass(Screen.PosterWall::class)
             subclass(Screen.Settings::class)
             subclass(Screen.WebDav::class)
             subclass(Screen.VideoPlayer::class)
+            subclass(Screen.WorkDetail::class)
         }
     }
 }
@@ -314,7 +322,9 @@ fun PikoMainScaffold(
     ) { dev.piko.ui.workbench.WorkspaceViewModel(services, account) }
     val fileWorkspace = workspaceModel.fileWorkspace
     val driveWorkspace = workspaceModel.driveWorkspace
-    var currentTab by rememberSaveable { mutableStateOf(workspaceModel.lastMainTab) }
+    // 进 App 直接落在海报墙（用户要求）：不再沿用上次停留的标签，重启后总是先看到海报墙。
+    // rememberSaveable 只在进程内（如转屏）保留当前页，进程重启就回到这个初始值。
+    var currentTab by rememberSaveable { mutableStateOf(MainTab.POSTERS) }
     val backStack = rememberNavBackStack(NavKeyConfiguration, *workspaceModel.lastNavigation.toTypedArray())
     val workspaceUiStates = rememberSaveableStateHolder()
     val workspaceContexts by workspaceModel.contexts.contextsFlow.collectAsStateWithLifecycle()
@@ -455,6 +465,18 @@ fun PikoMainScaffold(
         when (videoPlayer) {
             is VideoPlayerHost.InApp -> backStack.add(Screen.VideoPlayer(file.id, file.name, localPath, startMillis))
             is VideoPlayerHost.Detached -> videoPlayer.open(VideoPlayerRequest(file.id, file.name, localPath, playlist, startMillis))
+        }
+    }
+
+    /** 海报墙的作品文件开播：只有 ID 与名字（索引里没存整份 FileStat），下载过的照旧放本地副本。 */
+    fun playWorkFile(fileId: String, fileName: String) {
+        val localTask = services.downloadManager.tasks.value.values.find {
+            it.fileId == fileId && it.status == DownloadStatus.COMPLETED && !it.isSegment
+        }
+        val localPath = localTask?.destinationPath?.takeIf(localFiles::exists)
+        when (videoPlayer) {
+            is VideoPlayerHost.InApp -> backStack.add(Screen.VideoPlayer(fileId, fileName, localPath))
+            is VideoPlayerHost.Detached -> videoPlayer.open(VideoPlayerRequest(fileId, fileName, localPath, emptyList()))
         }
     }
 
@@ -776,6 +798,7 @@ fun PikoMainScaffold(
                 MainTab.FILES -> filesScrollToTop++
                 MainTab.TRANSFERS -> transfersScrollToTop++
                 MainTab.SETTINGS -> Unit
+                MainTab.POSTERS -> Unit
             }
         }
         currentTab = tab
@@ -798,6 +821,15 @@ fun PikoMainScaffold(
     // 旧版在宽窗口里也会停在「我的」，恢复出来的就回到文件
     LaunchedEffect(desktop) { if (desktop && currentTab == MainTab.SETTINGS) currentTab = MainTab.FILES }
 
+    // 从作品详情点演员/标签：回海报墙并直接按它筛选
+    fun openPosterWallFiltered(filter: dev.piko.shared.state.PosterWallState.Filter, name: String) {
+        currentTab = MainTab.POSTERS
+        services.posterWall?.selectFilter(filter, name)
+        // 压一页海报墙而不是清栈：从这儿按返回回到刚才的详情页。
+        // 之前清到只剩根，返回被 BackHandler 接走切成文件页，看着像「跳错页」。
+        if (backStack.lastOrNull() != Screen.PosterWall) backStack.add(Screen.PosterWall)
+    }
+
     // 应用里的各个去处。命令面板与网盘页的地址栏共用这一份：怎么打开它们（压不压一栏「我的」、切不切页）只有这里知道
     fun tabDestinations(): List<PaletteItem> {
         val label = shortcutModifier::label
@@ -805,6 +837,7 @@ fun PikoMainScaffold(
             PaletteItem("文件", Icons.Outlined.Folder, "前往", detail = label("1"), keywords = "files drive") { currentTab = MainTab.FILES; resetToHome() },
             PaletteItem("任务", Icons.Outlined.SyncAlt, "前往", detail = label("2"), keywords = "tasks transfers downloads uploads") { openTransfers() },
             if (desktop) null else PaletteItem("我的", Icons.Outlined.Person, "前往", detail = label("3"), keywords = "profile me") { currentTab = MainTab.SETTINGS; resetToHome() },
+            PaletteItem("海报墙", Icons.Outlined.GridOn, "前往", detail = label("4"), keywords = "posters wall 海报 刮削 演员") { currentTab = MainTab.POSTERS; resetToHome() },
         )
     }
 
@@ -911,6 +944,23 @@ fun PikoMainScaffold(
                             onOpenLibrary = ::openLibraryFromProfile,
                         )
                     }
+                    MainTab.POSTERS -> {
+                        // 海报墙是独立的一页：没配好索引库（截图环境）时给一句说明，别闪退
+                        val posterWall = services.posterWall
+                        if (posterWall == null) {
+                            PikoEmptyState(
+                                title = "海报墙不可用",
+                                description = "这个构建没有带索引库",
+                                icon = Icons.Outlined.GridOn,
+                                modifier = Modifier.fillMaxSize(),
+                            )
+                        } else {
+                            PosterWallScreen(
+                                onOpenWork = { code -> backStack.add(Screen.WorkDetail(code)) },
+                                onBackClick = null,
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -919,8 +969,10 @@ fun PikoMainScaffold(
             // 侧边栏模式下导航栏不画，侧边栏在返回栈外面，见 sidebarMode
             val sidebar = sidebarMode
             // 若当前不在文件主页，按下返回键优先回到文件页
-            BackHandler(enabled = currentTab != MainTab.FILES && !feedFullScreen) {
-                currentTab = MainTab.FILES
+            // 只在没有压栈页时才由这里接返回：其它标签页都退回海报墙（启动也落在那里）；
+            // 已经在海报墙根页时不拦，交给系统退出 App。
+            BackHandler(enabled = currentTab != MainTab.POSTERS && !feedFullScreen && backStack.size <= 1) {
+                currentTab = MainTab.POSTERS
             }
 
             // 不显示主侧栏时统一使用底部导航，不再保留占用横向空间的图标轨。
@@ -1265,6 +1317,7 @@ fun PikoMainScaffold(
                         Key.One -> MainTab.FILES
                         Key.Two -> MainTab.TRANSFERS
                         Key.Three -> if (desktop) return@onKeyEvent false else MainTab.SETTINGS
+                        Key.Four -> MainTab.POSTERS
                         else -> return@onKeyEvent false
                     }
                     currentTab = tab
@@ -1355,7 +1408,23 @@ fun PikoMainScaffold(
                                         onRevealInDrive = { file -> coroutineScope.launch { revealInDrive(file.id) } },
                                     )
                                 }
+                                entry<Screen.PosterWall> {
+                                    // 从详情页点演员/标签后压进来的这一页：带返回箭头，弹回详情页
+                                    PosterWallScreen(
+                                        onOpenWork = { code -> backStack.add(Screen.WorkDetail(code)) },
+                                        onBackClick = ::popBack,
+                                    )
+                                }
                                 entry<Screen.MyShares> { MySharesScreen(onBackClick = paneBack, onLocate = ::revealInDrive) }
+                                entry<Screen.WorkDetail> { screen ->
+                                    WorkDetailScreen(
+                                        code = screen.code,
+                                        onBackClick = ::popBack,
+                                        onPlay = { file -> playWorkFile(file.fileId, file.name) },
+                                        onFilterActor = { actor -> openPosterWallFiltered(PosterWallState.Filter.ACTOR, actor) },
+                                        onFilterTag = { tag -> openPosterWallFiltered(PosterWallState.Filter.TAG, tag) },
+                                    )
+                                }
                                 entry<Screen.Settings> {
                                     SettingsScreen(
                                         onBackClick = paneBack,
@@ -1429,6 +1498,7 @@ private fun MainTab.icon(selected: Boolean) = when (this) {
     // SyncAlt 的实心与描边长得一样，选中看不出变化；这一款描边是空心的圆，选中时填实
     MainTab.TRANSFERS -> if (selected) Icons.Filled.SwapVerticalCircle else Icons.Outlined.SwapVerticalCircle
     MainTab.SETTINGS -> if (selected) Icons.Filled.Person else Icons.Outlined.Person
+    MainTab.POSTERS -> if (selected) Icons.Filled.GridOn else Icons.Outlined.GridOn
 }
 
 /** 浮起的侧边栏下面那层遮罩，M3 模态抽屉的 32%。 */
@@ -1556,7 +1626,7 @@ private fun MainSidebar(
  */
 @Composable
 private fun MainTabSwitch(currentTab: MainTab?, onTabClick: (MainTab) -> Unit, activity: TransferActivity, collapsed: Boolean) {
-    val tabs = listOf(MainTab.FILES, MainTab.TRANSFERS)
+    val tabs = listOf(MainTab.FILES, MainTab.TRANSFERS, MainTab.POSTERS)
     val snail by LocalPikoServices.current.preferences.snailModeFlow.collectAsStateWithLifecycle(initialValue = SnailMode())
     if (collapsed) {
         tabs.forEach { tab ->

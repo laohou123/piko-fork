@@ -126,6 +126,9 @@ dependencies {
     // 播放后端：预编译的 libmpv 与 FFmpeg（含 arm64/armv7/x86_64）
     implementation(libs.libmpv.android)
 
+    // 海报墙索引库的驱动（每账号一个 SQLite 文件，见 AndroidLibraryDriverFactory）
+    implementation(libs.sqldelight.android.driver)
+
     // AndroidX & Lifecycle
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.documentfile)

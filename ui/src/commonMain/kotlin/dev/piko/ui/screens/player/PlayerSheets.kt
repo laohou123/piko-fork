@@ -53,6 +53,8 @@ import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.outlined.Cloud
 import androidx.compose.material.icons.outlined.FileOpen
 import androidx.compose.material.icons.outlined.Movie
+import androidx.compose.material.icons.outlined.Search
+import androidx.compose.material.icons.outlined.Translate
 import androidx.compose.material3.ButtonGroupDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
@@ -107,7 +109,7 @@ import dev.piko.shared.media.player.PlaybackStatsSection
 import androidx.compose.foundation.text.selection.SelectionContainer
 import kotlin.math.roundToInt
 
-internal enum class PlayerSheet { Episodes, Settings, Tracks, DriveSubtitles, Stats }
+internal enum class PlayerSheet { Episodes, Settings, Tracks, DriveSubtitles, TranslateSubtitle, Stats }
 
 /**
  * 播放器的面板容器：横屏是贴右侧的浮动 side sheet，竖屏是 bottom sheet。
@@ -139,7 +141,8 @@ internal fun PlayerSheetHost(
         ) {
             // 选集与网盘字幕固定占七成高：按内容定高时几十项会顶满全屏，几项时又只露一条，
             // 字幕目录里进出一层面板还会跟着跳。其余面板内容少，按内容定高
-            val fixedHeight = sheet == PlayerSheet.Episodes || sheet == PlayerSheet.DriveSubtitles
+            val fixedHeight = sheet == PlayerSheet.Episodes ||
+                sheet == PlayerSheet.DriveSubtitles || sheet == PlayerSheet.TranslateSubtitle
             val height = if (fixedHeight) Modifier.fillMaxHeight(EPISODE_SHEET_HEIGHT_FRACTION) else Modifier
             Column(height.wheelStaysInSheet()) {
                 Text(
@@ -158,7 +161,8 @@ private val PlayerSheet.title: String
         PlayerSheet.Episodes -> "选集"
         PlayerSheet.Settings -> "播放设置"
         PlayerSheet.Tracks -> "音轨与字幕"
-        PlayerSheet.DriveSubtitles -> "从网盘选择字幕"
+        PlayerSheet.DriveSubtitles -> "网盘字幕（右侧图标可删除）"
+        PlayerSheet.TranslateSubtitle -> "AI 翻译字幕"
         PlayerSheet.Stats -> "详细信息"
     }
 
@@ -776,8 +780,8 @@ internal fun PlayerSettingsPanel(
 
 /**
  * 音轨与字幕。轨道名常带语言、字幕组与「外挂」，长短不一，按钮组放不下，所以一行一条、单选。
- * 音轨只有一条时整节不出现；字幕第一项是关闭，末尾是从本机或网盘另挑一个字幕文件的入口，
- * 平台或后端做不到时为 null，不显示。
+ * 音轨只有一条时整节不出现；字幕第一项是关闭，末尾是另挑字幕文件的入口
+ * （本机 / 网盘 / 在线搜索），平台或后端做不到时为 null，不显示。
  */
 @Composable
 internal fun TracksPanel(
@@ -790,6 +794,10 @@ internal fun TracksPanel(
     onPickLocalSubtitle: (() -> Unit)?,
     onPickDriveSubtitle: (() -> Unit)?,
     modifier: Modifier = Modifier,
+    /** 在线搜字幕（SubtitleCat）：搜到下载到视频所在目录，再回到这里挂。 */
+    onSearchSubtitle: (() -> Unit)? = null,
+    /** 打开 AI 翻译面板；没配置翻译模型时为 null，不显示这一项。 */
+    onTranslateSubtitle: (() -> Unit)? = null,
 ) {
     Column(
         modifier = modifier
@@ -818,11 +826,21 @@ internal fun TracksPanel(
                     onClick = { onSelectSubtitle(track) },
                 )
             }
+            if (onSearchSubtitle != null) {
+                PickerRow(icon = Icons.Outlined.Search, label = "搜索字幕…", onClick = onSearchSubtitle)
+            }
+            if (onTranslateSubtitle != null) {
+                PickerRow(
+                    icon = Icons.Outlined.Translate,
+                    label = "AI 翻译字幕…",
+                    onClick = onTranslateSubtitle,
+                )
+            }
             if (onPickLocalSubtitle != null) {
                 PickerRow(icon = Icons.Outlined.FileOpen, label = "从本机选择字幕…", onClick = onPickLocalSubtitle)
             }
             if (onPickDriveSubtitle != null) {
-                PickerRow(icon = Icons.Outlined.Cloud, label = "从网盘选择字幕…", onClick = onPickDriveSubtitle)
+                PickerRow(icon = Icons.Outlined.Cloud, label = "网盘字幕（选择 / 删除）…", onClick = onPickDriveSubtitle)
             }
         }
     }
@@ -830,7 +848,14 @@ internal fun TracksPanel(
 
 /** 字幕列表末尾的入口行：与轨道行同高，前面带图标，看得出它不是一条轨道。 */
 @Composable
-internal fun PickerRow(icon: ImageVector, label: String, onClick: () -> Unit, modifier: Modifier = Modifier) {
+internal fun PickerRow(
+    icon: ImageVector,
+    label: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    /** 行尾的附加动作，例如删除。给了就不再点整行触发 [onClick]。 */
+    trailing: (@Composable () -> Unit)? = null,
+) {
     Row(
         modifier = modifier
             .fillMaxWidth()
@@ -850,6 +875,10 @@ internal fun PickerRow(icon: ImageVector, label: String, onClick: () -> Unit, mo
             overflow = TextOverflow.MiddleEllipsis,
             modifier = Modifier.weight(1f),
         )
+        trailing?.let {
+            Spacer(Modifier.width(4.dp))
+            it()
+        }
     }
 }
 

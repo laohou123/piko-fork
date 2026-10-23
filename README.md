@@ -1,117 +1,126 @@
 <p align="right"><b>简体中文</b> | <a href="README.en.md">English</a></p>
 
-<p align="center"><img src="https://raw.githubusercontent.com/NihilDigit/piko/main/docs/icon.png" alt="Piko" width="96"></p>
+<p align="center"><img src="docs/icon.png" alt="Piko" width="96"></p>
 
-<h1 align="center">Piko</h1>
+<h1 align="center">Piko · 海报墙版</h1>
 
 <p align="center">
-<a href="#安装"><img alt="Android 8.0+" src="https://img.shields.io/badge/Android-8.0%2B-306EFF?style=flat-square&logo=android&logoColor=white"></a>
-<a href="#安装"><img alt="Windows 10+ x64" src="https://img.shields.io/badge/Windows-10%2B%20x64-306EFF?style=flat-square&logo=data:image/svg%2bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0id2hpdGUiIGQ9Ik0yIDJoOS41djkuNUgyek0xMi41IDJIMjJ2OS41aC05LjV6TTIgMTIuNWg5LjVWMjJIMnpNMTIuNSAxMi41SDIyVjIyaC05LjV6Ii8+PC9zdmc+"></a>
-<a href="#安装"><img alt="Windows 11+ arm64" src="https://img.shields.io/badge/Windows-11%2B%20arm64-306EFF?style=flat-square&logo=data:image/svg%2bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0id2hpdGUiIGQ9Ik0yIDJoOS41djkuNUgyek0xMi41IDJIMjJ2OS41aC05LjV6TTIgMTIuNWg5LjVWMjJIMnpNMTIuNSAxMi41SDIyVjIyaC05LjV6Ii8+PC9zdmc+"></a>
-<a href="#安装"><img alt="macOS 12+ arm64" src="https://img.shields.io/badge/macOS-12%2B%20arm64-306EFF?style=flat-square&logo=apple&logoColor=white"></a>
-<a href="#安装"><img alt="Linux x64" src="https://img.shields.io/badge/Linux-x64-306EFF?style=flat-square&logo=linux&logoColor=white"></a>
+<a href="#下载安装"><img alt="Android 8.0+" src="https://img.shields.io/badge/Android-8.0%2B-306EFF?style=flat-square&logo=android&logoColor=white"></a>
+<a href="#下载安装"><img alt="Windows" src="https://img.shields.io/badge/Windows-10%2B-306EFF?style=flat-square"></a>
+<a href="#下载安装"><img alt="macOS" src="https://img.shields.io/badge/macOS-12%2B-306EFF?style=flat-square&logo=apple&logoColor=white"></a>
+<a href="#下载安装"><img alt="Linux" src="https://img.shields.io/badge/Linux-x64-306EFF?style=flat-square&logo=linux&logoColor=white"></a>
 <br>
-<a href="https://github.com/NihilDigit/piko/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/NihilDigit/piko?style=flat-square&color=306EFF&label=Release&logo=github&logoColor=white"></a>
-<a href="https://github.com/NihilDigit/piko/attestations"><img alt="SLSA Build L3" src="https://raw.githubusercontent.com/NihilDigit/piko/main/docs/badges/slsa-l3.svg"></a>
-<a href="LICENSE"><img alt="License AGPL-3.0-or-later" src="https://img.shields.io/badge/License-AGPL--3.0--or--later-306EFF?style=flat-square&logo=data:image/svg%2bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0id2hpdGUiIGQ9Ik0xIDIxdi0yaDEwVjcuODI1UTEwLjM1IDcuNiA5Ljg3NSA3LjEyNVQ5LjE3NSA2SDZsMyA3cTAgMS4yNS0xLjAyNSAyLjEyNVQ1LjUgMTZxLTEuNDUgMC0yLjQ3NS0uODc1VDIgMTNsMy03SDNWNGg2LjE3NXEuMy0uODc1IDEuMDc1LTEuNDM3VDEyIDJxLjk3NSAwIDEuNzUuNTYzVDE0LjgyNSA0SDIxdjJoLTJsMyA3cTAgMS4yNS0xLjAyNSAyLjEyNVQxOC41IDE2cS0xLjQ1IDAtMi40NzUtLjg3NVQxNSAxM2wzLTdoLTMuMTc1cS0uMjI1LjY1LS43IDEuMTI1VDEzIDcuODI1VjE5aDEwdjJIMVptMTUuNjI1LThoMy43NUwxOC41IDguNjUgMTYuNjI1IDEzWm0tMTMgMGgzLjc1TDUuNSA4LjY1IDMuNjI1IDEzWk0xMiA2cS40MjUgMCAuNzEzLS4yODhUMTMgNXEwLS40MjUtLjI4OC0uNzEzVDEyIDRxLS40MjUgMC0uNzEzLjI4OFQxMSA1cTAgLjQyNS4yODguNzEzVDEyIDZaIi8+PC9zdmc+Cg=="></a></p>
-
-<p align="center"><b>高性能、多平台的 PikPak 客户端</b></p>
-
-<p align="center">开发进展与更新日志发布在 Telegram 频道 <a href="https://t.me/piko_dev">@piko_dev</a></p>
-
-<p align="center"><a href="https://trendshift.io/repositories/263280?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-263280" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/263280/weekly?language=Kotlin" alt="Trendshift: NihilDigit/piko" width="250" height="53"/></a></p>
-
-## 自适应布局
-
-桌面端贴合键鼠操作，移动端简洁易用。
-
-<p align="center">
-<picture>
-<source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/NihilDigit/piko/main/docs/screenshots/hero-dark.jpg">
-<img src="https://raw.githubusercontent.com/NihilDigit/piko/main/docs/screenshots/hero.jpg" alt="桌面端与手机端的海报墙">
-</picture>
+<a href="../../releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/laohou123/piko-fork?style=flat-square&color=306EFF&label=Release&logo=github&logoColor=white"></a>
+<a href="LICENSE"><img alt="License AGPL-3.0-or-later" src="https://img.shields.io/badge/License-AGPL--3.0--or--later-306EFF?style=flat-square"></a>
 </p>
 
-## 信息流
+<p align="center"><b>高性能多平台 PikPak 客户端 · 带可刮削的海报墙与 AI 字幕／片名翻译</b></p>
 
-随机播放当前文件夹里的视频片段，上下滑动切换。
+---
 
-<p align="center">
-<picture>
-<source media="(prefers-color-scheme: dark)" type="image/avif" srcset="https://raw.githubusercontent.com/NihilDigit/piko/main/docs/screenshots/feed-dark.avif">
-<source type="image/avif" srcset="https://raw.githubusercontent.com/NihilDigit/piko/main/docs/screenshots/feed.avif">
-<source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/NihilDigit/piko/main/docs/screenshots/feed-dark.jpg">
-<img src="https://raw.githubusercontent.com/NihilDigit/piko/main/docs/screenshots/feed.jpg" alt="网盘右侧的信息流，上下滑动切换视频片段">
-</picture>
-</p>
+## 这是什么
 
-## 链接与文件名解析
+这是 [NihilDigit/piko](https://github.com/NihilDigit/piko) 的定制分支，在上游的网盘客户端之上加了一套**本地影视库**：
 
-解析磁力链接、种子、下载地址与分享链接，保存前可完整预览、按文件挑选。文件按作品与集数整理，收起样片与花絮。
+- 选一个网盘目录扫描，按番号自动归组成「作品」
+- 元数据、封面、截图全部经**自建 MetaTube** 代理获取（客户端不直连源站，绕开反爬与图片防盗链）
+- **AI 翻译**：字幕逐条对齐翻译、片名批量翻译，模型由你自己填（任意 OpenAI 兼容接口）
+- 收藏、演员／标签筛选、搜索、多文件合并、增量重扫等完整浏览体验
 
-<p align="center">
-<picture>
-<source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/NihilDigit/piko/main/docs/screenshots/links-dark.jpg">
-<img src="https://raw.githubusercontent.com/NihilDigit/piko/main/docs/screenshots/links.jpg" alt="网盘中按作品整理的剧集，右侧是解析磁力链接的面板">
-</picture>
-</p>
+上游原有的能力（多平台自适应界面、信息流、磁力／分享链接解析、上传下载、离线包、WebDAV 挂载等）全部保留。
 
-## 传输
+## 海报墙
 
-多连接并发，自动绕开缓慢或无响应的节点，优化弱网下的使用体验。蜗牛模式限速，不影响播放。
+| 能力 | 说明 |
+|---|---|
+| 扫描归组 | 递归扫目录，按番号把分集／多版本收成一部；认不出番号的视频也保留，直接显示文件名 |
+| 刮削 | MetaTube 优先：标题、封面、背景图、截图墙、演员、标签、片商、系列、时长 |
+| 筛选与搜索 | 全部／收藏／演员／标签四个等宽按钮，右上角搜索支持番号、标题、女优、标签 |
+| 收藏 | 作品收藏（海报墙／详情页／播放页），演员与标签长按收藏并置顶 |
+| 详情页 | 顶部用 Piko 自带播放后端播正片中段作预览，横向大封面、截图墙（可全屏左右翻）、底部固定操作栏 |
+| 增量重扫 | 网盘里删掉视频，完整重扫后自动移除对应作品；中途停止不会误删 |
 
-<p align="center">
-<picture>
-<source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/NihilDigit/piko/main/docs/screenshots/transfers-dark.jpg">
-<img src="https://raw.githubusercontent.com/NihilDigit/piko/main/docs/screenshots/transfers.jpg" alt="传输页：进行中与已完成的下载、上传与云端任务">
-</picture>
-</p>
+图片全部走 MetaTube 的图片代理端点，由服务端取图后再返回，因此不受源站 Referer 校验、防盗链与网络可达性影响。
 
-## 文件处理
+## AI 翻译
 
-支持截取视频片段与查找重复文件。
+模型自己填，不绑定厂商：DeepSeek、OpenAI、通义、任意中转站、本地 Ollama／LM Studio，只要兼容 `POST /chat/completions`。
 
-<p align="center">
-<picture>
-<source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/NihilDigit/piko/main/docs/screenshots/tools-dark.jpg">
-<img src="https://raw.githubusercontent.com/NihilDigit/piko/main/docs/screenshots/tools.jpg" alt="手机上的截取视频片段与查找重复">
-</picture>
-</p>
+**字幕翻译**（播放页 → 字幕面板 → AI 翻译字幕）
 
-## 安装
+- 译文命名 `<番号>.zh.srt`，传回视频所在目录并当场挂载，换设备也能直接用
+- 管线四层保护：按字数分批且**不切断单条字幕**、**行数对齐校验**（对不上就逐条重翻）、并发 + 指数退避重试、第二轮串行补漏
+- 部分行失败时保留原文，不会出现空洞
 
-前往 [Releases](https://github.com/NihilDigit/piko/releases/latest) 下载。安装包均由 GitHub Actions 从源码构建，Release 页面按设备列出应下载的文件。
+**片名翻译**
 
-- **Android**：Android 8.0 及以上。按设备架构选择 APK，无法确定时选 `universal`。
-- **Windows**：x64 需 Windows 10 及以上，arm64 需 Windows 11 及以上。`.msi` 为安装版，`.7z` 为便携版；Windows 11 可在资源管理器中直接解压，Windows 10 可用 [NanaZip](https://apps.microsoft.com/detail/9n8g7tscl18r) 或 7-Zip 解压。
-- **macOS**（实验性）：macOS 12 及以上，仅 Apple 芯片。安装包未经公证，首次打开需在「系统设置」→「隐私与安全性」中放行。
-- **Linux**（实验性）：x64，需 glibc 2.38 及以上（Ubuntu 24.04、Debian 13、Fedora 39 或更新）。AppImage 添加执行权限后运行。
+- 设置里一键翻全部：显示进度、可随时停止，每批落库，中断不白花钱
+- 详情页标题旁可单独翻译当前作品，或手动改名
+- 原文保留在 `title`，译名存 `title_zh`，两者互不覆盖
 
-## 贡献
+**可调项**
 
-路线图见 [#10](https://github.com/NihilDigit/piko/issues/10)。
+| 项 | 默认 | 说明 |
+|---|---|---|
+| 推理强度 | 关闭 | 字幕是成百上千次小请求，开推理明显变慢；接口不认 `reasoning_effort` 时自动降级 |
+| 字幕提示词 | 内置中日影视字幕规则 | 可整段替换，建议保留末尾「行数一致／不要行号」等格式约束 |
 
-欢迎提交 Issue 与 PR。小的 Bug 修复、崩溃排查与文档补充可以直接提交。
+## 下载安装
 
-计划新增功能或调整架构时，请先提交 Issue，说明使用场景与拟定方案，确认方向后再实现。
+到 [Releases](../../releases/latest) 下载安装包。
 
-使用 LLM 辅助编写代码时，请理解新增代码的逻辑，并在真机上验证。
+- **Android**：`piko-poster-wall-release.apk`，Android 8.0+，约 40 MB（含三 ABI 的 libmpv）
+- **桌面端**：Windows／macOS／Linux 构建方式见下方「从源码构建」
 
-提交 PR 前须签署[贡献者协议](CLA.md)，签署方式见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+> 本分支的 APK 使用自有证书签名。与官方版或 debug 版包名不同，可共存，但**数据不共享**。
 
-## 许可与致谢
+## 首次配置
 
-- 源码以 [AGPL-3.0-or-later](LICENSE) 许可证开源。1.1.0 及更早的版本以 MIT 许可证发布。
-  Android 安装包内置以 GPLv3 构建的 mpv 与 FFmpeg。
-- PikPak 接口实现参考了 [52funny/pikpakcli](https://github.com/52funny/pikpakcli)。
-- 多项功能设计参考了 PikPak 网页端增强脚本 [digbug82/PikPak_Enhancement_Master](https://github.com/digbug82/PikPak_Enhancement_Master)。
-- Windows 端 mpv 的零拷贝渲染由 [MediaMP](https://github.com/open-ani/mediamp) 实现。
+1. **MetaTube**（设置 → MetaTube）：填自建服务地址与访问令牌。没有它就没有封面与元数据
+2. **AI 翻译**（设置 → AI 翻译，可选）：接口地址（填到 `/v1` 为止）、API Key、模型名，点「测试连接」验证
+3. **海报墙**（底部导航最左）：右上角「扫描目录」选一个网盘目录，等扫描与补刮完成
 
-## Star History
+## 从源码构建
 
-<a href="https://www.star-history.com/#nihildigit/piko&Date">
-<picture>
-<source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=nihildigit/piko&type=Date&theme=dark&legend=bottom-right">
-<img alt="Star History Chart" src="https://api.star-history.com/svg?repos=nihildigit/piko&type=Date&legend=bottom-right">
-</picture>
-</a>
+```bash
+# 环境：JDK 21、Android SDK（compileSdk 37），Gradle 随仓库自带
+export JAVA_HOME=/path/to/jdk-21
+export ANDROID_HOME=/path/to/android-sdk
+
+# 调试包
+./gradlew :app:assembleDebug -Ppiko.enableAbiSplits=false
+
+# 正式包（需要自己的 keystore）
+export ANDROID_KEYSTORE_PATH=/path/to/release.jks
+export ANDROID_KEYSTORE_PASSWORD='<your-store-password>'
+export ANDROID_KEY_ALIAS='<your-key-alias>'
+export ANDROID_KEY_PASSWORD='<your-key-password>'
+export PIKO_VERSION_NAME=0.5.0
+export PIKO_VERSION_CODE=5000
+./gradlew :app:assembleRelease -Ppiko.enableAbiSplits=false
+```
+
+产物在 `app/build/outputs/apk/`。仓库不保存任何签名文件与密钥。
+
+测试：
+
+```bash
+./gradlew :shared:desktopTest :ui:desktopTest
+xvfb-run -a ./gradlew :desktopApp:desktopTest   # 桌面 UI 测试需要显示环境
+```
+
+## 数据与升级
+
+- 索引按账号各一个 SQLite 文件，存作品、文件、演员、标签、截图、收藏
+- schema 升级自动迁移，v4／v5 老库直升最新，刮削结果与译名不丢
+- 重扫只重建文件表；元数据、封面、演员、标签、截图、译名一律保留，只有这一轮确实消失的作品才会被删
+
+## 与上游的关系
+
+- 上游：<https://github.com/NihilDigit/piko>
+- 本分支的改动集中在海报墙（`shared/.../library`、`shared/.../state`、`ui/.../screens/poster`）与 AI 翻译（`shared/.../translate`），其余保持上游结构，便于跟进更新
+- 检查更新指向本仓库，不会被上游版本覆盖
+
+## 许可
+
+[AGPL-3.0-or-later](LICENSE)，与上游一致。二次分发需同样开源。

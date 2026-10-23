@@ -1,0 +1,4 @@
+-- v5→v6：作品加中文标题列。
+-- 原始标题留在 title（刮削来的日文），title_zh 存 AI 翻译或手动修改的结果，
+-- 界面优先显示 title_zh。老库里的作品译名为空，下次点「翻译片名」时补上。
+ALTER TABLE works ADD COLUMN title_zh TEXT;

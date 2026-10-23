@@ -1,130 +1,112 @@
 <p align="right"><a href="README.md">简体中文</a> | <b>English</b></p>
 
-<p align="center"><img src="https://raw.githubusercontent.com/NihilDigit/piko/main/docs/icon.png" alt="Piko" width="96"></p>
+<p align="center"><img src="docs/icon.png" alt="Piko" width="96"></p>
 
-<h1 align="center">Piko</h1>
+<h1 align="center">Piko · Poster Wall Edition</h1>
 
 <p align="center">
 <a href="#install"><img alt="Android 8.0+" src="https://img.shields.io/badge/Android-8.0%2B-306EFF?style=flat-square&logo=android&logoColor=white"></a>
-<a href="#install"><img alt="Windows 10+ x64" src="https://img.shields.io/badge/Windows-10%2B%20x64-306EFF?style=flat-square&logo=data:image/svg%2bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0id2hpdGUiIGQ9Ik0yIDJoOS41djkuNUgyek0xMi41IDJIMjJ2OS41aC05LjV6TTIgMTIuNWg5LjVWMjJIMnpNMTIuNSAxMi41SDIyVjIyaC05LjV6Ii8+PC9zdmc+"></a>
-<a href="#install"><img alt="Windows 11+ arm64" src="https://img.shields.io/badge/Windows-11%2B%20arm64-306EFF?style=flat-square&logo=data:image/svg%2bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0id2hpdGUiIGQ9Ik0yIDJoOS41djkuNUgyek0xMi41IDJIMjJ2OS41aC05LjV6TTIgMTIuNWg5LjVWMjJIMnpNMTIuNSAxMi41SDIyVjIyaC05LjV6Ii8+PC9zdmc+"></a>
-<a href="#install"><img alt="macOS 12+ arm64" src="https://img.shields.io/badge/macOS-12%2B%20arm64-306EFF?style=flat-square&logo=apple&logoColor=white"></a>
-<a href="#install"><img alt="Linux x64" src="https://img.shields.io/badge/Linux-x64-306EFF?style=flat-square&logo=linux&logoColor=white"></a>
+<a href="#install"><img alt="Windows" src="https://img.shields.io/badge/Windows-10%2B-306EFF?style=flat-square"></a>
+<a href="#install"><img alt="macOS" src="https://img.shields.io/badge/macOS-12%2B-306EFF?style=flat-square&logo=apple&logoColor=white"></a>
+<a href="#install"><img alt="Linux" src="https://img.shields.io/badge/Linux-x64-306EFF?style=flat-square&logo=linux&logoColor=white"></a>
 <br>
-<a href="https://github.com/NihilDigit/piko/releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/NihilDigit/piko?style=flat-square&color=306EFF&label=Release&logo=github&logoColor=white"></a>
-<a href="https://github.com/NihilDigit/piko/attestations"><img alt="SLSA Build L3" src="https://raw.githubusercontent.com/NihilDigit/piko/main/docs/badges/slsa-l3.svg"></a>
-<a href="LICENSE"><img alt="License AGPL-3.0-or-later" src="https://img.shields.io/badge/License-AGPL--3.0--or--later-306EFF?style=flat-square&logo=data:image/svg%2bxml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0id2hpdGUiIGQ9Ik0xIDIxdi0yaDEwVjcuODI1UTEwLjM1IDcuNiA5Ljg3NSA3LjEyNVQ5LjE3NSA2SDZsMyA3cTAgMS4yNS0xLjAyNSAyLjEyNVQ1LjUgMTZxLTEuNDUgMC0yLjQ3NS0uODc1VDIgMTNsMy03SDNWNGg2LjE3NXEuMy0uODc1IDEuMDc1LTEuNDM3VDEyIDJxLjk3NSAwIDEuNzUuNTYzVDE0LjgyNSA0SDIxdjJoLTJsMyA3cTAgMS4yNS0xLjAyNSAyLjEyNVQxOC41IDE2cS0xLjQ1IDAtMi40NzUtLjg3NVQxNSAxM2wzLTdoLTMuMTc1cS0uMjI1LjY1LS43IDEuMTI1VDEzIDcuODI1VjE5aDEwdjJIMVptMTUuNjI1LThoMy43NUwxOC41IDguNjUgMTYuNjI1IDEzWm0tMTMgMGgzLjc1TDUuNSA4LjY1IDMuNjI1IDEzWk0xMiA2cS40MjUgMCAuNzEzLS4yODhUMTMgNXEwLS40MjUtLjI4OC0uNzEzVDEyIDRxLS40MjUgMC0uNzEzLjI4OFQxMSA1cTAgLjQyNS4yODguNzEzVDEyIDZaIi8+PC9zdmc+Cg=="></a></p>
-
-<p align="center"><b>A fast, cross-platform PikPak client</b></p>
-
-<p align="center">Development updates and changelogs are posted to the Telegram channel <a href="https://t.me/piko_dev">@piko_dev</a></p>
-
-<p align="center"><a href="https://trendshift.io/repositories/263280?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-263280" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/263280/weekly?language=Kotlin" alt="Trendshift: NihilDigit/piko" width="250" height="53"/></a></p>
-
-## Adaptive layout
-
-Built for mouse and keyboard on the desktop, clean and simple on the phone.
-
-<p align="center">
-<picture>
-<source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/NihilDigit/piko/main/docs/screenshots/hero-dark.jpg">
-<img src="https://raw.githubusercontent.com/NihilDigit/piko/main/docs/screenshots/hero.jpg" alt="Poster wall on desktop and phone">
-</picture>
+<a href="../../releases/latest"><img alt="Release" src="https://img.shields.io/github/v/release/laohou123/piko-fork?style=flat-square&color=306EFF&label=Release&logo=github&logoColor=white"></a>
+<a href="LICENSE"><img alt="License AGPL-3.0-or-later" src="https://img.shields.io/badge/License-AGPL--3.0--or--later-306EFF?style=flat-square"></a>
 </p>
 
-## Feed
+<p align="center"><b>Fast, multi-platform PikPak client · with a scrapable poster wall and AI subtitle/title translation</b></p>
 
-Plays random clips from the videos in the current folder. Swipe up or down to switch.
+---
 
-<p align="center">
-<picture>
-<source media="(prefers-color-scheme: dark)" type="image/avif" srcset="https://raw.githubusercontent.com/NihilDigit/piko/main/docs/screenshots/feed-dark.avif">
-<source type="image/avif" srcset="https://raw.githubusercontent.com/NihilDigit/piko/main/docs/screenshots/feed.avif">
-<source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/NihilDigit/piko/main/docs/screenshots/feed-dark.jpg">
-<img src="https://raw.githubusercontent.com/NihilDigit/piko/main/docs/screenshots/feed.jpg" alt="The feed beside the drive, swiping between clips">
-</picture>
-</p>
+## What this is
 
-## Link and file name parsing
+A custom branch of [NihilDigit/piko](https://github.com/NihilDigit/piko). Everything upstream ships stays, plus a **local media library** on top of your drive:
 
-Parses magnet links, torrents, download URLs and share links, with a full preview and per-file
-selection before saving. Files are grouped by work and episode, with samples and extras folded away.
+- Scan a drive folder, group videos into works by catalogue number (multi-part files collapse into one work)
+- Metadata, covers and screenshots all come through your **self-hosted MetaTube** (the client never hits source sites directly, so anti-bot and hotlink protection never apply)
+- **AI translation** for subtitles and titles with any OpenAI-compatible endpoint you configure
+- Favourites, actor/tag filters, search, and incremental rescans
 
-<p align="center">
-<picture>
-<source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/NihilDigit/piko/main/docs/screenshots/links-dark.jpg">
-<img src="https://raw.githubusercontent.com/NihilDigit/piko/main/docs/screenshots/links.jpg" alt="Episodes grouped by work, with a parsed magnet link in the side panel">
-</picture>
-</p>
+## Poster wall
 
-## Transfers
+| Feature | Detail |
+|---|---|
+| Scan & group | Recursive scan, grouped by code; files whose code can't be parsed are still kept and shown by file name |
+| Scraping | Via MetaTube: title, cover, backdrop, screenshot wall, actors, tags, studio, series, runtime |
+| Filters | All / Favourites / Actor / Tag as four equal-width chips; search matches code, title, actress or tag |
+| Favourites | Works (wall, detail, player); actors and tags via long press, pinned to the top |
+| Detail page | Muted preview of the actual video (Piko's own playback backend), large cover, swipeable screenshot wall, fixed bottom action bar |
+| Incremental rescan | Deleting a video in the drive removes the work after a full rescan; stopping early never deletes anything |
 
-Parallel connections that route around slow or unresponsive nodes, for a better experience on poor
-networks. Snail mode caps the speed without affecting playback.
+All images go through MetaTube's image proxy endpoints, so Referer checks, hotlink protection and network reachability of the source site are handled server-side.
 
-<p align="center">
-<picture>
-<source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/NihilDigit/piko/main/docs/screenshots/transfers-dark.jpg">
-<img src="https://raw.githubusercontent.com/NihilDigit/piko/main/docs/screenshots/transfers.jpg" alt="Transfers: active and finished downloads, uploads and cloud tasks">
-</picture>
-</p>
+## AI translation
 
-## File tools
+Any provider that speaks `POST /chat/completions`: DeepSeek, OpenAI, Qwen, proxies, local Ollama / LM Studio.
 
-Cut video clips and find duplicate files.
+**Subtitles** — player → subtitle panel → *AI translate*:
 
-<p align="center">
-<picture>
-<source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/NihilDigit/piko/main/docs/screenshots/tools-dark.jpg">
-<img src="https://raw.githubusercontent.com/NihilDigit/piko/main/docs/screenshots/tools.jpg" alt="Clip download and duplicate finder on a phone">
-</picture>
-</p>
+- Saved as `<code>.zh.srt` next to the video and attached immediately, reusable on other devices
+- Four safeguards: batching that never splits a cue, line-count validation (falls back to per-line retry), concurrency with exponential backoff, and a slow second pass for leftovers
+- Lines that fail keep their source text, so the file never has holes
+
+**Titles** — bulk translate from Settings (progress, cancelable, written per batch), or translate / hand-edit a single work from its detail page. The original title is preserved in `title`, the translation in `title_zh`.
+
+**Tunables**: reasoning effort (off by default — subtitles are many small requests; unsupported endpoints fall back automatically) and a fully editable subtitle prompt.
 
 ## Install
 
-Download from [Releases](https://github.com/NihilDigit/piko/releases/latest). Every package is built
-from source by GitHub Actions, and the release page lists which file to download for each device.
+Download from [Releases](../../releases/latest).
 
-- **Android**: Android 8.0 or later. Pick the APK for your device's architecture, or `universal` if
-  unsure.
-- **Windows**: Windows 10 or later on x64, Windows 11 or later on arm64. `.msi` is the installer, `.7z` the portable build;
-  Windows 11 extracts it in File Explorer, and on Windows 10 use
-  [NanaZip](https://apps.microsoft.com/detail/9n8g7tscl18r) or 7-Zip.
-- **macOS** (experimental): macOS 12 or later, Apple silicon only. The package is not notarized;
-  allow it once under System Settings → Privacy & Security.
-- **Linux** (experimental): x64, glibc 2.38 or later (Ubuntu 24.04, Debian 13, Fedora 39 or newer).
-  Make the AppImage executable after downloading it.
+- **Android**: `piko-poster-wall-release.apk`, Android 8.0+, ~40 MB (three ABIs of libmpv)
+- **Desktop**: build from source with the commands below
 
-## Contributing
+> The APK is signed with this branch's own key. It uses a different package name than the official or debug builds, so both can coexist, but **data is not shared**.
 
-The roadmap is in [#10](https://github.com/NihilDigit/piko/issues/10).
+## First run
 
-Issues and pull requests are welcome. Small bug fixes, crash reports and documentation fixes can go
-straight in as a pull request.
+1. **MetaTube** (Settings → MetaTube): self-hosted URL and access token — without it there are no covers or metadata
+2. **AI translation** (Settings → AI translation, optional): base URL (up to `/v1`), API key, model name, then *Test connection*
+3. **Poster wall** (leftmost bottom tab): *Scan folder* in the top-right, wait for the scan and enrichment to finish
 
-For a new feature or an architectural change, open an issue first describing the use case and the
-approach, so the direction is agreed before the work starts.
+## Build from source
 
-If you write code with the help of an LLM, make sure you understand what it adds and test it on a
-real device.
+```bash
+# JDK 21, Android SDK (compileSdk 37); the Gradle wrapper ships with the repo
+export JAVA_HOME=/path/to/jdk-21
+export ANDROID_HOME=/path/to/android-sdk
 
-Pull requests require signing the [Contributor License Agreement](CLA.md) once, by replying to the
-bot on the pull request; see [CONTRIBUTING.md](CONTRIBUTING.md).
+./gradlew :app:assembleDebug -Ppiko.enableAbiSplits=false
 
-## License and credits
+# Signed release, with your own keystore
+export ANDROID_KEYSTORE_PATH=/path/to/release.jks
+export ANDROID_KEYSTORE_PASSWORD='<your-store-password>'
+export ANDROID_KEY_ALIAS='<your-key-alias>'
+export ANDROID_KEY_PASSWORD='<your-key-password>'
+export PIKO_VERSION_NAME=0.5.0
+export PIKO_VERSION_CODE=5000
+./gradlew :app:assembleRelease -Ppiko.enableAbiSplits=false
+```
 
-- The source code is under the [AGPL-3.0-or-later](LICENSE) license. Version 1.1.0 and earlier
-  were released under the MIT license. The Android packages bundle GPLv3 builds of mpv and FFmpeg.
-- The PikPak API implementation draws on [52funny/pikpakcli](https://github.com/52funny/pikpakcli).
-- Several features are modelled on the PikPak web enhancement script
-  [digbug82/PikPak_Enhancement_Master](https://github.com/digbug82/PikPak_Enhancement_Master).
-- Zero-copy mpv rendering on Windows is provided by [MediaMP](https://github.com/open-ani/mediamp).
+Tests:
 
-## Star History
+```bash
+./gradlew :shared:desktopTest :ui:desktopTest
+xvfb-run -a ./gradlew :desktopApp:desktopTest   # desktop UI tests need a display
+```
 
-<a href="https://www.star-history.com/#nihildigit/piko&Date">
-<picture>
-<source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=nihildigit/piko&type=Date&theme=dark&legend=bottom-right">
-<img alt="Star History Chart" src="https://api.star-history.com/svg?repos=nihildigit/piko&type=Date&legend=bottom-right">
-</picture>
-</a>
+## Data and upgrades
+
+- One SQLite index per account: works, files, actors, tags, screenshots, favourites
+- Schema migrations run automatically; v4/v5 databases upgrade in place without losing scraped data or translations
+- Rescans only rebuild the file table — metadata, covers, actors, tags, screenshots and translations are kept; only works that really disappeared are removed
+
+## Relation to upstream
+
+- Upstream: <https://github.com/NihilDigit/piko>
+- Changes are concentrated in the poster wall (`shared/.../library`, `shared/.../state`, `ui/.../screens/poster`) and AI translation (`shared/.../translate`); the rest follows upstream so updates stay easy to merge
+- The update checker points at this repository, so upstream releases will not overwrite this build
+
+## License
+
+[AGPL-3.0-or-later](LICENSE), same as upstream.

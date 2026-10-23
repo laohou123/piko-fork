@@ -9,7 +9,9 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import dev.piko.shared.media.player.isPlayerSubtitleName
+import dev.piko.shared.naming.av.matchAvFile
 import dev.piko.ui.LocalPikoServices
+import dev.piko.ui.screens.poster.SubtitleSearchSheet
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
@@ -166,6 +168,20 @@ fun MediampVideoPlayerScreen(
         subtitleLauncher.launch(arrayOf("*/*"))
     }
 
+    // 在线搜字幕（SubtitleCat）：下载到当前视频所在的网盘目录，之后从「网盘字幕」挂上。
+    // 本地播放没有网盘目录，给不了入口
+    val services = LocalPikoServices.current
+    val currentVideoFolderId = siblingVideos.find { it.id == state.fileId }?.parentId
+    var showSubtitleSearch by remember { mutableStateOf(false) }
+    // 作品收藏（与海报墙收藏夹同一份数据）：按文件名认番号，认不出就不给入口
+    val currentWorkCode = remember(state.fileId, state.title) {
+        matchAvFile(state.title)?.code
+    }
+    var favorite by remember { mutableStateOf(false) }
+    LaunchedEffect(state.fileId, currentWorkCode) {
+        favorite = currentWorkCode?.let { services.libraryStore?.isWorkFavorite(it) } ?: false
+    }
+
     LaunchedEffect(isFullscreen) {
         if (isFullscreen) orientationController.hideSystemBars() else orientationController.showSystemBars()
     }
@@ -277,8 +293,37 @@ fun MediampVideoPlayerScreen(
                 onPickLocalSubtitle = pickLocalSubtitle.takeIf { state.canAddSubtitle },
                 onPickDriveSubtitle = { file: FileStat -> state.addDriveSubtitle(file.id, file.name) }
                     .takeIf { state.canAddSubtitle },
+                onSearchSubtitle = { showSubtitleSearch = true }
+                    .takeIf { state.canAddSubtitle && currentVideoFolderId != null },
+                // AI 翻译字幕：要番号（译文名）与翻译配置都齐了才给入口
+                subtitleTranslateCode = currentWorkCode
+                    .takeIf { services.translation != null && state.canAddSubtitle },
+                onTranslatedSubtitle = { fileId, name -> state.addDriveSubtitle(fileId, name) },
+                isFavorite = favorite,
+                onFavoriteClick = currentWorkCode?.let { code ->
+                    {
+                        scope.launch {
+                            favorite = services.libraryStore?.toggleWorkFavorite(code) ?: false
+                        }
+                    }
+                },
             )
         }
+    }
+
+    // 在线字幕搜索：下载到当前视频所在的网盘目录（SubtitleSearchSheet 内部走上传队列）
+    if (showSubtitleSearch && currentVideoFolderId != null) {
+        SubtitleSearchSheet(
+            code = currentWorkCode ?: state.title.substringBeforeLast('.'),
+            targetFolderId = currentVideoFolderId,
+            targetFolderName = "视频所在目录",
+            onDismissRequest = { showSubtitleSearch = false },
+            // 传完立刻挂上，不用退出重进
+            onUploaded = { fileId, fileName ->
+                state.addDriveSubtitle(fileId, fileName)
+                showSubtitleSearch = false
+            },
+        )
     }
 }
 

@@ -23,11 +23,11 @@ import kotlin.test.assertIs
  * 这两条回退只在真出事时才走到，平时的手测碰不上，用假的服务端逐条走一遍。
  */
 class ReleaseSourceFallbackTest {
-    private val manifestUrl = "https://github.com/NihilDigit/piko/releases/latest/download/release.json"
-    private val assetUrl = "https://github.com/NihilDigit/piko/releases/download/v2.0.0/piko-2.0.0-universal.apk"
+    private val manifestUrl = "https://github.com/laohou123/piko-fork/releases/latest/download/release.json"
+    private val assetUrl = "https://github.com/laohou123/piko-fork/releases/download/v2.0.0/piko-2.0.0-universal.apk"
 
     private val releaseJson = """
-        {"tag_name":"v2.0.0","html_url":"https://github.com/NihilDigit/piko/releases/tag/v2.0.0","body":"",
+        {"tag_name":"v2.0.0","html_url":"https://github.com/laohou123/piko-fork/releases/tag/v2.0.0","body":"",
          "draft":false,"prerelease":false,
          "assets":[{"name":"piko-2.0.0-universal.apk","size":4,"browser_download_url":"$assetUrl","digest":"sha256:ab"}]}
     """.trimIndent()

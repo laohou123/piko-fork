@@ -37,10 +37,12 @@ import dev.piko.desktop.winrt.WindowsLinkAssociation
 import dev.piko.download.DownloadStatus
 import dev.piko.download.DownloadTask
 import dev.piko.shared.data.FilePikoCacheStore
+import dev.piko.shared.library.SubtitleCatSource
 import dev.piko.shared.sync.JvmSyncCipher
 import dev.piko.shared.scrape.MetaTubeService
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.okhttp.OkHttp
+import io.ktor.client.plugins.HttpTimeout
 import dev.piko.shared.data.PikoClientManager
 import dev.piko.shared.state.InstantSheetState
 import dev.piko.shared.state.TorrentMagnet
@@ -486,6 +488,30 @@ private fun createServices(settings: DesktopSettingsStore, preferences: DesktopP
         cacheStore = FilePikoCacheStore(PikoHome.root.resolve("cache").toString()),
         syncCipher = JvmSyncCipher(),
         metaTube = MetaTubeService(preferences) { HttpClient(OkHttp) },
+        // 海报墙与刮削字幕：索引库按账号各一个 SQLite，刮削/字幕源共用一个客户端工厂。
+        // 带超时：源站不通时快速失败回 null，补刮计数为「没找到」，而不是无限期挂住
+        libraryDriverFactory = DesktopLibraryDriverFactory(),
+        scrapeHttpClientFactory = {
+            HttpClient(OkHttp) {
+                install(HttpTimeout) {
+                    requestTimeoutMillis = 30_000
+                    connectTimeoutMillis = 15_000
+                    socketTimeoutMillis = 30_000
+                }
+            }
+        },
+        subtitleSourceFactory = { http -> SubtitleCatSource(http) },
+        translationHttpClientFactory = {
+            // 翻译一次要几十秒，超时按分钟级给；真正的单批上限在 TranslationClient 里控
+            HttpClient(OkHttp) {
+                install(HttpTimeout) {
+                requestTimeoutMillis = 120_000
+                connectTimeoutMillis = 15_000
+                socketTimeoutMillis = 120_000
+                }
+            }
+        },
+        subtitleSaver = DesktopSubtitleFileSaver(),
     )
 }
 

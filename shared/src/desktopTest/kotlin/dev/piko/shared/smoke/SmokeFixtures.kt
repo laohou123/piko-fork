@@ -137,6 +137,23 @@ class MemoryPreferences : PikoUserPreferences {
     override suspend fun setMetaTubeUrl(url: String) { metaTubeUrlFlow.value = url }
     override val metaTubeTokenFlow = MutableStateFlow("")
     override suspend fun setMetaTubeToken(token: String) { metaTubeTokenFlow.value = token }
+
+    override val posterAutoPreviewFlow = MutableStateFlow(true)
+    override suspend fun setPosterAutoPreviewEnabled(enabled: Boolean) { posterAutoPreviewFlow.value = enabled }
+
+    override val posterPreviewMaxHeightFlow = MutableStateFlow(0)
+    override suspend fun setPosterPreviewMaxHeight(height: Int) { posterPreviewMaxHeightFlow.value = height }
+
+    override val translationBaseUrlFlow = MutableStateFlow("")
+    override suspend fun setTranslationBaseUrl(url: String) { translationBaseUrlFlow.value = url }
+    override val translationApiKeyFlow = MutableStateFlow("")
+    override suspend fun setTranslationApiKey(key: String) { translationApiKeyFlow.value = key }
+    override val translationModelFlow = MutableStateFlow("")
+    override suspend fun setTranslationModel(model: String) { translationModelFlow.value = model }
+    override val translationReasoningFlow = MutableStateFlow("")
+    override suspend fun setTranslationReasoning(level: String) { translationReasoningFlow.value = level }
+    override val translationPromptFlow = MutableStateFlow("")
+    override suspend fun setTranslationPrompt(prompt: String) { translationPromptFlow.value = prompt }
 }
 
 /** 内存会话存储，行为与两端的实现一致：会话、上次账号、密码三份各自独立。 */

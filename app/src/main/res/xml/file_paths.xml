@@ -9,4 +9,6 @@
     <files-path name="internal_downloads" path="Piko/" />
     <!-- 导出的日志，见 AndroidPikoPlatform.exportLog -->
     <cache-path name="logs" path="logs/" />
+    <!-- 抓下来的字幕，见 AndroidSubtitleFileSaver：写缓存后经 FileProvider 交给上传队列 -->
+    <cache-path name="subtitles" path="subtitles/" />
 </paths>

@@ -49,6 +49,9 @@ import androidx.compose.material.icons.outlined.Subtitles
 import androidx.compose.material.icons.outlined.SwapVerticalCircle
 import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material.icons.outlined.TextFields
+import androidx.compose.material.icons.outlined.Movie
+import androidx.compose.material.icons.outlined.Translate
+import androidx.compose.material.icons.outlined.Title
 import androidx.compose.material.icons.outlined.TravelExplore
 import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material.icons.outlined.VisibilityOff
@@ -150,6 +153,10 @@ fun SettingsScreen(
     val isNameParsingEnabled by sessionManager.nameParsingFlow.collectAsStateWithLifecycle(initialValue = true)
     val isBundleSubtitlesEnabled by sessionManager.bundleSubtitlesFlow.collectAsStateWithLifecycle(initialValue = true)
     val isAutoCleanNamesEnabled by sessionManager.autoCleanNamesFlow.collectAsStateWithLifecycle(initialValue = false)
+    // 详情页顶部是否自动播放作品预览片
+    val isPosterAutoPreviewEnabled by sessionManager.posterAutoPreviewFlow.collectAsStateWithLifecycle(initialValue = true)
+    // 预览片最高画面高度（0 = 自动/原画）
+    val isPosterPreviewMaxHeight by sessionManager.posterPreviewMaxHeightFlow.collectAsStateWithLifecycle(initialValue = 0)
     val isHardwareDecodingEnabled by sessionManager.hardwareDecodingFlow.collectAsStateWithLifecycle(initialValue = true)
     val isSyncPlayHistoryEnabled by sessionManager.syncPlayHistoryFlow.collectAsStateWithLifecycle(initialValue = true)
     val isSettingsSyncEnabled by sessionManager.settingsSyncFlow.collectAsStateWithLifecycle(initialValue = true)
@@ -172,6 +179,17 @@ fun SettingsScreen(
     val metaTube = services.metaTube
     val metaTubeUrl by sessionManager.metaTubeUrlFlow.collectAsStateWithLifecycle(initialValue = "")
     var showMetaTubeDialog by remember { mutableStateOf(false) }
+    var showPreviewQuality by remember { mutableStateOf(false) }
+
+    // AI 翻译：接口地址 / Key / 模型，三样齐了才能用
+    val translationGateway = services.translation
+    val translationBaseUrl by sessionManager.translationBaseUrlFlow.collectAsStateWithLifecycle(initialValue = "")
+    val translationApiKey by sessionManager.translationApiKeyFlow.collectAsStateWithLifecycle(initialValue = "")
+    val translationModel by sessionManager.translationModelFlow.collectAsStateWithLifecycle(initialValue = "")
+    val translationReasoning by sessionManager.translationReasoningFlow.collectAsStateWithLifecycle(initialValue = "")
+    val translationPrompt by sessionManager.translationPromptFlow.collectAsStateWithLifecycle(initialValue = "")
+    var showTranslationDialog by remember { mutableStateOf(false) }
+    val posterWall = services.posterWall
 
     var showDownloadDirDialog by remember { mutableStateOf(false) }
     val proxySetting by sessionManager.proxySettingFlow.collectAsStateWithLifecycle(initialValue = ProxySetting())
@@ -415,6 +433,66 @@ fun SettingsScreen(
                                     trailingIcon = null,
                                 )
                             }
+                            if (translationGateway != null) {
+                                val configured = translationBaseUrl.isNotBlank() &&
+                                    translationApiKey.isNotBlank() && translationModel.isNotBlank()
+                                SettingsNavigationRow(
+                                    icon = Icons.Outlined.Translate,
+                                    title = "AI 翻译",
+                                    supporting = if (configured) {
+                                        val level = when (translationReasoning) {
+                                            "low" -> " · 推理低"
+                                            "medium" -> " · 推理中"
+                                            "high" -> " · 推理高"
+                                            else -> ""
+                                        }
+                                        "$translationModel$level · 翻译字幕与片名"
+                                    } else {
+                                        "未设置，翻译字幕与片名前先配好接口与模型"
+                                    },
+                                    onClick = { showTranslationDialog = true },
+                                    trailingIcon = null,
+                                )
+                                if (posterWall != null) {
+                                    val translating = posterWall.titleTranslating
+                                    SettingsNavigationRow(
+                                        icon = Icons.Outlined.Title,
+                                        title = if (translating) "正在翻译片名…" else "翻译全部片名",
+                                        supporting = when {
+                                            !configured -> "先配置上面的「AI 翻译」"
+                                            translating -> "已完成 ${posterWall.titleDone}/${posterWall.titleTotal}" +
+                                                "，成功 ${posterWall.titleTranslated} 部，点一下可停止"
+                                            posterWall.titlePending == 0L -> "所有作品都已有中文标题"
+                                            else -> "还有 ${posterWall.titlePending} 部没有中文标题，点一下开始"
+                                        },
+                                        onClick = {
+                                            if (translating) {
+                                                posterWall.cancelTitleTranslation()
+                                            } else if (configured && posterWall.titlePending > 0L) {
+                                                posterWall.translateTitles()
+                                            }
+                                        },
+                                        enabled = configured,
+                                        trailingIcon = null,
+                                    )
+                                }
+                            }
+                            SettingsSwitchRow(
+                                icon = Icons.Outlined.Movie,
+                                title = "详情页自动预览",
+                                supporting = "进入作品详情时静音播放一小段画面；关掉可省流量",
+                                checked = isPosterAutoPreviewEnabled,
+                                onCheckedChange = {
+                                    scope.launch { sessionManager.setPosterAutoPreviewEnabled(it) }
+                                },
+                            )
+                            SettingsNavigationRow(
+                                icon = Icons.Outlined.HighQuality,
+                                title = "预览清晰度",
+                                supporting = if (isPosterPreviewMaxHeight == 0) "自动（原画）" else "${isPosterPreviewMaxHeight}P",
+                                onClick = { showPreviewQuality = true },
+                                trailingIcon = null,
+                            )
                         }
                     }
 
@@ -528,6 +606,28 @@ fun SettingsScreen(
         }
     }
 
+    if (showTranslationDialog && translationGateway != null) {
+        TranslationSettingsDialog(
+            gateway = translationGateway,
+            currentBaseUrl = translationBaseUrl,
+            currentApiKey = translationApiKey,
+            currentModel = translationModel,
+            currentReasoning = translationReasoning,
+            currentPrompt = translationPrompt,
+            onSave = { base, key, model, reasoning, prompt ->
+                showTranslationDialog = false
+                scope.launch {
+                    sessionManager.setTranslationBaseUrl(base)
+                    sessionManager.setTranslationApiKey(key)
+                    sessionManager.setTranslationModel(model)
+                    sessionManager.setTranslationReasoning(reasoning)
+                    sessionManager.setTranslationPrompt(prompt)
+                }
+            },
+            onDismiss = { showTranslationDialog = false },
+        )
+    }
+
     if (showMetaTubeDialog && metaTube != null) {
         // 令牌在打开对话框时才读：桌面端从系统保管处取，不必在设置页一打开就碰钥匙串
         val token by sessionManager.metaTubeTokenFlow.collectAsStateWithLifecycle(initialValue = null)
@@ -579,6 +679,20 @@ fun SettingsScreen(
                 scope.launch { sessionManager.setSnailMode(mode) }
             },
             onDismiss = { showSnailDialog = false },
+        )
+    }
+
+    if (showPreviewQuality) {
+        PlaybackQualityDialog(
+            maxHeight = isPosterPreviewMaxHeight,
+            onSelect = { height ->
+                showPreviewQuality = false
+                scope.launch { sessionManager.setPosterPreviewMaxHeight(height ?: 0) }
+            },
+            onDismiss = { showPreviewQuality = false },
+            title = "预览清晰度",
+            description = "详情页顶部预览片取多高的画面。预览只为看一眼，降档能省流量与解码开销。",
+            unsetLabel = "自动（原画）",
         )
     }
 

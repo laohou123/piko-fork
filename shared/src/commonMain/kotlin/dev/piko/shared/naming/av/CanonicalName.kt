@@ -105,6 +105,10 @@ private const val MAX_SETTLE_ROUNDS = 3
 /** 文件夹名里的番号，认不出时为 null。文件夹名没有扩展名，不能交给 parseMediaName。 */
 fun matchAvFolder(name: String): AvInfo? = matchAv(name.trim(), allowLanguageSuffix = false)?.info
 
+/** 视频文件名里的番号（先剥扩展名，认语言后缀），认不出时为 null。播放器收藏与搜字幕用它。 */
+fun matchAvFile(fileName: String): AvInfo? =
+    matchAv(fileName.trim().substringBeforeLast('.'), allowLanguageSuffix = true)?.info
+
 /** 文件名能否给出番号。界面据此决定要不要给「按番号规范命名」的入口。 */
 fun hasAvCode(fileName: String): Boolean = parseMediaName(fileName).av != null
 

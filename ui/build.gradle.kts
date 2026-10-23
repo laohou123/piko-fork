@@ -48,8 +48,13 @@ kotlin {
             implementation(libs.androidx.lifecycle.runtime.compose)
             implementation(libs.androidx.lifecycle.viewmodel.compose)
             implementation(libs.coil.compose)
+            // Coil 的 OkHttp 网络引擎（各端入口注册），封面从 MetaTube 取图靠它
+            implementation(libs.coil.network.okhttp)
             implementation(libs.kotlinx.coroutines.core)
             implementation(libs.kotlinx.serialization.json)
+            // 海报墙刮削源与字幕源共用的 HTTP 客户端工厂返回 io.ktor.client.HttpClient，
+            // 签名在 ui 模块里就要看得到（引擎本身在各端入口建）
+            implementation(libs.ktor.client.core)
         }
         // CMP 的 material3 在 Android 上重定向到 androidx 的构件，版本比 app 用的 BOM 旧；
         // 这里对齐到同一份 BOM，ui 模块编译时看到的就是 app 运行时的那套 API

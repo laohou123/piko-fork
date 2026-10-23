@@ -159,9 +159,18 @@ fun MobilePlayerControls(
     // 画面旋转的度数，后端不能旋转时为 null，设置面板与 R 键都不给
     rotationDegrees: Int? = null,
     onRotationChange: (Int) -> Unit = {},
-    // 手动挂字幕。本机的由平台弹文件选择框，选完自己交给播放器；网盘的在字幕面板里就地浏览，选中后回调
+    // 手动挂字幕。本机的由平台弹文件选择框，选完自己交给播放器；网盘的在字幕面板里就地浏览，选中后回调；
+    // 搜索的打开在线字幕搜索（SubtitleCat），下载到视频所在目录
     onPickLocalSubtitle: (() -> Unit)? = null,
     onPickDriveSubtitle: ((FileStat) -> Unit)? = null,
+    onSearchSubtitle: (() -> Unit)? = null,
+    // AI 翻译字幕：入口在字幕面板里，[subtitleTranslateCode] 是这个视频的番号（译文名要用），
+    // 为空说明拿不到番号或没配置翻译模型，不给入口
+    subtitleTranslateCode: String? = null,
+    onTranslatedSubtitle: ((fileId: String, name: String) -> Unit)? = null,
+    // 作品收藏（海报墙收藏夹）：顶栏心形，null 时不显示
+    isFavorite: Boolean = false,
+    onFavoriteClick: (() -> Unit)? = null,
     // 双击、方向键进退一步的秒数与长按倍速，在播放设置里改；改的回调为 null 时设置里不列这一项
     seekStepSeconds: Int = PlayerGestureDefaults.SEEK_STEP_SECONDS,
     onSeekStepChange: ((Int) -> Unit)? = null,
@@ -598,7 +607,7 @@ fun MobilePlayerControls(
     val hasPlaylist = playlist.size > 1
     // 文件本身没有字幕时也要给入口：正是这种时候才要自己挑一个
     val hasTracksEntry = subtitleTracks.isNotEmpty() || audioTracks.size > 1 ||
-        onPickLocalSubtitle != null || onPickDriveSubtitle != null
+        onPickLocalSubtitle != null || onPickDriveSubtitle != null || onSearchSubtitle != null
     // 显示区分段而不是「第几个 / 共几个」：目录里混着剧场版与特典时，序号对不上集数
     val episodeLabel = playlist.find { it.fileId == currentFileId }
         ?.takeIf { hasPlaylist && it.label.length <= SUBTITLE_LABEL_MAX_LENGTH }
@@ -746,6 +755,13 @@ fun MobilePlayerControls(
                         }.takeIf {
                             hasTracksEntry || fileActions.isNotEmpty() || playbackSpeed != null ||
                                 qualityOptions.isNotEmpty() || aspectRatio != null || onSeekStepChange != null
+                        },
+                        isFavorite = isFavorite,
+                        onFavoriteClick = onFavoriteClick?.let {
+                            {
+                                interacted()
+                                it()
+                            }
                         },
                         modifier = Modifier
                             .align(Alignment.TopCenter)
@@ -947,6 +963,8 @@ fun MobilePlayerControls(
                         onSelectSubtitle = onSelectSubtitleTrack,
                         onPickLocalSubtitle = onPickLocalSubtitle,
                         onPickDriveSubtitle = onPickDriveSubtitle?.let { { openSheet = PlayerSheet.DriveSubtitles } },
+                        onSearchSubtitle = onSearchSubtitle,
+                        onTranslateSubtitle = subtitleTranslateCode?.let { { openSheet = PlayerSheet.TranslateSubtitle } },
                     )
                     // 选中后回到音轨与字幕：新挂的那条在列表里亮起，看得到已经换上
                     PlayerSheet.DriveSubtitles -> DriveSubtitlePanel(
@@ -957,6 +975,18 @@ fun MobilePlayerControls(
                         },
                         modifier = Modifier.weight(1f),
                     )
+                    PlayerSheet.TranslateSubtitle -> subtitleTranslateCode?.let { code ->
+                        SubtitleTranslatePanel(
+                            videoFileId = currentFileId,
+                            code = code,
+                            onUploaded = { fileId, name ->
+                                onTranslatedSubtitle?.invoke(fileId, name)
+                                // 翻完回到字幕列表：新挂的那条在那里亮着
+                                openSheet = PlayerSheet.Tracks
+                            },
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
                     PlayerSheet.Stats -> playbackStats?.let { PlaybackStatsPanel(read = it) }
                 }
             }

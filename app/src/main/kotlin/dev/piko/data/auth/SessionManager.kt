@@ -94,6 +94,10 @@ class SessionManager(private val context: Context) : PikoUserPreferences {
         val SPOILER_BLUR_ENABLED = booleanPreferencesKey("spoiler_blur_enabled")
         val AUTO_CHECK_UPDATES = booleanPreferencesKey("auto_check_updates")
         val REDUCE_MOTION = booleanPreferencesKey("reduce_motion")
+        /** 作品详情页顶部自动播放预览片，默认开。 */
+        val POSTER_AUTO_PREVIEW = booleanPreferencesKey("poster_auto_preview")
+        /** 预览片最高画面高度，0 为自动。 */
+        val POSTER_PREVIEW_MAX_HEIGHT = intPreferencesKey("poster_preview_max_height")
         val HARDWARE_DECODING = booleanPreferencesKey("hardware_decoding")
         val PLAYBACK_MAX_HEIGHT = intPreferencesKey("playback_max_height")
         // 不沿用开发期的 download_max_height：那时它只是对话框的默认选中，存过的值换到新语义就成了「不再询问」
@@ -133,6 +137,11 @@ class SessionManager(private val context: Context) : PikoUserPreferences {
         val IGNORED_UPDATE_VERSION = stringPreferencesKey("ignored_update_version")
         val METATUBE_URL = stringPreferencesKey("metatube_url")
         val METATUBE_TOKEN = stringPreferencesKey("metatube_token")
+        val TRANSLATION_BASE_URL = stringPreferencesKey("translation_base_url")
+        val TRANSLATION_API_KEY = stringPreferencesKey("translation_api_key")
+        val TRANSLATION_MODEL = stringPreferencesKey("translation_model")
+        val TRANSLATION_REASONING = stringPreferencesKey("translation_reasoning")
+        val TRANSLATION_PROMPT = stringPreferencesKey("translation_prompt")
     }
 
     /**
@@ -194,6 +203,24 @@ class SessionManager(private val context: Context) : PikoUserPreferences {
     override suspend fun setReduceMotion(enabled: Boolean) {
         context.dataStore.edit { preferences ->
             preferences[PreferencesKeys.REDUCE_MOTION] = enabled
+        }
+    }
+
+    override val posterAutoPreviewFlow: Flow<Boolean> =
+        preference { it[PreferencesKeys.POSTER_AUTO_PREVIEW] ?: true }
+
+    override suspend fun setPosterAutoPreviewEnabled(enabled: Boolean) {
+        context.dataStore.edit { preferences ->
+            preferences[PreferencesKeys.POSTER_AUTO_PREVIEW] = enabled
+        }
+    }
+
+    override val posterPreviewMaxHeightFlow: Flow<Int> =
+        preference { it[PreferencesKeys.POSTER_PREVIEW_MAX_HEIGHT] ?: 0 }
+
+    override suspend fun setPosterPreviewMaxHeight(height: Int) {
+        context.dataStore.edit { preferences ->
+            preferences[PreferencesKeys.POSTER_PREVIEW_MAX_HEIGHT] = height
         }
     }
 
@@ -572,6 +599,65 @@ class SessionManager(private val context: Context) : PikoUserPreferences {
         }
         context.dataStore.edit { preferences ->
             if (sealed.isEmpty()) preferences.remove(PreferencesKeys.METATUBE_TOKEN) else preferences[PreferencesKeys.METATUBE_TOKEN] = sealed
+        }
+    }
+
+    override val translationBaseUrlFlow: Flow<String> =
+        preference { it[PreferencesKeys.TRANSLATION_BASE_URL].orEmpty() }
+
+    override suspend fun setTranslationBaseUrl(url: String) {
+        context.dataStore.edit { preferences ->
+            preferences[PreferencesKeys.TRANSLATION_BASE_URL] = url
+        }
+    }
+
+    // 与 MetaTube 令牌同样加密：API Key 能直接刷钱，不能落明文
+    override val translationApiKeyFlow: Flow<String> =
+        preference { it[PreferencesKeys.TRANSLATION_API_KEY] }.map { stored ->
+            stored?.let(CredentialCipher::decrypt).orEmpty()
+        }
+
+    override suspend fun setTranslationApiKey(key: String) {
+        val sealed = if (key.isEmpty()) {
+            ""
+        } else {
+            runCatching { CredentialCipher.encrypt(key) }
+                .onFailure { PikoLog.w(TAG, "翻译 API Key 加密失败，未保存", it) }
+                .getOrNull() ?: return
+        }
+        context.dataStore.edit { preferences ->
+            if (sealed.isEmpty()) {
+                preferences.remove(PreferencesKeys.TRANSLATION_API_KEY)
+            } else {
+                preferences[PreferencesKeys.TRANSLATION_API_KEY] = sealed
+            }
+        }
+    }
+
+    override val translationModelFlow: Flow<String> =
+        preference { it[PreferencesKeys.TRANSLATION_MODEL].orEmpty() }
+
+    override suspend fun setTranslationModel(model: String) {
+        context.dataStore.edit { preferences ->
+            preferences[PreferencesKeys.TRANSLATION_MODEL] = model
+        }
+    }
+
+    override val translationReasoningFlow: Flow<String> =
+        preference { it[PreferencesKeys.TRANSLATION_REASONING].orEmpty() }
+
+    override suspend fun setTranslationReasoning(level: String) {
+        context.dataStore.edit { preferences ->
+            preferences[PreferencesKeys.TRANSLATION_REASONING] = level
+        }
+    }
+
+    override val translationPromptFlow: Flow<String> =
+        preference { it[PreferencesKeys.TRANSLATION_PROMPT].orEmpty() }
+
+    override suspend fun setTranslationPrompt(prompt: String) {
+        context.dataStore.edit { preferences ->
+            preferences[PreferencesKeys.TRANSLATION_PROMPT] = prompt
         }
     }
 }

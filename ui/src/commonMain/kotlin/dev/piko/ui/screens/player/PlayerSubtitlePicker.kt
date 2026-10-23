@@ -10,12 +10,17 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.background
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.outlined.Folder
+import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Subtitles
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -75,7 +80,28 @@ internal fun DriveSubtitlePanel(
                 PickerRow(icon = Icons.Outlined.Folder, label = folder.name, onClick = { state.open(folder) })
             }
             items(state.subtitles, key = { "f:" + it.id }) { file ->
-                PickerRow(icon = Icons.Outlined.Subtitles, label = file.name, onClick = { onPick(file) })
+                PickerRow(
+                    icon = Icons.Outlined.Subtitles,
+                    label = file.name,
+                    onClick = { onPick(file) },
+                    trailing = {
+                        // 删的是网盘里的那个字幕文件（进回收站，可恢复），删完列表自己重列。
+                        // 加浅红底圈：纯图标在长文件名旁边太容易被忽略
+                        IconButton(
+                            onClick = { state.delete(file) },
+                            modifier = Modifier
+                                .size(32.dp)
+                                .background(MaterialTheme.colorScheme.errorContainer, CircleShape),
+                        ) {
+                            Icon(
+                                Icons.Outlined.Delete,
+                                contentDescription = "删除字幕",
+                                tint = MaterialTheme.colorScheme.error,
+                                modifier = Modifier.size(18.dp),
+                            )
+                        }
+                    },
+                )
             }
             val error = state.loadError
             when {

@@ -74,6 +74,21 @@ class SubtitleBrowserState(
         loadJob = scope.launch { load() }
     }
 
+    /** 删除网盘里的这个字幕文件，删完重列。失败把原因挂在 [loadError] 上。 */
+    fun delete(file: FileStat) {
+        scope.launch {
+            driveRepo.delete(listOf(file.id))
+                .onSuccess {
+                    PikoLog.i(TAG, "已删除字幕 ${file.name.substringAfterLast('.', "未知")}")
+                    reload()
+                }
+                .onFailure { error ->
+                    PikoLog.w(TAG, "删除字幕失败", error)
+                    loadError = "删除失败：${error.message ?: "未知错误"}"
+                }
+        }
+    }
+
     private suspend fun load() {
         val folderId = current?.id ?: return
         isLoading = true
