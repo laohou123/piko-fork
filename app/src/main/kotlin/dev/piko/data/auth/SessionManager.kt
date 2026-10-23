@@ -142,6 +142,7 @@ class SessionManager(private val context: Context) : PikoUserPreferences {
         val TRANSLATION_MODEL = stringPreferencesKey("translation_model")
         val TRANSLATION_REASONING = stringPreferencesKey("translation_reasoning")
         val TRANSLATION_PROMPT = stringPreferencesKey("translation_prompt")
+        val TRANSLATION_CONCURRENCY = intPreferencesKey("translation_concurrency")
     }
 
     /**
@@ -658,6 +659,15 @@ class SessionManager(private val context: Context) : PikoUserPreferences {
     override suspend fun setTranslationPrompt(prompt: String) {
         context.dataStore.edit { preferences ->
             preferences[PreferencesKeys.TRANSLATION_PROMPT] = prompt
+        }
+    }
+
+    override val translationConcurrencyFlow: Flow<Int> =
+        preference { it[PreferencesKeys.TRANSLATION_CONCURRENCY] ?: 0 }
+
+    override suspend fun setTranslationConcurrency(count: Int) {
+        context.dataStore.edit { preferences ->
+            preferences[PreferencesKeys.TRANSLATION_CONCURRENCY] = count
         }
     }
 }

@@ -1,5 +1,6 @@
 package dev.piko.shared.translate
 
+import dev.piko.data.auth.DEFAULT_TRANSLATION_CONCURRENCY
 import dev.piko.data.auth.PikoUserPreferences
 import io.ktor.client.HttpClient
 import kotlinx.coroutines.flow.first
@@ -48,11 +49,11 @@ class TranslationGateway(
 
     suspend fun subtitleTranslator(): SubtitleTranslator? {
         val s = settings() ?: return null
-        return SubtitleTranslator(clientOf(s), prompt = s.prompt)
+        return SubtitleTranslator(clientOf(s), concurrency = s.concurrency, prompt = s.prompt)
     }
 
     suspend fun titleTranslator(): TitleTranslator? = settings()?.let { s ->
-        TitleTranslator(clientOf(s))
+        TitleTranslator(clientOf(s), concurrency = s.concurrency)
     }
 
     /** 片名有单独的超时偏好吗？没有——片名短，与字幕共用一套即可。 */
@@ -67,6 +68,8 @@ class TranslationGateway(
             model = model,
             reasoning = preferences.translationReasoningFlow.first().trim(),
             prompt = preferences.translationPromptFlow.first(),
+            concurrency = preferences.translationConcurrencyFlow.first()
+                .takeIf { it > 0 } ?: DEFAULT_TRANSLATION_CONCURRENCY,
         )
     }
 
@@ -76,5 +79,6 @@ class TranslationGateway(
         val model: String,
         val reasoning: String,
         val prompt: String,
+        val concurrency: Int,
     )
 }

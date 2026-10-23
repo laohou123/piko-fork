@@ -22,7 +22,7 @@
 
 这是 [NihilDigit/piko](https://github.com/NihilDigit/piko) 的定制分支，在上游的网盘客户端之上加了一套**本地影视库**：
 
-- 选一个网盘目录扫描，按番号自动归组成「作品」
+- 选一个网盘目录扫描，按作品编号自动归组成「作品」
 - 元数据、封面、截图全部经**自建 MetaTube** 代理获取（客户端不直连源站，绕开反爬与图片防盗链）
 - **AI 翻译**：字幕逐条对齐翻译、片名批量翻译，模型由你自己填（任意 OpenAI 兼容接口）
 - 收藏、演员／标签筛选、搜索、多文件合并、增量重扫等完整浏览体验
@@ -33,9 +33,9 @@
 
 | 能力 | 说明 |
 |---|---|
-| 扫描归组 | 递归扫目录，按番号把分集／多版本收成一部；认不出番号的视频也保留，直接显示文件名 |
+| 扫描归组 | 递归扫目录，按编号把分集／多版本收成一部；认不出编号的视频也保留，直接显示文件名 |
 | 刮削 | MetaTube 优先：标题、封面、背景图、截图墙、演员、标签、片商、系列、时长 |
-| 筛选与搜索 | 全部／收藏／演员／标签四个等宽按钮，右上角搜索支持番号、标题、女优、标签 |
+| 筛选与搜索 | 全部／收藏／演员／标签四个等宽按钮，右上角搜索支持编号、标题、演员、标签 |
 | 收藏 | 作品收藏（海报墙／详情页／播放页），演员与标签长按收藏并置顶 |
 | 详情页 | 顶部用 Piko 自带播放后端播正片中段作预览，横向大封面、截图墙（可全屏左右翻）、底部固定操作栏 |
 | 增量重扫 | 网盘里删掉视频，完整重扫后自动移除对应作品；中途停止不会误删 |
@@ -48,7 +48,7 @@
 
 **字幕翻译**（播放页 → 字幕面板 → AI 翻译字幕）
 
-- 译文命名 `<番号>.zh.srt`，传回视频所在目录并当场挂载，换设备也能直接用
+- 译文命名 `<编号>.zh.srt`，传回视频所在目录并当场挂载，换设备也能直接用
 - 管线四层保护：按字数分批且**不切断单条字幕**、**行数对齐校验**（对不上就逐条重翻）、并发 + 指数退避重试、第二轮串行补漏
 - 部分行失败时保留原文，不会出现空洞
 
@@ -69,7 +69,7 @@
 
 到 [Releases](../../releases/latest) 下载安装包。
 
-- **Android**：`piko-poster-wall-release.apk`，Android 8.0+，约 40 MB（含三 ABI 的 libmpv）
+- **Android**：`piko-0.5.1-universal.apk`，Android 8.0+，约 40 MB（含三 ABI 的 libmpv）
 - **桌面端**：Windows／macOS／Linux 构建方式见下方「从源码构建」
 
 > 本分支的 APK 使用自有证书签名。与官方版或 debug 版包名不同，可共存，但**数据不共享**。
@@ -95,8 +95,8 @@ export ANDROID_KEYSTORE_PATH=/path/to/release.jks
 export ANDROID_KEYSTORE_PASSWORD='<your-store-password>'
 export ANDROID_KEY_ALIAS='<your-key-alias>'
 export ANDROID_KEY_PASSWORD='<your-key-password>'
-export PIKO_VERSION_NAME=0.5.0
-export PIKO_VERSION_CODE=5000
+export PIKO_VERSION_NAME=0.5.1
+export PIKO_VERSION_CODE=5001
 ./gradlew :app:assembleRelease -Ppiko.enableAbiSplits=false
 ```
 

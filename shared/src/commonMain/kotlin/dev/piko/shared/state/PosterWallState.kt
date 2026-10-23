@@ -79,6 +79,24 @@ class PosterWallState(
     var query by mutableStateOf("")
         private set
 
+    /**
+     * 海报墙的滚动位置（首项下标与像素偏移）。
+     *
+     * 故意**不是** Compose 的 mutableStateOf：界面只在首次组合时读一次作为初始值，
+     * 滚动时每帧都写，若进了快照系统会把整页重组几百次。切到别的 tab 再回来接着看，
+     * 进程退出后这里随对象重建归零，正好是"重开 App 回到顶部"。
+     */
+    var scrollIndex: Int = 0
+        private set
+    var scrollOffset: Int = 0
+        private set
+
+    /** 界面滚动时回写位置。 */
+    fun rememberScroll(index: Int, offset: Int) {
+        scrollIndex = index
+        scrollOffset = offset
+    }
+
     /** 正在单部刮削的番号（详情页「刮削这部」按钮），null 表示没有。 */
     var scrapingCode by mutableStateOf<String?>(null)
         private set
@@ -374,6 +392,9 @@ class PosterWallState(
     fun selectFilter(filter: Filter, name: String? = null) {
         this.filter = filter
         filterName = name
+        // 列表内容整个换了，停在上次的位置没有意义
+        scrollIndex = 0
+        scrollOffset = 0
         scope.launch { refresh() }
     }
 

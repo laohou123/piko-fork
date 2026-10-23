@@ -92,30 +92,36 @@ class SubtitleTranslator(
             }.awaitAll()
         }
 
-        // 第二轮：漏掉的行一条一条慢慢来。整批失败多半是被限流，串行能把它们救回来
+        // 第二轮：把漏掉的行补回来。
+        // 用一个小并发（2）而不是纯串行——纯串行时 20 条漏行要等 20 个来回，
+        // 而此时的限流压力已经比第一轮小；真被限流了，单条重试照样会退避。
         if (leftovers.isNotEmpty()) {
-            PikoLog.i(TAG, "第二轮补翻 ${leftovers.sumOf { it.size }} 行")
-            for (batch in leftovers) {
-                for (cue in batch) {
-                    if (cue in translated) continue
-                    val line = translateOne(doc.cues[cue].text)
-                    if (line != null) {
-                        translated[cue] = line
-                        mutex.withLock { ok++ }
+            val missing = leftovers.flatten().filterNot { it in translated }
+            PikoLog.i(TAG, "第二轮补翻 ${missing.size} 行")
+            val retryGate = Semaphore(RETRY_CONCURRENCY)
+            coroutineScope {
+                missing.map { cue ->
+                    async {
+                        retryGate.withPermit {
+                            val line = translateOne(doc.cues[cue].text)
+                            mutex.withLock {
+                                if (line != null && cue !in translated) {
+                                    translated[cue] = line
+                                    ok++
+                                }
+                                pending = doc.size - ok
+                                onProgress(
+                                    SubtitleProgress(
+                                        doneBatches = done.coerceAtMost(batches.size),
+                                        totalBatches = batches.size,
+                                        translatedLines = ok,
+                                        pendingLines = pending,
+                                    ),
+                                )
+                            }
+                        }
                     }
-                }
-                mutex.withLock {
-                    done++
-                    pending = doc.size - ok
-                    onProgress(
-                        SubtitleProgress(
-                            doneBatches = done.coerceAtMost(batches.size),
-                            totalBatches = batches.size,
-                            translatedLines = ok,
-                            pendingLines = pending,
-                        ),
-                    )
-                }
+                }.awaitAll()
             }
         }
 
@@ -163,6 +169,9 @@ class SubtitleTranslator(
 
         /** 超过这么多行就不再逐条重试，逐条只会把请求数翻好几倍。 */
         private const val PER_LINE_RETRY_LIMIT = 12
+
+        /** 第二轮补漏的并发：比第一轮小，给限流留余量。 */
+        private const val RETRY_CONCURRENCY = 2
 
         /**
          * 默认提示词。前六条是「翻得准」的要求，最后三条是这套管线必须的格式约束——

@@ -505,9 +505,21 @@ private fun createServices(settings: DesktopSettingsStore, preferences: DesktopP
             // 翻译一次要几十秒，超时按分钟级给；真正的单批上限在 TranslationClient 里控
             HttpClient(OkHttp) {
                 install(HttpTimeout) {
-                requestTimeoutMillis = 120_000
-                connectTimeoutMillis = 15_000
-                socketTimeoutMillis = 120_000
+                    requestTimeoutMillis = 120_000
+                    connectTimeoutMillis = 15_000
+                    socketTimeoutMillis = 120_000
+                }
+                engine {
+                    config {
+                        // OkHttp 默认对同一域名只放 5 个并发请求：翻译并发调到 6 以上时，
+                        // 多出来的请求会在客户端排队，看起来就是「设了高并发还是慢」
+                        dispatcher(
+                            okhttp3.Dispatcher().apply {
+                                maxRequests = 64
+                                maxRequestsPerHost = 32
+                            },
+                        )
+                    }
                 }
             }
         },

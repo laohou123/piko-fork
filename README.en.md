@@ -33,7 +33,7 @@ A custom branch of [NihilDigit/piko](https://github.com/NihilDigit/piko). Everyt
 |---|---|
 | Scan & group | Recursive scan, grouped by code; files whose code can't be parsed are still kept and shown by file name |
 | Scraping | Via MetaTube: title, cover, backdrop, screenshot wall, actors, tags, studio, series, runtime |
-| Filters | All / Favourites / Actor / Tag as four equal-width chips; search matches code, title, actress or tag |
+| Filters | All / Favourites / Actor / Tag as four equal-width chips; search matches code, title, actor or tag |
 | Favourites | Works (wall, detail, player); actors and tags via long press, pinned to the top |
 | Detail page | Muted preview of the actual video (Piko's own playback backend), large cover, swipeable screenshot wall, fixed bottom action bar |
 | Incremental rescan | Deleting a video in the drive removes the work after a full rescan; stopping early never deletes anything |
@@ -58,7 +58,7 @@ Any provider that speaks `POST /chat/completions`: DeepSeek, OpenAI, Qwen, proxi
 
 Download from [Releases](../../releases/latest).
 
-- **Android**: `piko-poster-wall-release.apk`, Android 8.0+, ~40 MB (three ABIs of libmpv)
+- **Android**: `piko-0.5.1-universal.apk`, Android 8.0+, ~40 MB (three ABIs of libmpv)
 - **Desktop**: build from source with the commands below
 
 > The APK is signed with this branch's own key. It uses a different package name than the official or debug builds, so both can coexist, but **data is not shared**.
@@ -83,8 +83,8 @@ export ANDROID_KEYSTORE_PATH=/path/to/release.jks
 export ANDROID_KEYSTORE_PASSWORD='<your-store-password>'
 export ANDROID_KEY_ALIAS='<your-key-alias>'
 export ANDROID_KEY_PASSWORD='<your-key-password>'
-export PIKO_VERSION_NAME=0.5.0
-export PIKO_VERSION_CODE=5000
+export PIKO_VERSION_NAME=0.5.1
+export PIKO_VERSION_CODE=5001
 ./gradlew :app:assembleRelease -Ppiko.enableAbiSplits=false
 ```
 

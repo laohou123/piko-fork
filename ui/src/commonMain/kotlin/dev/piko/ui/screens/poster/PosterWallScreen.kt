@@ -1,5 +1,10 @@
 package dev.piko.ui.screens.poster
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.BorderStroke
@@ -26,6 +31,7 @@ import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Star
@@ -40,6 +46,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.FocusRequester
@@ -55,11 +62,13 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.ContentScale
@@ -79,6 +88,8 @@ import dev.piko.ui.components.PikoScaffold
 import dev.piko.ui.components.PikoSheet
 import dev.piko.ui.components.PikoTopBar
 import dev.piko.ui.components.iconBarItem
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.launch
 
 /**
  * 海报墙：扫一个网盘目录，把里面的番号片收成一部一部的网格。列表、演员与标签
@@ -98,7 +109,32 @@ fun PosterWallScreen(
     // 入口在 posterWall 为 null（截图环境）时给了兜底空态，正常到不了这里；仍防一手
     val state = services.posterWall ?: return
     val snackbarHostState = remember { SnackbarHostState() }
-    val gridState = rememberLazyGridState()
+    val scope = rememberCoroutineScope()
+    // 网格位置存在 state 里（普通字段，不是 mutableStateOf）：切 tab、进详情页再回来都在原位，
+    // 退出 App 后进程销毁、state 随之丢失，自然回到顶部
+    val gridState = rememberLazyGridState(
+        initialFirstVisibleItemIndex = state.scrollIndex,
+        initialFirstVisibleItemScrollOffset = state.scrollOffset,
+    )
+
+    // 滚动时把位置写回 state。值没变就不写；写的是两个 Int，不触发重组
+    LaunchedEffect(gridState) {
+        snapshotFlow {
+            gridState.firstVisibleItemIndex to gridState.firstVisibleItemScrollOffset
+        }
+            .distinctUntilChanged()
+            .collect { (index, offset) -> state.rememberScroll(index, offset) }
+    }
+
+    // 筛选或搜索换了，列表整体变了，回顶部；首帧不碰，好让恢复的位置生效
+    val listKey = state.filter to state.query
+    var prevListKey by remember { mutableStateOf(listKey) }
+    LaunchedEffect(listKey) {
+        if (listKey != prevListKey) {
+            prevListKey = listKey
+            gridState.scrollToItem(0)
+        }
+    }
 
     var showScrapeDialog by remember { mutableStateOf(false) }
     var showFolderPicker by remember { mutableStateOf(false) }
@@ -124,6 +160,20 @@ fun PosterWallScreen(
             )
         },
         snackbarHost = { SnackbarHost(snackbarHostState) },
+        // 回顶悬浮按钮：滑过第一屏才出现，点一下平滑滚回海报墙顶部
+        floatingActionButton = {
+            AnimatedVisibility(
+                visible = gridState.firstVisibleItemIndex > 0,
+                enter = fadeIn() + scaleIn(),
+                exit = fadeOut() + scaleOut(),
+            ) {
+                FloatingActionButton(
+                    onClick = { scope.launch { gridState.animateScrollToItem(0) } },
+                ) {
+                    Icon(Icons.Filled.ArrowUpward, contentDescription = "回到顶部")
+                }
+            }
+        },
     ) { padding ->
         Column(modifier = Modifier.fillMaxSize().padding(padding)) {
             if (searchActive) {

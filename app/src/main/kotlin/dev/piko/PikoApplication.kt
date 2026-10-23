@@ -127,6 +127,18 @@ class PikoApplication : Application(), SingletonImageLoader.Factory {
                         connectTimeoutMillis = 15_000
                         socketTimeoutMillis = 120_000
                     }
+                    engine {
+                        config {
+                            // OkHttp 默认对同一域名只放 5 个并发请求：翻译并发调到 6 以上时，
+                            // 多出来的请求会在客户端排队，看起来就是"设了高并发还是慢"
+                            dispatcher(
+                                okhttp3.Dispatcher().apply {
+                                    maxRequests = 64
+                                    maxRequestsPerHost = 32
+                                },
+                            )
+                        }
+                    }
                 }
             },
             subtitleSaver = AndroidSubtitleFileSaver(this),

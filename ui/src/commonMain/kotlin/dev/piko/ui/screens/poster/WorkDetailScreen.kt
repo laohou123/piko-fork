@@ -268,14 +268,6 @@ fun WorkDetailScreen(
                                 )
                             }
                         }
-                        d.summary?.let {
-                            Text(
-                                text = it,
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.padding(top = 8.dp),
-                            )
-                        }
                         // 信息网格：发行日期 / 时长 / 片商 / 系列
                         val info = buildList {
                             d.work.releaseDate?.let { add("发行日期" to it) }

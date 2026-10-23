@@ -250,9 +250,9 @@ GROUP BY t.tag_name ORDER BY favorite DESC, count DESC, name;
 selectFileCounts:
 SELECT work_code, COUNT(*) AS count, SUM(size) AS total FROM work_files GROUP BY work_code;
 
--- 搜索：番号、标题、演员、标签任一处命中就算。返回匹配的番号集合，列表查询再按它过滤
+-- 搜索：番号、标题、译名、演员、标签任一处命中就算。返回匹配的番号集合，列表查询再按它过滤
 searchCodes:
-SELECT code FROM works WHERE code LIKE :pattern OR title LIKE :pattern
+SELECT code FROM works WHERE code LIKE :pattern OR title LIKE :pattern OR title_zh LIKE :pattern
 UNION
 SELECT work_code FROM work_actors WHERE actor_name LIKE :pattern
 UNION

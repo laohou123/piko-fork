@@ -188,6 +188,7 @@ fun SettingsScreen(
     val translationModel by sessionManager.translationModelFlow.collectAsStateWithLifecycle(initialValue = "")
     val translationReasoning by sessionManager.translationReasoningFlow.collectAsStateWithLifecycle(initialValue = "")
     val translationPrompt by sessionManager.translationPromptFlow.collectAsStateWithLifecycle(initialValue = "")
+    val translationConcurrency by sessionManager.translationConcurrencyFlow.collectAsStateWithLifecycle(initialValue = 0)
     var showTranslationDialog by remember { mutableStateOf(false) }
     val posterWall = services.posterWall
 
@@ -614,7 +615,8 @@ fun SettingsScreen(
             currentModel = translationModel,
             currentReasoning = translationReasoning,
             currentPrompt = translationPrompt,
-            onSave = { base, key, model, reasoning, prompt ->
+            currentConcurrency = translationConcurrency,
+            onSave = { base, key, model, reasoning, prompt, concurrency ->
                 showTranslationDialog = false
                 scope.launch {
                     sessionManager.setTranslationBaseUrl(base)
@@ -622,6 +624,7 @@ fun SettingsScreen(
                     sessionManager.setTranslationModel(model)
                     sessionManager.setTranslationReasoning(reasoning)
                     sessionManager.setTranslationPrompt(prompt)
+                    sessionManager.setTranslationConcurrency(concurrency)
                 }
             },
             onDismiss = { showTranslationDialog = false },

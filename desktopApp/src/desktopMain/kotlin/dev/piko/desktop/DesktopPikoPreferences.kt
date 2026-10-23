@@ -459,6 +459,13 @@ class DesktopPikoPreferences(
         translationPrompt.value = prompt
     }
 
+    private val translationConcurrency = MutableStateFlow(settings.get(KEY_TRANSLATION_CONCURRENCY).toIntOrNull() ?: 0)
+    override val translationConcurrencyFlow: Flow<Int> = translationConcurrency.asStateFlow()
+    override suspend fun setTranslationConcurrency(count: Int) {
+        settings.set(KEY_TRANSLATION_CONCURRENCY, count.toString())
+        translationConcurrency.value = count
+    }
+
     private companion object {
         const val TAG = "credentials"
         const val SECRET_METATUBE_TOKEN = "metatube-token"
@@ -468,6 +475,7 @@ class DesktopPikoPreferences(
         const val KEY_TRANSLATION_MODEL = "translate.model"
         const val KEY_TRANSLATION_REASONING = "translate.reasoning"
         const val KEY_TRANSLATION_PROMPT = "translate.prompt"
+        const val KEY_TRANSLATION_CONCURRENCY = "translate.concurrency"
 
         fun uploadCredentialsKey(taskId: String) = "upload-$taskId"
 

@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.TextButton
+import dev.piko.data.auth.DEFAULT_TRANSLATION_CONCURRENCY
 import dev.piko.shared.translate.SubtitleTranslator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -44,13 +45,24 @@ internal fun TranslationSettingsDialog(
     currentModel: String,
     currentReasoning: String,
     currentPrompt: String,
-    onSave: (baseUrl: String, apiKey: String, model: String, reasoning: String, prompt: String) -> Unit,
+    currentConcurrency: Int,
+    onSave: (
+        baseUrl: String,
+        apiKey: String,
+        model: String,
+        reasoning: String,
+        prompt: String,
+        concurrency: Int,
+    ) -> Unit,
     onDismiss: () -> Unit,
 ) {
     var baseUrl by remember { mutableStateOf(currentBaseUrl) }
     var apiKey by remember { mutableStateOf(currentApiKey) }
     var model by remember { mutableStateOf(currentModel) }
     var reasoning by remember { mutableStateOf(currentReasoning) }
+    var concurrency by remember {
+        mutableStateOf(currentConcurrency.takeIf { it > 0 } ?: DEFAULT_TRANSLATION_CONCURRENCY)
+    }
     // 输入框里始终显示"实际会生效的提示词"：用户没改过就填默认的那套，
     // 看得见才好改；保存时若与默认一致就存空串，以后默认提示词升级能跟着更新
     var prompt by remember {
@@ -78,6 +90,7 @@ internal fun TranslationSettingsDialog(
                 reasoning,
                 // 与默认一致就存空，恢复成"跟随内置提示词"
                 if (custom == SubtitleTranslator.SUBTITLE_PROMPT.trim()) "" else custom,
+                concurrency,
             )
         },
         saveEnabled = !urlInvalid,
@@ -123,6 +136,27 @@ internal fun TranslationSettingsDialog(
         }
         Text(
             text = "关掉最快，适合字幕这种一次几百条的小请求；翻译质量不满意再把档位调高。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        Text(
+            text = "同时请求数",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            CONCURRENCY_OPTIONS.forEach { (value, label) ->
+                FilterChip(
+                    selected = concurrency == value,
+                    onClick = { concurrency = value },
+                    label = { Text(label, maxLines = 1) },
+                )
+            }
+        }
+        Text(
+            text = "调高能快几倍，但更容易被服务商限流（429）。被限流不会失败，只是会退避重试，反而更慢——" +
+                "所以觉得没快反而更慢时，往回调一档。",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -194,6 +228,13 @@ internal fun TranslationSettingsDialog(
         }
     }
 }
+
+/** 可选的同时请求数。3 保守，6 默认，10 激进。 */
+private val CONCURRENCY_OPTIONS = listOf(
+    3 to "保守 3",
+    6 to "标准 6",
+    10 to "激进 10",
+)
 
 /** 推理强度：值 → 界面文案。空串是不传参数（最快）。 */
 private val REASONING_OPTIONS = listOf(

@@ -288,4 +288,14 @@ interface PikoUserPreferences {
      */
     val translationPromptFlow: Flow<String>
     suspend fun setTranslationPrompt(prompt: String)
+
+    /**
+     * 同时发出的翻译请求数。0 表示默认（[DEFAULT_TRANSLATION_CONCURRENCY]）。
+     * 调高换速度，代价是更容易被服务商限流（429）——限流本身有退避重试，不会失败，只是会变慢。
+     */
+    val translationConcurrencyFlow: Flow<Int>
+    suspend fun setTranslationConcurrency(count: Int)
 }
+
+/** 没选过并发时的默认值：比早期的 3/4 翻倍，又不至于把免费额度打到限流。 */
+const val DEFAULT_TRANSLATION_CONCURRENCY = 6
