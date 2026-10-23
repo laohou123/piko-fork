@@ -46,7 +46,9 @@ android {
     }
 
     defaultConfig {
-        applicationId = "dev.piko"
+        // 与上游官方版（dev.piko）区分开：包名不同才能同时装着，签名也各自独立。
+        // namespace 仍是 dev.piko，代码里的包结构不变
+        applicationId = "dev.piko.fork"
         minSdk = 26
         targetSdk = 37
         versionCode = appVersionCode.get()
