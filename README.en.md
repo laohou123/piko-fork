@@ -61,7 +61,7 @@ Download from [Releases](../../releases/latest).
 - **Android**: `piko-0.5.3-universal.apk`, Android 8.0+, ~40 MB (three ABIs of libmpv)
 - **Desktop**: build from source with the commands below
 
-> The APK is signed with this branch's own key. It uses a different package name than the official or debug builds, so both can coexist, but **data is not shared**.
+> The APK is signed with this branch's own key and uses the **same** package name as the official release (`dev.piko`), with a different signature — so the two **cannot coexist**: uninstall the official build first (which clears its data). This branch's debug build is `dev.piko.debug`, which can coexist with the official release. Data is not shared either way.
 
 ## First run
 
