@@ -172,10 +172,10 @@ class SubtitleSearchState(
                 uploads.tasks.first { tasks ->
                     tasks.values.any {
                         it.fileName == fileName &&
-                            (it.status == UploadStatus.COMPLETED || it.status == UploadStatus.FAILED)
+                            ((it.status == UploadStatus.COMPLETED && it.fileId != null) || it.status == UploadStatus.FAILED)
                     }
                 }
-            }?.values?.firstOrNull { it.fileName == fileName }
+            }?.values?.firstOrNull { it.fileName == fileName && it.fileId != null }
             val fileId = settled?.fileId
             when {
                 fileId != null -> {

@@ -282,9 +282,17 @@ class PlayerScreenState(
     fun addDriveSubtitle(subtitleFileId: String, name: String) {
         val videoFileId = fileId
         scope.launch {
-            val stream = repository.prepareSubtitle(subtitleFileId)
+            // 字幕是刚传上去的：网盘那边可能还没把文件放进目录、取不到下载链接。
+            // 一次打不开就等一会儿再试，别直接报「无法打开字幕文件」让用户手动挂
+            var stream: ProxyStream? = null
+            repeat(SUBTITLE_OPEN_ATTEMPTS) { attempt ->
+                stream = repository.prepareSubtitle(subtitleFileId)
+                if (stream != null) return@repeat
+                if (attempt < SUBTITLE_OPEN_ATTEMPTS - 1) delay(SUBTITLE_OPEN_RETRY_MS)
+            }
             if (stream == null) {
-                _messages.tryEmit("无法打开字幕文件")
+                PikoLog.w(TAG, "字幕传上去了但打不开：$subtitleFileId")
+                _messages.tryEmit("字幕暂时打不开，可在「从网盘选择字幕」里手动挂")
                 return@launch
             }
             // 取流期间换了集，这条字幕不属于新文件
@@ -784,6 +792,10 @@ class PlayerScreenState(
 
         // 打开第一个文件前等播放列表的上限，超过就不带外挂字幕先放
         const val PLAYLIST_WAIT_MILLIS = 3_000L
+
+        /** 刚传上去的字幕，网盘可能还没放进目录、取不到链接：多试几次再放弃。 */
+        const val SUBTITLE_OPEN_ATTEMPTS = 4
+        const val SUBTITLE_OPEN_RETRY_MS = 1_500L
 
         // 开播前等云端续播位置的上限。它与取流并行，通常早已回来；网络差时不为它拖住开播
         const val CLOUD_RESUME_WAIT_MILLIS = 1_500L

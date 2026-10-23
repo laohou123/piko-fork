@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!--
+        Android 9 起默认拒绝明文 HTTP。用户自建的服务（MetaTube、AI 翻译接口如本机
+        Ollama / LM Studio、局域网里的中转站）多半只有 http，地址又是用户自己在设置里
+        填的，没法在这里预先列出，所以默认放行明文。
+        网盘官方接口一律走 https：下面单独把它们锁死，明文请求到官方域名仍然被拒，
+        不会因为放开明文而把账号与令牌暴露在明文通道上。
+    -->
+    <base-config cleartextTrafficPermitted="true" />
+    <domain-config cleartextTrafficPermitted="false">
+        <domain includeSubdomains="true">mypikpak.com</domain>
+        <domain includeSubdomains="true">pikpak.com</domain>
+    </domain-config>
+</network-security-config>
