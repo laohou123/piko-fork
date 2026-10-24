@@ -1,0 +1,12 @@
+-- v6→v7：加一张变更记录表，把译名与收藏同步到网盘时靠它比新旧。
+-- 译名、作品/演员/标签收藏每次改动都记一行（时刻 + 新值 + 开关）。
+-- 取消收藏在 favorite_* 表里是删行，删了就无从比较，只能靠这张表留下「什么时候取消的」。
+-- 升级前就有的译名与收藏没有记录，第一次导出时补一条时刻 0 的：既不丢，也不会盖掉别的设备的改动。
+CREATE TABLE sync_marks (
+    kind TEXT NOT NULL,
+    key TEXT NOT NULL,
+    at INTEGER NOT NULL,
+    title_value TEXT,
+    on_flag INTEGER NOT NULL,
+    PRIMARY KEY (kind, key)
+);

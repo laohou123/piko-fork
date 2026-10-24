@@ -48,6 +48,11 @@
 - **MetaTube 令牌与翻译 API Key 也同步，但先加密**：密钥由账号密码派生（PBKDF2 + AES-GCM），别人拿到同步文件也解不开
 - 按项带时间戳合并，两台设备各改一项两项都保留；下载目录与代理按设备各自保留，不同步
 
+另有一份 `.piko/library-*.json` 专门放库数据：**中文译名、作品收藏、演员收藏、标签收藏**。
+每条带最后修改时刻，谁后改谁赢——两台设备各翻各的、各收藏各的，结果都留下；
+取消收藏、把译名改回原名也会同步过去，不会被另一台设备又补回来。
+这份文件只在翻译或收藏变化时才重传（批量翻译结束后一次），改设置不会带上它。
+
 图片全部走 MetaTube 的图片代理端点，由服务端取图后再返回，因此不受源站 Referer 校验、防盗链与网络可达性影响。
 
 ## AI 翻译
@@ -77,7 +82,7 @@
 
 到 [Releases](../../releases/latest) 下载安装包。
 
-- **Android**：`piko-1.2-universal.apk`，Android 8.0+，约 40 MB（含三 ABI 的 libmpv）
+- **Android**：`piko-1.3.0-universal.apk`，Android 8.0+，约 40 MB（含三 ABI 的 libmpv）
 - **桌面端**：Windows／macOS／Linux 构建方式见下方「从源码构建」
 
 > 本分支的包名是 `dev.piko.fork`，官方版是 `dev.piko`，两者签名也不同，因此**可以同时安装、各自独立运行**。
@@ -104,8 +109,8 @@ export ANDROID_KEYSTORE_PATH=/path/to/release.jks
 export ANDROID_KEYSTORE_PASSWORD='<your-store-password>'
 export ANDROID_KEY_ALIAS='<your-key-alias>'
 export ANDROID_KEY_PASSWORD='<your-key-password>'
-export PIKO_VERSION_NAME=1.2
-export PIKO_VERSION_CODE=10200
+export PIKO_VERSION_NAME=1.3.0
+export PIKO_VERSION_CODE=10300
 ./gradlew :app:assembleRelease -Ppiko.enableAbiSplits=false
 ```
 

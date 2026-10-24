@@ -621,7 +621,13 @@ fun SettingsScreen(
                                 enabled = isSettingsSyncEnabled,
                                 status = syncStatusText(syncStatus, lastSynced),
                                 onEnabledChange = { scope.launch { sessionManager.setSettingsSyncEnabled(it) } },
-                                onSyncNow = { scope.launch { settingsSync.syncNow() } },
+                                onSyncNow = {
+                                    scope.launch {
+                                        // 设置与「译名 + 收藏」是两份文件，一起同步，用户只点一次
+                                        settingsSync.syncNow()
+                                        services.librarySync?.syncNow()
+                                    }
+                                },
                             )
                             SettingsSwitchRow(
                                 icon = Icons.Outlined.History,

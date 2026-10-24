@@ -4,6 +4,9 @@ import app.cash.sqldelight.db.SqlDriver
 import dev.piko.library.LibraryQueries
 import dev.piko.shared.naming.av.matchAvFile
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -12,6 +15,26 @@ import kotlinx.coroutines.withContext
 interface LibraryDriverFactory {
     fun create(account: String): SqlDriver
 }
+
+/** 同步记录里的类别：译名与三种收藏。 */
+object SyncKind {
+    const val TITLE = "title"
+    const val WORK = "work"
+    const val ACTOR = "actor"
+    const val TAG = "tag"
+}
+
+/**
+ * 一条变更记录：谁（[key]）、什么时候（[at]，毫秒）、改成什么（译名在 [value]，收藏看 [on]）。
+ * 同步到网盘时按 (kind, key) 比 [at]，谁后改谁赢。
+ */
+data class SyncMark(
+    val kind: String,
+    val key: String,
+    val at: Long,
+    val value: String?,
+    val on: Boolean,
+)
 
 /** 海报墙索引进库时的一部作品：番号加它名下的视频文件（元数据还没刮）。 */
 data class ScannedWork(
@@ -95,6 +118,13 @@ class LibraryStore(
     private val drivers = mutableMapOf<String, SqlDriver>()
     private val queries = mutableMapOf<String, LibraryQueries>()
 
+    /**
+     * 本机的译名或收藏变了：同步类据此把改动推上去。
+     * 合并缓冲为 1，连续收藏几个只算一次——同步那头本来也会等几秒再动手。
+     */
+    private val _changes = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+    val changes: SharedFlow<Unit> = _changes.asSharedFlow()
+
     private fun queriesOf(account: String): LibraryQueries = queries.getOrPut(account) {
         val driver = drivers.getOrPut(account) { driverFactory.create(account) }
         LibraryQueries(driver)
@@ -164,6 +194,8 @@ class LibraryStore(
             q.deleteOrphanTags()
             q.deleteOrphanImages()
             q.deleteOrphanFavoriteWorks()
+            // 新设备先同步到了译名、后来才扫描：作品刚插进来，这里把记录里的译名补上
+            q.backfillTitleZhFromMarks()
             val now = System.currentTimeMillis()
             // 用库里的真实条数：没扫全时它比 works.size 大
             q.setScanState(rootFolderId, rootFolderName, now, q.selectWorkCount().executeAsOne(), 0L)
@@ -349,9 +381,13 @@ class LibraryStore(
 
     /** 写入中文标题；[titleZh] 传空串表示清掉译名、恢复显示原文。 */
     suspend fun setTitleZh(code: String, titleZh: String?) = withQueries { q ->
-        q.setWorkTitleZh(titleZh?.trim()?.takeIf { it.isNotEmpty() }, code)
+        val trimmed = titleZh?.trim()?.takeIf { it.isNotEmpty() }
+        val now = System.currentTimeMillis()
+        q.setWorkTitleZh(trimmed, code)
+        // 清空也记一条：别的设备拉到之后会把那边的译名一起清掉，而不是又被补回来
+        q.upsertSyncMark(SyncKind.TITLE, code, now, trimmed, if (trimmed != null) 1 else 0)
         Unit
-    }
+    }.also { _changes.tryEmit(Unit) }
 
     /**
      * 一次事务写入多条译名。批量翻片名时每条开一次事务太慢——
@@ -359,14 +395,82 @@ class LibraryStore(
      */
     suspend fun setTitleZhBatch(items: List<Pair<String, String>>) = withQueries { q ->
         if (items.isNotEmpty()) {
+            val now = System.currentTimeMillis()
             q.transaction {
                 items.forEach { (code, titleZh) ->
-                    q.setWorkTitleZh(titleZh.trim().takeIf { it.isNotEmpty() }, code)
+                    val trimmed = titleZh.trim().takeIf { it.isNotEmpty() }
+                    q.setWorkTitleZh(trimmed, code)
+                    q.upsertSyncMark(SyncKind.TITLE, code, now, trimmed, if (trimmed != null) 1 else 0)
                 }
             }
         }
         Unit
-    }
+    }.also { _changes.tryEmit(Unit) }
+
+    // ---------------------------------------------------------------- 同步记录
+
+    /**
+     * 导出全部变更记录，供同步到网盘。
+     *
+     * 升级前就有的译名与收藏没有记录：先补一条时刻 0 的（最旧）。这样它们能被别的设备拉走，
+     * 又不会盖掉别的设备上更新的改动——否则老库一同步就把另一台调好的名字全部顶掉。
+     */
+    suspend fun exportSyncMarks(): List<SyncMark> = withQueries { q ->
+        q.transaction {
+            q.selectTitleTranslations().executeAsList().forEach { row ->
+                row.title_zh?.let { q.insertSyncMarkIfAbsent(SyncKind.TITLE, row.code, 0L, it, 1L) }
+            }
+            q.selectFavoriteWorkCodes().executeAsList().forEach {
+                q.insertSyncMarkIfAbsent(SyncKind.WORK, it, 0L, null, 1L)
+            }
+            q.selectFavoriteActorNames().executeAsList().forEach {
+                q.insertSyncMarkIfAbsent(SyncKind.ACTOR, it, 0L, null, 1L)
+            }
+            q.selectFavoriteTagNames().executeAsList().forEach {
+                q.insertSyncMarkIfAbsent(SyncKind.TAG, it, 0L, null, 1L)
+            }
+        }
+        q.selectSyncMarks().executeAsList().map {
+            SyncMark(it.kind, it.key, it.at, it.title_value, it.on_flag != 0L)
+        }
+    }.orEmpty()
+
+    /**
+     * 把别的设备的变更记录并进来：同一条记录远端时刻更大才动本机，谁后改谁赢。
+     * 返回实际应用了几条，界面据此决定要不要重读列表。
+     */
+    suspend fun applySyncMarks(remote: List<SyncMark>): Int = withQueries { q ->
+        if (remote.isEmpty()) return@withQueries 0
+        val local = q.selectSyncMarks().executeAsList().associateBy { it.kind to it.key }
+        // 收藏时间：没有时刻的（升级前的老数据）按现在算，免得排到 1970 年去
+        fun stampOf(at: Long): Long = if (at > 0) at else System.currentTimeMillis()
+        var applied = 0
+        q.transaction {
+            for (mark in remote) {
+                val current = local[mark.kind to mark.key]
+                if (current != null && current.at > mark.at) continue
+                when (mark.kind) {
+                    SyncKind.TITLE -> q.applySyncTitleZh(mark.value?.trim()?.takeIf { it.isNotEmpty() }, mark.key)
+                    SyncKind.WORK ->
+                        if (mark.on) q.insertFavoriteWork(mark.key, stampOf(mark.at)) else q.deleteFavoriteWork(mark.key)
+                    SyncKind.ACTOR ->
+                        if (mark.on) q.insertFavoriteActor(mark.key, stampOf(mark.at)) else q.deleteFavoriteActor(mark.key)
+                    SyncKind.TAG ->
+                        if (mark.on) q.insertFavoriteTag(mark.key, stampOf(mark.at)) else q.deleteFavoriteTag(mark.key)
+                    else -> continue
+                }
+                q.upsertSyncMark(mark.kind, mark.key, mark.at, mark.value, if (mark.on) 1 else 0)
+                applied++
+            }
+        }
+        applied
+    } ?: 0
+
+    suspend fun titleTranslations(): Map<String, String> = withQueries { q ->
+        q.selectTitleTranslations().executeAsList().mapNotNull { row ->
+            row.title_zh?.trim()?.takeIf { it.isNotEmpty() }?.let { row.code to it }
+        }.toMap()
+    }.orEmpty()
 
     /** 还缺译名的作品数（有原文、没译名）。 */
     suspend fun titleTranslationPendingCount(): Long = withQueries { q ->
@@ -394,9 +498,12 @@ class LibraryStore(
     /** 作品收藏：返回收藏后的新状态（true = 已收藏）。 */
     suspend fun toggleWorkFavorite(code: String): Boolean = withQueries { q ->
         val exists = q.selectFavoriteWorkCodes().executeAsList().any { it == code }
-        if (exists) q.deleteFavoriteWork(code) else q.insertFavoriteWork(code, System.currentTimeMillis())
+        val now = System.currentTimeMillis()
+        if (exists) q.deleteFavoriteWork(code) else q.insertFavoriteWork(code, now)
+        // 记下这次改动，同步时按时刻跟别的设备比
+        q.upsertSyncMark(SyncKind.WORK, code, now, null, if (exists) 0 else 1)
         !exists
-    } ?: false
+    }?.also { _changes.tryEmit(Unit) } ?: false
 
     suspend fun isWorkFavorite(code: String): Boolean = withQueries { q ->
         q.selectFavoriteWorkCodes().executeAsList().any { it == code }
@@ -405,16 +512,20 @@ class LibraryStore(
     /** 演员收藏：返回收藏后的新状态。 */
     suspend fun toggleActorFavorite(name: String): Boolean = withQueries { q ->
         val exists = q.selectFavoriteActorNames().executeAsList().any { it == name }
-        if (exists) q.deleteFavoriteActor(name) else q.insertFavoriteActor(name, System.currentTimeMillis())
+        val now = System.currentTimeMillis()
+        if (exists) q.deleteFavoriteActor(name) else q.insertFavoriteActor(name, now)
+        q.upsertSyncMark(SyncKind.ACTOR, name, now, null, if (exists) 0 else 1)
         !exists
-    } ?: false
+    }?.also { _changes.tryEmit(Unit) } ?: false
 
     /** 标签收藏：返回收藏后的新状态。 */
     suspend fun toggleTagFavorite(name: String): Boolean = withQueries { q ->
         val exists = q.selectFavoriteTagNames().executeAsList().any { it == name }
-        if (exists) q.deleteFavoriteTag(name) else q.insertFavoriteTag(name, System.currentTimeMillis())
+        val now = System.currentTimeMillis()
+        if (exists) q.deleteFavoriteTag(name) else q.insertFavoriteTag(name, now)
+        q.upsertSyncMark(SyncKind.TAG, name, now, null, if (exists) 0 else 1)
         !exists
-    } ?: false
+    }?.also { _changes.tryEmit(Unit) } ?: false
 
     // ---------------------------------------------------------------- 兼容修补
 

@@ -40,6 +40,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material.icons.outlined.Translate
 import androidx.compose.material.icons.outlined.Edit
+import androidx.compose.material.icons.outlined.ImageNotSupported
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.MaterialTheme
@@ -119,6 +120,17 @@ fun WorkDetailScreen(
     var translatingTitle by remember { mutableStateOf(false) }
     var editingTitle by remember { mutableStateOf(false) }
 
+    // 顶栏按钮与「还没有封面」占位卡片共用：刮这一部，刮完重读详情
+    val scrapeThis: () -> Unit = {
+        scope.launch {
+            scraping = true
+            services.posterWall?.scrapeOne(code)
+            // 刮完重读详情，封面/截图/标签一起更新
+            detail = services.libraryStore?.workDetail(code)
+            scraping = false
+        }
+    }
+
     LaunchedEffect(code) {
         loading = true
         detail = services.libraryStore?.workDetail(code)
@@ -139,15 +151,7 @@ fun WorkDetailScreen(
                         if (scraping) "正在刮削…" else "刮削这部",
                         priority = 1,
                         enabled = !scraping,
-                        onClick = {
-                            scope.launch {
-                                scraping = true
-                                services.posterWall?.scrapeOne(code)
-                                // 刮完重读详情，封面/截图/标签一起更新
-                                detail = services.libraryStore?.workDetail(code)
-                                scraping = false
-                            }
-                        },
+                        onClick = scrapeThis,
                     ),
                 ),
             )
@@ -195,14 +199,24 @@ fun WorkDetailScreen(
                 ) {
                     // 顶部预览：用 Piko 自己的播放后端播这部片的第一个文件（静音、循环一小段）。
                     // 没有视频文件或后端不可用时退回封面。
-                    WorkPreview(
-                        file = d.files.firstOrNull(),
-                        coverUrl = d.work.coverUrl,
-                        code = d.work.code,
-                        enabled = autoPreview,
-                        quality = previewMaxHeight,
-                        modifier = Modifier.fillMaxWidth().aspectRatio(CoverAspectRatio),
-                    )
+                    // 既没刮到封面、也没刮到元数据的作品不放这块：没有封面兜底时它是一块黑底播放器，
+                    // 失败就只剩黑块与转圈，整页看着像坏了。改成一张带「刮削这部」的占位卡片。
+                    if (d.work.scraped || d.work.coverUrl != null) {
+                        WorkPreview(
+                            file = d.files.firstOrNull(),
+                            coverUrl = d.work.coverUrl,
+                            code = d.work.code,
+                            enabled = autoPreview,
+                            quality = previewMaxHeight,
+                            modifier = Modifier.fillMaxWidth().aspectRatio(CoverAspectRatio),
+                        )
+                    } else {
+                        MissingCoverHeader(
+                            scraping = scraping,
+                            onScrape = scrapeThis,
+                            modifier = Modifier.fillMaxWidth().aspectRatio(CoverAspectRatio),
+                        )
+                    }
                     Column(modifier = Modifier.padding(horizontal = 16.dp)) {
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
@@ -230,8 +244,11 @@ fun WorkDetailScreen(
                             // 标题只显示一个名字（有译名就是译名，没有就是原文），
                             // 两个按钮紧贴标题末尾，不再靠 weight 把图标推到屏幕右边
                             Text(
-                                text = d.work.displayTitle ?: d.work.code,
+                                // 没刮到的作品，code 就是文件名：去掉扩展名再显示，长名字最多两行
+                                text = d.work.displayTitle ?: d.work.code.substringBeforeLast('.', d.work.code),
                                 style = MaterialTheme.typography.titleMedium,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
                                 modifier = Modifier.weight(1f, fill = false),
                             )
                             IconButton(
@@ -626,6 +643,45 @@ private fun DetailActionBar(
                     contentDescription = if (favorite) "取消收藏" else "收藏",
                     modifier = Modifier.size(26.dp),
                 )
+            }
+        }
+    }
+}
+
+/**
+ * 既没刮到封面、也没刮到元数据时的顶部占位：
+ * 一块底色加一句说明与「刮削这部」，比一块黑底播放器（失败后只剩黑与转圈）清楚，页面也不会看着像坏了。
+ */
+@Composable
+private fun MissingCoverHeader(
+    scraping: Boolean,
+    onScrape: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Box(
+        modifier = modifier.background(MaterialTheme.colorScheme.surfaceContainerHighest),
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Icon(
+                Icons.Outlined.ImageNotSupported,
+                contentDescription = null,
+                modifier = Modifier.size(36.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                text = "还没有封面与元数据",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 8.dp),
+            )
+            FilledTonalButton(
+                onClick = onScrape,
+                enabled = !scraping,
+                modifier = Modifier.padding(top = 12.dp),
+            ) {
+                Icon(Icons.Outlined.AutoAwesome, contentDescription = null, modifier = Modifier.size(18.dp))
+                Text(if (scraping) "正在刮削…" else "刮削这部", modifier = Modifier.padding(start = 6.dp))
             }
         }
     }

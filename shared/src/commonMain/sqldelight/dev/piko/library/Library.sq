@@ -89,6 +89,19 @@ CREATE TABLE favorite_tags (
     created_at INTEGER NOT NULL
 );
 
+-- 译名与收藏的变更记录，同步到网盘时靠它比新旧（谁后改谁赢）。
+-- kind：title / work / actor / tag；key 是作品编号或演员/标签名；
+-- value 只有译名用，收藏存 NULL；on_flag 1 表示收藏/有译名，0 表示取消收藏/清空译名。
+-- 升级前的老数据没有记录，第一次导出时补一条 at = 0 的，见 LibraryStore.exportSyncMarks。
+CREATE TABLE sync_marks (
+    kind TEXT NOT NULL,
+    key TEXT NOT NULL,
+    at INTEGER NOT NULL,
+    title_value TEXT,
+    on_flag INTEGER NOT NULL,
+    PRIMARY KEY (kind, key)
+);
+
 insertWork:
 INSERT OR REPLACE INTO works (code, title, cover_url, release_date, duration, summary, studio, series, provider, mt_provider, mt_id, preview_video_url, scraped_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
@@ -278,6 +291,47 @@ selectCodesNeedingTitleTranslation:
 SELECT code FROM works
 WHERE title IS NOT NULL AND trim(title) <> '' AND (title_zh IS NULL OR trim(title_zh) = '')
 ORDER BY (release_date IS NULL) ASC, release_date DESC, code DESC;
+
+-- 译名同步到网盘：整份导出（code → 中文标题），只带已有译名的
+selectTitleTranslations:
+SELECT code, title_zh FROM works WHERE title_zh IS NOT NULL AND trim(title_zh) <> '';
+
+-- 从网盘拉下来的译名只补空：本机已经有的（可能是这台设备上刚改的）不动
+fillWorkTitleZh:
+UPDATE works SET title_zh = ? WHERE code = ? AND (title_zh IS NULL OR trim(title_zh) = '');
+
+-- ---------------------------------------------------------------- 同步记录
+
+upsertSyncMark:
+INSERT OR REPLACE INTO sync_marks (kind, key, at, title_value, on_flag) VALUES (?, ?, ?, ?, ?);
+
+-- 补历史记录：已经有记录的不动（INSERT OR IGNORE），时刻按调用方给的 0 算作最旧
+insertSyncMarkIfAbsent:
+INSERT OR IGNORE INTO sync_marks (kind, key, at, title_value, on_flag) VALUES (?, ?, ?, ?, ?);
+
+selectSyncMarks:
+SELECT kind, key, at, title_value, on_flag FROM sync_marks;
+
+-- 同步专用：按远端的记录直接写译名（不走 setWorkTitleZh，免得又刷一次本机时刻）
+applySyncTitleZh:
+UPDATE works SET title_zh = ? WHERE code = ?;
+
+selectSyncMarkOne:
+SELECT at FROM sync_marks WHERE kind = ? AND key = ?;
+
+-- 新设备先拉到了译名、后来才扫描：扫描把作品插进库时译名还是空的，这里按记录补上。
+-- 只补空的，本机翻好的不会被盖掉。
+backfillTitleZhFromMarks:
+UPDATE works SET title_zh = (
+    SELECT title_value FROM sync_marks
+    WHERE sync_marks.kind = 'title' AND sync_marks.key = works.code AND sync_marks.on_flag = 1
+)
+WHERE (title_zh IS NULL OR trim(title_zh) = '')
+  AND EXISTS (
+    SELECT 1 FROM sync_marks
+    WHERE sync_marks.kind = 'title' AND sync_marks.key = works.code
+      AND sync_marks.on_flag = 1 AND sync_marks.title_value IS NOT NULL
+);
 
 -- 批量翻译时一次取走，省得逐条查
 selectTitlePairs:

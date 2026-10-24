@@ -1,6 +1,8 @@
 package dev.piko.ui
 
 import dev.piko.shared.sync.ArchivePasswordSync
+import dev.piko.shared.sync.DriveSettingsStore
+import dev.piko.shared.sync.LibrarySync
 import dev.piko.shared.sync.PikoSettingsSync
 import dev.piko.shared.sync.SyncCipher
 import dev.piko.shared.sync.SourceLedgerSync
@@ -224,6 +226,22 @@ class PikoServices(
             translation = translation,
             scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate),
         )
+    }
+
+    /**
+     * 译名与收藏（作品/演员/标签）随账号同步到网盘 `.piko/library-*.json`。
+     * 单独一份：它们是库数据，体积随作品数长，不该跟着改设置一起重传。
+     */
+    val librarySync: LibrarySync? = libraryStore?.let { store ->
+        LibrarySync(
+            clients = clientManager,
+            remote = DriveSettingsStore(clientManager, driveRepository, "library-"),
+            store = store,
+            scope = backgroundScope,
+            enabled = preferences.settingsSyncFlow,
+            // 别的设备改了译名或收藏：让海报墙重读一遍，不用退出去再进来
+            onApplied = { posterWall?.refreshList() },
+        ).also { it.start() }
     }
 
     val instantSaveRecords = InstantSaveRecords(clientManager, cacheStore, backgroundScope)
