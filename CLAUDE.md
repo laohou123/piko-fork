@@ -351,6 +351,11 @@ Windows 上的 `:desktopApp:desktopTest`，Android 单测，x86_64 模拟器（A
 JVM 测试看不出 Android 与 HotSpot 的差异：Android 的正则是 ICU，不认 `\p{IsHan}` 这类 Java 专有写法，
 Android 8 上一编译就崩（1.0.0 出过）。`AndroidRegexGuardTest` 扫源码拦着，写脚本类用 `\p{script=Han}`。
 ICU 的 `\d` 还是全部 Unicode 数字，文件名里的 `𝟐` 被抓出来后 `toInt()` 就抛（1.1.0 信息流闪退），数字一律写 `[0-9]`，同一个测试拦着。
+ICU 对**裸花括号**也零容忍：Java 的 Pattern 放过结尾多余的 `}`，ICU 直接抛 `PatternSyntaxException`。1.3.9 的字幕翻译
+必失败（报错信息里的 `wb6` / `o86` / `vb6` 就是混淆后找不到的异常类名）就是这么来的——`SrtDocument` 的样式标记正则
+`\{\\[^}]*}` 结尾忘了转义，写在 companion object 里，一抛就是 `ExceptionInInitializerError`，整个类用不了。花括号一律
+写成 `\}` / `\{`（量词 `{2,4}` 与 `\p{L}` 自带的是合法），`AndroidRegexGuardTest` 的 `regex literals have no bare braces`
+扫全部源码拦着。
 模拟器上的 `NamingUnicodeDigitsSmokeTest` 把文件名解析的各个入口（网盘页、信息流、查重、播放列表）在 ICU 上跑一遍，
 文件名里的数字逐位换成数学粗体、全角等别的数字，不许抛异常；解析入口有新增时往里补一行。
 老格式样片在 `testdata/media/`，直接提交，生成方式见 `generate.sh`；没有 WMV3/VC-1 样片，因为 ffmpeg 没有它的编码器。
