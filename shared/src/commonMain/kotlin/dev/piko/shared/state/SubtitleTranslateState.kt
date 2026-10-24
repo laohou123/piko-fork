@@ -95,7 +95,7 @@ class SubtitleTranslateState(
                 stage = Stage.TRANSLATING
                 val translated = translator.translate(source) { p -> progress = p }
                     .getOrElse { e ->
-                        error = e.message ?: "翻译失败"
+                        error = readableTranslationError(e)
                         return@launch
                     }
 
@@ -128,7 +128,7 @@ class SubtitleTranslateState(
                 throw e
             } catch (e: Throwable) {
                 PikoLog.w(TAG, "翻译字幕失败", e)
-                error = e.message ?: "翻译失败"
+                error = readableTranslationError(e)
             } finally {
                 stage = Stage.IDLE
                 translatingId = null
@@ -156,6 +156,13 @@ class SubtitleTranslateState(
         } finally {
             stream.close()
         }
+    }
+
+    /** 出错时的可见提示：有话就照说，没话就把异常类型带上（类型名已排除混淆，是可读的）。 */
+    private fun readableTranslationError(e: Throwable): String {
+        val message = e.message?.trim().orEmpty()
+        if (message.isNotBlank()) return message
+        return "翻译失败（${e::class.simpleName ?: "未知异常"}）"
     }
 
     private suspend fun awaitUpload(fileName: String): String? {
