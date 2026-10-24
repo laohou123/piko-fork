@@ -123,6 +123,11 @@ fun WorkDetailScreen(
     // 详情页「标签」那一行末尾的 + ：自定义标签
     var editingTags by remember { mutableStateOf(false) }
     var tagDraft by remember { mutableStateOf("") }
+    // 以前用过的自定义标签：打开对话框时读一次，点一下就能加
+    var tagCandidates by remember { mutableStateOf<List<String>>(emptyList()) }
+    LaunchedEffect(editingTags) {
+        if (editingTags) tagCandidates = services.libraryStore?.customTagCandidates().orEmpty()
+    }
 
     // 顶栏按钮与「还没有封面」占位卡片共用：刮这一部，刮完重读详情
     val scrapeThis: () -> Unit = {
@@ -470,6 +475,34 @@ fun WorkDetailScreen(
                             },
                             modifier = Modifier.padding(start = 8.dp),
                         ) { Text("添加") }
+                    }
+                    // 用过的标签：点一下直接加到这部作品上，已经在的就不列了
+                    val onThisWork = customTags.map { it.name }.toSet()
+                    val suggestions = tagCandidates.filterNot { it in onThisWork }
+                    if (suggestions.isNotEmpty()) {
+                        Text(
+                            text = "用过的标签（点一下直接加）",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 12.dp),
+                        )
+                        FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.padding(top = 6.dp),
+                        ) {
+                            suggestions.forEach { name ->
+                                SuggestionChip(
+                                    name = name,
+                                    onClick = {
+                                        scope.launch {
+                                            services.libraryStore?.addCustomTag(code, name)
+                                            detail = services.libraryStore?.workDetail(code)
+                                        }
+                                    },
+                                )
+                            }
+                        }
                     }
                     if (customTags.isNotEmpty()) {
                         Text(
@@ -913,6 +946,30 @@ private fun AddTagChip(onClick: () -> Unit) {
             )
             Spacer(modifier = Modifier.width(4.dp))
             Text(text = "标签", style = MaterialTheme.typography.labelLarge)
+        }
+    }
+}
+
+/** 候选标签：与详情页标签同款外形，点一下直接加到作品上。 */
+@Composable
+private fun SuggestionChip(name: String, onClick: () -> Unit) {
+    Surface(
+        shape = RoundedCornerShape(8.dp),
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        modifier = Modifier.clickable(onClick = onClick),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+        ) {
+            Icon(
+                Icons.Filled.Add,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(14.dp),
+            )
+            Spacer(modifier = Modifier.width(4.dp))
+            Text(text = name, style = MaterialTheme.typography.labelLarge)
         }
     }
 }

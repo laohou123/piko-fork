@@ -523,6 +523,11 @@ class LibraryStore(
         Unit
     }?.also { _changes.tryEmit(Unit) }
 
+    /** 加标签的候选：以前用过的自定义标签，点一下就能加，不用再敲一遍。 */
+    suspend fun customTagCandidates(): List<String> = withQueries { q ->
+        q.selectCustomTagNames().executeAsList()
+    }.orEmpty()
+
     /** 删掉这部作品上的某个标签（刮削来的也能删，下次刮削才会回来）。 */
     suspend fun removeTag(code: String, name: String) = withQueries { q ->
         q.deleteWorkTag(code, name)

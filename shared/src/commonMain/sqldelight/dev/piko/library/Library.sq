@@ -330,6 +330,10 @@ SELECT kind, key, at, title_value, on_flag FROM sync_marks;
 selectCustomTags:
 SELECT work_code, tag_name FROM work_tags WHERE custom = 1;
 
+-- 详情页加标签时的候选：用过一次的自定义标签，下次直接点
+selectCustomTagNames:
+SELECT DISTINCT tag_name FROM work_tags WHERE custom = 1 ORDER BY tag_name;
+
 -- 同步专用：按远端的记录直接写译名（不走 setWorkTitleZh，免得又刷一次本机时刻）
 applySyncTitleZh:
 UPDATE works SET title_zh = ? WHERE code = ?;
