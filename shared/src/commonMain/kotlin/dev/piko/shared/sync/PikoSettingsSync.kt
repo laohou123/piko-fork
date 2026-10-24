@@ -7,6 +7,7 @@ import dev.piko.shared.data.PikoClientProvider
 import dev.piko.shared.data.PikoDriveRepository
 import dev.piko.shared.log.PikoLog
 import dev.piko.shared.log.logFailure
+import dev.piko.shared.translate.TranslationProfileStore
 import io.github.nihildigit.pikpak.FileStat
 import io.github.nihildigit.pikpak.TaskPhase
 import kotlinx.coroutines.CoroutineScope
@@ -22,6 +23,7 @@ import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -146,12 +148,25 @@ val SyncedSettings: List<SyncedSetting> = listOf(
     SyncedSetting("metaTubeToken", { it.metaTubeTokenFlow }, { prefs, value -> prefs.setMetaTubeToken(value) }, secret = true),
 
     // ---------------------------------------------------------------- AI 翻译
-    SyncedSetting("translationBaseUrl", { it.translationBaseUrlFlow }, { prefs, value -> prefs.setTranslationBaseUrl(value) }),
-    SyncedSetting("translationModel", { it.translationModelFlow }, { prefs, value -> prefs.setTranslationModel(value) }),
+    // 1.3.11 起翻译配置按「档案」组织：一个 JSON 含全部档案（地址、密钥、模型），
+    // 与旧版的单项 Key 同样加密后进网盘；激活哪个档案是明文，跟着档案列表走。
+    // 读的时候经 TranslationProfileStore：老设备没迁过到时先把旧三件套转成第一个档案。
+    SyncedSetting(
+        "translationProfiles",
+        { prefs ->
+            flow { emit(TranslationProfileStore(prefs).encode(TranslationProfileStore(prefs).load())) }
+        },
+        { prefs, value -> prefs.setTranslationProfiles(value) },
+        secret = true,
+    ),
+    SyncedSetting(
+        "translationActiveProfile",
+        { it.translationActiveProfileFlow },
+        { prefs, value -> prefs.setTranslationActiveProfile(value) },
+    ),
     SyncedSetting("translationReasoning", { it.translationReasoningFlow }, { prefs, value -> prefs.setTranslationReasoning(value) }),
     SyncedSetting("translationPrompt", { it.translationPromptFlow }, { prefs, value -> prefs.setTranslationPrompt(value) }),
     int("translationConcurrency", { it.translationConcurrencyFlow }) { setTranslationConcurrency(it) },
-    SyncedSetting("translationApiKey", { it.translationApiKeyFlow }, { prefs, value -> prefs.setTranslationApiKey(value) }, secret = true),
 )
 
 /**
@@ -159,8 +174,16 @@ val SyncedSettings: List<SyncedSetting> = listOf(
  *
  * archivePasswords：1.1.0 把解压密码明文同步进网盘。之后本机存进机密存储，跨设备改由 ArchivePasswordSync
  * 以账号密码派生的密钥加密后单独存一份。
+ * translationBaseUrl / translationModel / translationApiKey：1.3.11 起合成一个加密的 translationProfiles，
+ * 旧三项留着只会互相覆盖，从同步文件里抹掉。
  */
-private val RetiredSettingKeys = setOf("archivePasswords", "spoilerBlur")
+private val RetiredSettingKeys = setOf(
+    "archivePasswords",
+    "spoilerBlur",
+    "translationBaseUrl",
+    "translationModel",
+    "translationApiKey",
+)
 
 /**
  * 把 [SyncedSettings] 同步到网盘根目录下的 `.piko` 文件夹（[DriveSettingsStore]），换一台设备登录同一个账号，设置跟着过来。

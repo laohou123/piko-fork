@@ -50,6 +50,9 @@ class TranslationClient(
     /** 配好了没有：三样都填了才算。 */
     val configured: Boolean get() = base.isNotEmpty() && apiKey.isNotEmpty() && model.isNotEmpty()
 
+    /** 这把客户端用的 Key。密钥池据此把「坏 Key」和客户端对应起来。 */
+    val key: String get() = apiKey
+
     /**
      * 翻一段文本。[system] 是规则，[input] 是待译内容，返回模型输出的原文（未清洗）。
      */
@@ -155,11 +158,14 @@ class TranslationClient(
         if (!response.status.isSuccess()) {
             val rejectedReasoning = response.status.value == 400 &&
                 body.contains("reasoning", ignoreCase = true)
+            val authFailed = isAuthFailure(response.status, body)
             throw TranslationException(
                 message = describeStatus(response.status, body, endpoint),
                 retryable = response.status.value == 429 || response.status.value >= 500,
                 notFound = response.status == HttpStatusCode.NotFound,
                 reasoningRejected = rejectedReasoning,
+                // 认证/余额类错误：换一把 Key 可能就好了，交由上层密钥池换 Key 重试
+                authFailed = authFailed,
             )
         }
         val parsed = runCatching { json.decodeFromString(ChatResponse.serializer(), body) }.getOrNull()
@@ -181,6 +187,28 @@ class TranslationClient(
         base.endsWith("/v1") -> listOf("$base/chat/completions")
         else -> listOf("$base/chat/completions", "$base/v1/chat/completions")
     }
+
+    /**
+     * 是不是「这把 Key 不行」类的错误：401/403（Key 无效或过期）、402（余额不足），
+     * 以及服务端把同样意思塞在 400/429 里的（invalid api key、insufficient balance…）。
+     *
+     * 只认 Key 层的错：限流（429）、超时、5xx、模型名不对都不算——换 Key 治不了这些。
+     */
+    private fun isAuthFailure(status: HttpStatusCode, body: String): Boolean =
+        when (status.value) {
+            401, 403, 402 -> true
+            else -> {
+                val detail = body.lowercase()
+                detail.contains("insufficient balance") ||
+                    detail.contains("insufficient_balance") ||
+                    detail.contains("invalid api key") ||
+                    detail.contains("invalid_api_key") ||
+                    detail.contains("incorrect api key") ||
+                    detail.contains("unauthorized") ||
+                    detail.contains("quota exceeded") ||
+                    detail.contains("quota_exceeded")
+            }
+        }
 
     private fun describeStatus(status: HttpStatusCode, body: String, endpoint: String): String {
         // 完整响应先进日志：服务商给的错误往往只有一两个字的码（例如 "wb6"），
@@ -233,13 +261,15 @@ class TranslationClient(
     }
 }
 
-/** 翻译接口的错误。带两个标记，决定要不要重试、要不要换路径。 */
+/** 翻译接口的错误。带几个标记，决定要不要重试、要不要换路径、要不要换密钥。 */
 class TranslationException(
     message: String,
     val retryable: Boolean = false,
     val notFound: Boolean = false,
     /** 400 且响应里提到 reasoning：说明接口不认这个参数，去掉重试即可。 */
     val reasoningRejected: Boolean = false,
+    /** 这把 API Key 不行（无效/过期/余额不足）：换一把 Key 重试，别在这把 Key 上耗。 */
+    val authFailed: Boolean = false,
     cause: Throwable? = null,
 ) : Exception(message, cause)
 

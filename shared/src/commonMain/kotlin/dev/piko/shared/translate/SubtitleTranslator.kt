@@ -29,17 +29,25 @@ data class SubtitleProgress(
  * 1. **按字数分批、不切断单条字幕**：一次请求太大会被截断，切在一条字幕中间就对不齐了；
  * 2. **行数对齐校验**：模型回的行数和送去的不等就整批作废，小批次（≤12 行）退化成逐条重翻，
  *    避免一条字幕错位后整段跟着错位；
- * 3. **2 并发 + 每批重试**：大模型 429 是常态，不能因为一批被限流就放弃整部片；
- * 4. **第二轮串行补漏**：把还空着的行慢慢再翻一遍，目标是完整而不是差不多。
+ * 3. **并发 + 每批重试**：大模型 429 是常态，不能因为一批被限流就放弃整部片；
+ * 4. **多密钥轮询**：一个档案下挂几把 Key，每批轮着用；某把报认证/余额错就换下一把重试同一批；
+ * 5. **第二轮串行补漏**：把还空着的行慢慢再翻一遍，目标是完整而不是差不多。
  */
 class SubtitleTranslator(
-    private val client: TranslationClient,
+    /**
+     * 同一档案下每把 Key 一个客户端（顺序即添加顺序）。一把 Key 报认证/余额错就
+     * 换下一把重试本批，全坏才放弃这批——见 [TranslationKeyPool]。
+     */
+    private val clients: List<TranslationClient>,
     private val concurrency: Int = DEFAULT_CONCURRENCY,
     private val batchChars: Int = DEFAULT_BATCH_CHARS,
     /** 用户在设置里改过的提示词；空则用内置的 [SUBTITLE_PROMPT]。 */
     prompt: String = "",
 ) {
     private val systemPrompt = prompt.trim().ifEmpty { SUBTITLE_PROMPT }
+
+    /** 一次翻译任务内共用：轮换取 Key，坏的跳过。 */
+    private val keyPool = TranslationKeyPool(clients.map { it.key })
     /**
      * 翻一份 SRT 文本。成功时返回**完整**的 SRT（没翻到的行保留原文，不会留空洞）。
      * 一行都没翻出来才算失败。
@@ -136,26 +144,56 @@ class SubtitleTranslator(
     /** 一批：整批翻，行数对得上才收；对不上且批次够小就退化成逐条。 */
     private suspend fun translateBatch(doc: SrtDocument, batch: List<Int>): List<String>? {
         val texts = batch.map { doc.cues[it].text }
-        val output = client.translate(systemPrompt, texts.joinToString("\n")).getOrElse { error ->
-            PikoLog.w(TAG, "批次失败：${error.message}")
-            return null
-        }
-        val lines = alignedLines(output, batch.size)
-        if (lines.size == batch.size) return lines
+        val input = texts.joinToString("\n")
+        // 多把 Key 轮着翻这批：某把 Key 报认证/余额错，换下一把重试同一批；
+        // 限流、超时这类错误换 Key 治不了，直接交给上层进补漏队列
+        var attempts = 0
+        while (attempts < clients.size.coerceAtLeast(1)) {
+            attempts++
+            val key = keyPool.nextKey() ?: break
+            val client = clients.firstOrNull { it.key == key } ?: continue
+            val result = client.translate(systemPrompt, input)
+            val error = result.exceptionOrNull()
+            if (error != null && error is TranslationException && error.authFailed) {
+                PikoLog.w(TAG, "密钥认证/余额失败，换下一把：${error.message?.take(60)}")
+                keyPool.reportBroken(key)
+                continue
+            }
+            keyPool.reportOk(key)
+            val lines = alignedLines(result.getOrNull().orEmpty(), batch.size)
+            if (lines.size == batch.size) return lines
 
-        PikoLog.w(TAG, "行数对不上：送 ${batch.size} 行，回 ${lines.size} 行")
-        if (batch.size > PER_LINE_RETRY_LIMIT) return null
-        // 逐条重翻，能救几条是几条；救不回的交给第二轮
-        val result = MutableList<String?>(batch.size) { null }
-        texts.forEachIndexed { i, text ->
-            result[i] = translateOne(text)
+            PikoLog.w(TAG, "行数对不上：送 ${batch.size} 行，回 ${lines.size} 行")
+            if (batch.size > PER_LINE_RETRY_LIMIT) return null
+            // 逐条重翻，能救几条是几条；救不回的交给第二轮
+            val result2 = MutableList<String?>(batch.size) { null }
+            texts.forEachIndexed { i, text ->
+                result2[i] = translateOne(text)
+            }
+            return result2.takeIf { it.all { line -> line != null } }?.map { it!! }
         }
-        return result.takeIf { it.all { line -> line != null } }?.map { it!! }
+        // 所有 Key 都坏（或没有 Key 可用）：本批失败，进补漏队列
+        PikoLog.w(TAG, "批次失败：没有可用的翻译密钥（共 ${clients.size} 把）")
+        return null
     }
 
     private suspend fun translateOne(text: String): String? {
-        val output = client.translate(systemPrompt, text).getOrNull() ?: return null
-        return alignedLines(output, 1).firstOrNull()
+        var attempts = 0
+        while (attempts < clients.size.coerceAtLeast(1)) {
+            attempts++
+            val key = keyPool.nextKey() ?: return null
+            val client = clients.firstOrNull { it.key == key } ?: continue
+            val result = client.translate(systemPrompt, text)
+            val error = result.exceptionOrNull()
+            if (error != null && error is TranslationException && error.authFailed) {
+                keyPool.reportBroken(key)
+                continue
+            }
+            keyPool.reportOk(key)
+            val output = result.getOrNull() ?: return null
+            return alignedLines(output, 1).firstOrNull()
+        }
+        return null
     }
 
     companion object {

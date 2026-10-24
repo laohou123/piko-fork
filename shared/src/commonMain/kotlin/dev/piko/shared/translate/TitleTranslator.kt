@@ -29,15 +29,32 @@ data class TitleProgress(
  * 所以偶尔有模型多吐一句话也不会让整批错位。
  */
 class TitleTranslator(
-    private val client: TranslationClient,
+    /** 同一档案下每把 Key 一个客户端（顺序即添加顺序），轮着用、坏的跳过。 */
+    private val clients: List<TranslationClient>,
     private val concurrency: Int = DEFAULT_CONCURRENCY,
 ) {
-    /** 翻一条。失败返回 null。 */
+    /** 一次批量翻译内共用：轮换取 Key，认证/余额坏的跳过。 */
+    private val keyPool = TranslationKeyPool(clients.map { it.key })
+
+    /** 翻一条。失败返回 null。多把 Key 时轮着用，认证/余额坏的跳过换下一把。 */
     suspend fun translateOne(title: String): String? {
         val trimmed = title.trim()
         if (trimmed.isEmpty()) return null
-        val output = client.translate(TITLE_PROMPT, trimmed, maxTokens = 256).getOrNull() ?: return null
-        return cleanTitle(output)
+        var attempts = 0
+        while (attempts < clients.size.coerceAtLeast(1)) {
+            attempts++
+            val key = keyPool.nextKey() ?: return null
+            val client = clients.firstOrNull { it.key == key } ?: continue
+            val result = client.translate(TITLE_PROMPT, trimmed, maxTokens = 256)
+            val error = result.exceptionOrNull()
+            if (error != null && error is TranslationException && error.authFailed) {
+                keyPool.reportBroken(key)
+                continue
+            }
+            keyPool.reportOk(key)
+            return cleanTitle(result.getOrNull() ?: return null)
+        }
+        return null
     }
 
     /**
@@ -91,19 +108,33 @@ class TitleTranslator(
         ok
     }
 
-    /** 一批：整批翻，行数对得上就用；对不上就逐条。 */
+    /** 一批：整批翻，行数对得上就用；对不上就逐条。多把 Key 时换 Key 重试整批。 */
     private suspend fun translateChunk(chunk: List<Pair<String, String>>): List<String?> {
         if (chunk.size == 1) return listOf(translateOne(chunk[0].second))
         val input = chunk.joinToString("\n") { it.second.trim() }
-        val output = client.translate(TITLE_PROMPT, input, maxTokens = 256 * chunk.size)
-            .getOrElse { error ->
-                PikoLog.w(TAG, "片名批次失败：${error.message}")
+        var attempts = 0
+        while (attempts < clients.size.coerceAtLeast(1)) {
+            attempts++
+            val key = keyPool.nextKey() ?: break
+            val client = clients.firstOrNull { it.key == key } ?: continue
+            val result = client.translate(TITLE_PROMPT, input, maxTokens = 256 * chunk.size)
+            val error = result.exceptionOrNull()
+            if (error != null && error is TranslationException && error.authFailed) {
+                PikoLog.w(TAG, "片名批次密钥认证/余额失败，换下一把")
+                keyPool.reportBroken(key)
+                continue
+            }
+            keyPool.reportOk(key)
+            val output = result.getOrElse { e ->
+                PikoLog.w(TAG, "片名批次失败：${e.message}")
                 return chunk.map { null }
             }
-        val lines = alignedLines(output, chunk.size).map { cleanTitle(it) }
-        if (lines.size == chunk.size) return lines
-        PikoLog.w(TAG, "片名行数对不上：送 ${chunk.size} 条，回 ${lines.size} 条，改逐条翻")
-        return chunk.map { translateOne(it.second) }
+            val lines = alignedLines(output, chunk.size).map { cleanTitle(it) }
+            if (lines.size == chunk.size) return lines
+            PikoLog.w(TAG, "片名行数对不上：送 ${chunk.size} 条，回 ${lines.size} 条，改逐条翻")
+            return chunk.map { translateOne(it.second) }
+        }
+        return chunk.map { null }
     }
 
     /** 模型偶尔会加引号、书名号或「译：」前缀，这里收拾干净。 */

@@ -144,6 +144,9 @@ class SessionManager(private val context: Context) : PikoUserPreferences {
         val TRANSLATION_REASONING = stringPreferencesKey("translation_reasoning")
         val TRANSLATION_PROMPT = stringPreferencesKey("translation_prompt")
         val TRANSLATION_CONCURRENCY = intPreferencesKey("translation_concurrency")
+        // 1.3.11 起：翻译配置按「档案」存。JSON 里含密钥，与 API Key 同样加密后落盘
+        val TRANSLATION_PROFILES = stringPreferencesKey("translation_profiles")
+        val TRANSLATION_ACTIVE_PROFILE = stringPreferencesKey("translation_active_profile")
     }
 
     /**
@@ -650,6 +653,37 @@ class SessionManager(private val context: Context) : PikoUserPreferences {
     override suspend fun setTranslationModel(model: String) {
         context.dataStore.edit { preferences ->
             preferences[PreferencesKeys.TRANSLATION_MODEL] = model
+        }
+    }
+
+    /**
+     * 档案列表 JSON。里面带 API Key，与单项的 Key 同样加密后落盘：
+     * 读出时解密，界面与网关拿到的始终是明文 JSON。
+     */
+    override val translationProfilesFlow: Flow<String> =
+        preference { it[PreferencesKeys.TRANSLATION_PROFILES] }.map { stored ->
+            stored?.let(CredentialCipher::decrypt).orEmpty()
+        }
+
+    override suspend fun setTranslationProfiles(json: String) {
+        if (json.isEmpty()) {
+            context.dataStore.edit { it.remove(PreferencesKeys.TRANSLATION_PROFILES) }
+            return
+        }
+        val sealed = runCatching { CredentialCipher.encrypt(json) }
+            .onFailure { PikoLog.w(TAG, "翻译档案加密失败，未保存", it) }
+            .getOrNull() ?: return
+        context.dataStore.edit { preferences ->
+            preferences[PreferencesKeys.TRANSLATION_PROFILES] = sealed
+        }
+    }
+
+    override val translationActiveProfileFlow: Flow<String> =
+        preference { it[PreferencesKeys.TRANSLATION_ACTIVE_PROFILE].orEmpty() }
+
+    override suspend fun setTranslationActiveProfile(id: String) {
+        context.dataStore.edit { preferences ->
+            preferences[PreferencesKeys.TRANSLATION_ACTIVE_PROFILE] = id
         }
     }
 

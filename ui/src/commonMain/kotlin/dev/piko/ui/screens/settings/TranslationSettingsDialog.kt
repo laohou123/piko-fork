@@ -1,19 +1,28 @@
 package dev.piko.ui.screens.settings
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.outlined.Translate
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Add
+import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.Edit
+import androidx.compose.material.icons.outlined.ExpandLess
+import androidx.compose.material.icons.outlined.ExpandMore
+import androidx.compose.material.icons.outlined.Translate
 import androidx.compose.material3.FilterChip
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.TextButton
-import dev.piko.data.auth.DEFAULT_TRANSLATION_CONCURRENCY
-import dev.piko.shared.translate.SubtitleTranslator
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.RadioButton
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -22,43 +31,47 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import dev.piko.data.auth.DEFAULT_TRANSLATION_CONCURRENCY
+import dev.piko.shared.translate.SubtitleTranslator
 import dev.piko.shared.translate.TranslationGateway
+import dev.piko.shared.translate.TranslationProfile
 import dev.piko.ui.components.PikoTextField
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 
 /**
- * AI 翻译的接口配置：OpenAI 兼容的地址、Key、模型名。
+ * AI 翻译的配置面板：OpenAI 兼容的地址、密钥、模型名，按「档案」组织。
  *
- * 不绑定任何厂商——DeepSeek、OpenAI、通义、中转站、本地 Ollama 都行，只要认
- * `/chat/completions` 这套协议。「测试」用框里还没保存的值现试一句，省得保存完
- * 翻字幕时才发现填错。
+ * 一个档案就是一条可切换的翻译通道：接口地址 + 这个接口的密钥（可挂多把，轮着用）+ 模型名。
+ * 顶部卡片显示当前激活的档案，点它展开档案列表（切换 / 编辑 / 删除 / 新增），
+ * 推理强度、并发数、提示词是全局的，所有档案共用。
+ *
+ * 「测试」用当前激活档案的第一把密钥现试一句，省得保存完翻字幕时才发现填错。
  */
 @Composable
 internal fun TranslationSettingsDialog(
     gateway: TranslationGateway,
-    currentBaseUrl: String,
-    currentApiKey: String,
-    currentModel: String,
+    profiles: List<TranslationProfile>,
+    activeProfileId: String?,
     currentReasoning: String,
     currentPrompt: String,
     currentConcurrency: Int,
     onSave: (
-        baseUrl: String,
-        apiKey: String,
-        model: String,
+        profiles: List<TranslationProfile>,
+        activeProfileId: String?,
         reasoning: String,
         prompt: String,
         concurrency: Int,
     ) -> Unit,
     onDismiss: () -> Unit,
 ) {
-    var baseUrl by remember { mutableStateOf(currentBaseUrl) }
-    var apiKey by remember { mutableStateOf(currentApiKey) }
-    var model by remember { mutableStateOf(currentModel) }
+    // 档案列表在对话框内是草稿：增删改都先落在这里，保存才写回
+    var draft by remember { mutableStateOf(profiles) }
+    var activeId by remember { mutableStateOf(activeProfileId ?: profiles.firstOrNull()?.id) }
+    var expanded by remember { mutableStateOf(false) }
+    var editorOpen by remember { mutableStateOf(false) }
+    var editing by remember { mutableStateOf<TranslationProfile?>(null) }
     var reasoning by remember { mutableStateOf(currentReasoning) }
     var concurrency by remember {
         mutableStateOf(currentConcurrency.takeIf { it > 0 } ?: DEFAULT_TRANSLATION_CONCURRENCY)
@@ -72,54 +85,90 @@ internal fun TranslationSettingsDialog(
     var testing by remember { mutableStateOf<Job?>(null) }
     val scope = rememberCoroutineScope()
 
-    val trimmedUrl = baseUrl.trim()
-    val urlInvalid = trimmedUrl.isNotEmpty() &&
-        !trimmedUrl.startsWith("http://") && !trimmedUrl.startsWith("https://")
-    val complete = trimmedUrl.isNotEmpty() && apiKey.trim().isNotEmpty() && model.trim().isNotEmpty()
+    val active = draft.firstOrNull { it.id == activeId } ?: draft.firstOrNull()
 
     SettingsInputDialog(
         icon = Icons.Outlined.Translate,
         title = "AI 翻译",
-        description = "翻译字幕与片名都用这套配置。填 OpenAI 兼容的接口即可（DeepSeek、OpenAI、中转站、本地 Ollama 都行）。",
+        description = "翻译字幕与片名都用当前激活的档案。一个档案 = 接口地址 + 密钥（可多把轮着用）+ 模型名，" +
+            "DeepSeek、OpenAI、中转站、本地 Ollama 都行，只要认 /chat/completions 这套协议。",
         onSave = {
             val custom = prompt.trim()
             onSave(
-                trimmedUrl,
-                apiKey.trim(),
-                model.trim(),
+                draft,
+                activeId,
                 reasoning,
                 // 与默认一致就存空，恢复成"跟随内置提示词"
                 if (custom == SubtitleTranslator.SUBTITLE_PROMPT.trim()) "" else custom,
                 concurrency,
             )
         },
-        saveEnabled = !urlInvalid,
+        saveEnabled = true,
         onDismiss = onDismiss,
     ) {
-        PikoTextField(
-            value = baseUrl,
-            onValueChange = { baseUrl = it; result = null },
-            label = "接口地址",
-            placeholder = "https://api.deepseek.com/v1",
-            isError = urlInvalid,
-            supportingText = "填到 /v1 为止即可，也可以填完整的 /chat/completions",
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
-        )
-        PikoTextField(
-            value = apiKey,
-            onValueChange = { apiKey = it; result = null },
-            label = "API Key",
-            supportingText = "只存在本机（系统加密），不上传",
-            visualTransformation = PasswordVisualTransformation(),
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
-        )
-        PikoTextField(
-            value = model,
-            onValueChange = { model = it; result = null },
-            label = "模型名",
-            placeholder = "deepseek-chat",
-            supportingText = "照服务商文档填，如 deepseek-chat、gpt-4o-mini、qwen-plus",
-        )
+        // ---------------- 当前档案：点开展开列表，右边加号新建 ----------------
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            ProfileCard(
+                profile = active,
+                expanded = expanded,
+                onClick = { expanded = !expanded },
+                modifier = Modifier.weight(1f),
+            )
+            IconButton(
+                onClick = {
+                    editing = null
+                    editorOpen = true
+                },
+            ) {
+                Icon(Icons.Outlined.Add, contentDescription = "新档案")
+            }
+        }
+
+        if (expanded) {
+            Surface(
+                color = MaterialTheme.colorScheme.surfaceContainerLow,
+                shape = MaterialTheme.shapes.medium,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Column(modifier = Modifier.padding(vertical = 4.dp)) {
+                    draft.forEach { profile ->
+                        ProfileRow(
+                            profile = profile,
+                            selected = profile.id == active?.id,
+                            canDelete = draft.size > 1,
+                            onSelect = { activeId = profile.id },
+                            onEdit = {
+                                editing = profile
+                                editorOpen = true
+                            },
+                            onDelete = { id ->
+                                val rest = draft.filterNot { it.id == id }
+                                draft = rest
+                                if (activeId == id) activeId = rest.firstOrNull()?.id
+                            },
+                        )
+                    }
+                    TextButton(
+                        onClick = {
+                            editing = null
+                            editorOpen = true
+                        },
+                        modifier = Modifier.padding(start = 4.dp),
+                    ) {
+                        Icon(Icons.Outlined.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Text("  新档案")
+                    }
+                }
+            }
+            if (active == null) {
+                Text(
+                    text = "还没有档案：点右边「+」新建一个，翻译入口才会亮起来。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+
         Text(
             text = "推理强度",
             style = MaterialTheme.typography.labelMedium,
@@ -172,12 +221,10 @@ internal fun TranslationSettingsDialog(
                 Text("恢复默认")
             }
         }
-        OutlinedTextField(
+        PikoTextField(
             value = prompt,
             onValueChange = { prompt = it },
-            minLines = 6,
-            maxLines = 12,
-            textStyle = MaterialTheme.typography.bodySmall,
+            label = "提示词",
             modifier = Modifier.fillMaxWidth(),
         )
         Text(
@@ -187,18 +234,21 @@ internal fun TranslationSettingsDialog(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
 
+        // ---------------- 测试：用当前激活档案的第一把密钥 ----------------
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp),
         ) {
+            val testable = active != null && active.complete
             OutlinedButton(
-                enabled = complete && testing?.isActive != true,
+                enabled = testable && testing?.isActive != true,
                 onClick = {
                     if (testing?.isActive == true) return@OutlinedButton
                     result = null
                     testing = scope.launch {
-                        // 用框里当前的值现建客户端，不依赖是否已保存
-                        val client = gateway.clientFor(trimmedUrl, apiKey.trim(), model.trim())
+                        val profile = active ?: return@launch
+                        val key = profile.effectiveKeys().first()
+                        val client = gateway.clientFor(profile.baseUrl, key, profile.model)
                         val outcome = client.translate(
                             system = "把用户提供的内容翻译成简体中文，只输出译文。",
                             input = "テスト",
@@ -224,6 +274,121 @@ internal fun TranslationSettingsDialog(
                     },
                     modifier = Modifier.weight(1f),
                 )
+            }
+        }
+    }
+
+    if (editorOpen) {
+        TranslationProfileEditorDialog(
+            initial = editing,
+            gateway = gateway,
+            canDelete = draft.size > 1,
+            onSave = { saved ->
+                val exists = draft.any { it.id == saved.id }
+                draft = if (exists) draft.map { if (it.id == saved.id) saved else it } else draft + saved
+                if (active == null) activeId = saved.id
+                editorOpen = false
+            },
+            onDelete = { id ->
+                val rest = draft.filterNot { it.id == id }
+                draft = rest
+                if (activeId == id) activeId = rest.firstOrNull()?.id
+                editorOpen = false
+            },
+            onDismiss = { editorOpen = false },
+        )
+    }
+}
+
+/** 当前档案卡：名称 + 地址 + 模型与密钥数，点它展开/收起档案列表。 */
+@Composable
+private fun ProfileCard(
+    profile: TranslationProfile?,
+    expanded: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        shape = MaterialTheme.shapes.medium,
+        modifier = modifier.clickable(onClick = onClick),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = profile?.let { it.label.ifBlank { it.model } } ?: "未配置",
+                    style = MaterialTheme.typography.titleSmall,
+                    maxLines = 1,
+                )
+                if (profile != null) {
+                    Text(
+                        text = profile.baseUrl,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                    )
+                    Text(
+                        text = "${profile.model} · ${profile.effectiveKeys().size} 把密钥",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                    )
+                } else {
+                    Text(
+                        text = "点右边「+」新建一个档案",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            Icon(
+                imageVector = if (expanded) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore,
+                contentDescription = if (expanded) "收起档案列表" else "展开档案列表",
+            )
+        }
+    }
+}
+
+/** 档案列表里的一行：单选切换激活，右侧编辑与删除。 */
+@Composable
+private fun ProfileRow(
+    profile: TranslationProfile,
+    selected: Boolean,
+    canDelete: Boolean,
+    onSelect: () -> Unit,
+    onEdit: () -> Unit,
+    onDelete: (String) -> Unit,
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onSelect)
+            .padding(start = 4.dp, end = 4.dp),
+    ) {
+        RadioButton(selected = selected, onClick = onSelect)
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = profile.label.ifBlank { profile.model },
+                style = MaterialTheme.typography.bodyMedium,
+                maxLines = 1,
+            )
+            Text(
+                text = "${profile.baseUrl} · ${profile.model} · ${profile.effectiveKeys().size} 把密钥",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+            )
+        }
+        IconButton(onClick = onEdit) {
+            Icon(Icons.Outlined.Edit, contentDescription = "编辑档案", modifier = Modifier.size(18.dp))
+        }
+        if (canDelete) {
+            IconButton(onClick = { onDelete(profile.id) }) {
+                Icon(Icons.Outlined.Delete, contentDescription = "删除档案", modifier = Modifier.size(18.dp))
             }
         }
     }

@@ -452,6 +452,38 @@ class DesktopPikoPreferences(
         translationModel.value = model
     }
 
+    /**
+     * 档案列表 JSON（含密钥）放系统保管处，与单项 Key 同等待遇；null 表示还没读出来。
+     */
+    private val translationProfiles = MutableStateFlow<String?>(null)
+    override val translationProfilesFlow: Flow<String> = translationProfiles.onStart {
+        if (translationProfiles.value == null) {
+            val stored = withSecrets { runCatching { secrets.read(SECRET_TRANSLATION_PROFILES)?.decodeToString() } }
+            translationProfiles.compareAndSet(
+                null,
+                stored.onFailure { PikoLog.w(TAG, "翻译档案未能从系统保管处读出", it) }.getOrNull().orEmpty(),
+            )
+        }
+    }.filterNotNull()
+
+    override suspend fun setTranslationProfiles(json: String) {
+        withSecrets {
+            if (json.isEmpty()) {
+                secrets.delete(SECRET_TRANSLATION_PROFILES)
+            } else {
+                secrets.write(SECRET_TRANSLATION_PROFILES, json.encodeToByteArray())
+            }
+        }
+        translationProfiles.value = json
+    }
+
+    private val translationActiveProfile = MutableStateFlow(settings.get(KEY_TRANSLATION_ACTIVE_PROFILE))
+    override val translationActiveProfileFlow: Flow<String> = translationActiveProfile.asStateFlow()
+    override suspend fun setTranslationActiveProfile(id: String) {
+        settings.set(KEY_TRANSLATION_ACTIVE_PROFILE, id)
+        translationActiveProfile.value = id
+    }
+
     private val translationReasoning = MutableStateFlow(settings.get(KEY_TRANSLATION_REASONING))
     override val translationReasoningFlow: Flow<String> = translationReasoning.asStateFlow()
     override suspend fun setTranslationReasoning(level: String) {
@@ -477,9 +509,11 @@ class DesktopPikoPreferences(
         const val TAG = "credentials"
         const val SECRET_METATUBE_TOKEN = "metatube-token"
         const val SECRET_TRANSLATION_API_KEY = "translation-api-key"
+        const val SECRET_TRANSLATION_PROFILES = "translation-profiles"
         const val KEY_METATUBE_URL = "scrape.metaTubeUrl"
         const val KEY_TRANSLATION_BASE_URL = "translate.baseUrl"
         const val KEY_TRANSLATION_MODEL = "translate.model"
+        const val KEY_TRANSLATION_ACTIVE_PROFILE = "translate.activeProfile"
         const val KEY_TRANSLATION_REASONING = "translate.reasoning"
         const val KEY_TRANSLATION_PROMPT = "translate.prompt"
         const val KEY_TRANSLATION_CONCURRENCY = "translate.concurrency"

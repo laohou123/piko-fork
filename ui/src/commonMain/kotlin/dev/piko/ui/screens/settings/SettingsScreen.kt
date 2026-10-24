@@ -54,6 +54,8 @@ import androidx.compose.material.icons.outlined.Sync
 import androidx.compose.material.icons.outlined.TextFields
 import androidx.compose.material.icons.outlined.Movie
 import androidx.compose.material.icons.outlined.Translate
+import dev.piko.shared.translate.TranslationProfile
+import dev.piko.shared.translate.TranslationProfileStore
 import androidx.compose.material.icons.outlined.Title
 import androidx.compose.material.icons.outlined.TravelExplore
 import androidx.compose.material.icons.outlined.Tune
@@ -186,10 +188,16 @@ fun SettingsScreen(
 
     // AI 翻译：接口地址 / Key / 模型，三样齐了才能用
     val translationGateway = services.translation
-    val translationBaseUrl by sessionManager.translationBaseUrlFlow.collectAsStateWithLifecycle(initialValue = "")
-    val translationApiKey by sessionManager.translationApiKeyFlow.collectAsStateWithLifecycle(initialValue = "")
-    val translationModel by sessionManager.translationModelFlow.collectAsStateWithLifecycle(initialValue = "")
+    val translationProfilesJson by sessionManager.translationProfilesFlow.collectAsStateWithLifecycle(initialValue = "")
+    val translationActiveProfileId by sessionManager.translationActiveProfileFlow.collectAsStateWithLifecycle(initialValue = "")
     val translationReasoning by sessionManager.translationReasoningFlow.collectAsStateWithLifecycle(initialValue = "")
+    // 档案列表经 store 读：首次会顺手把 1.3.10 及以前的旧三件套迁成第一个档案
+    var translationProfiles by remember { mutableStateOf<List<TranslationProfile>>(emptyList()) }
+    LaunchedEffect(translationProfilesJson) {
+        translationProfiles = TranslationProfileStore(sessionManager).load()
+    }
+    val activeProfile = translationProfiles.firstOrNull { it.id == translationActiveProfileId }
+        ?: translationProfiles.firstOrNull()
     val translationPrompt by sessionManager.translationPromptFlow.collectAsStateWithLifecycle(initialValue = "")
     val translationConcurrency by sessionManager.translationConcurrencyFlow.collectAsStateWithLifecycle(initialValue = 0)
     var showTranslationDialog by remember { mutableStateOf(false) }
@@ -489,19 +497,24 @@ fun SettingsScreen(
                                 )
                             }
                             if (translationGateway != null) {
-                                val configured = translationBaseUrl.isNotBlank() &&
-                                    translationApiKey.isNotBlank() && translationModel.isNotBlank()
+                                val configured = activeProfile?.complete == true
                                 SettingsNavigationRow(
                                     icon = Icons.Outlined.Translate,
                                     title = "AI 翻译",
-                                    supporting = if (configured) {
+                                    supporting = if (configured && activeProfile != null) {
                                         val level = when (translationReasoning) {
                                             "low" -> " · 推理低"
                                             "medium" -> " · 推理中"
                                             "high" -> " · 推理高"
                                             else -> ""
                                         }
-                                        "$translationModel$level · 翻译字幕与片名"
+                                        val name = activeProfile.label.ifBlank { activeProfile.model }
+                                        val keyHint = if (activeProfile.effectiveKeys().size > 1) {
+                                            " · ${activeProfile.effectiveKeys().size} 把密钥轮询"
+                                        } else {
+                                            ""
+                                        }
+                                        "$name$keyHint$level · 翻译字幕与片名"
                                     } else {
                                         "未设置，翻译字幕与片名前先配好接口与模型"
                                     },
@@ -670,18 +683,19 @@ fun SettingsScreen(
     if (showTranslationDialog && translationGateway != null) {
         TranslationSettingsDialog(
             gateway = translationGateway,
-            currentBaseUrl = translationBaseUrl,
-            currentApiKey = translationApiKey,
-            currentModel = translationModel,
+            profiles = translationProfiles,
+            activeProfileId = activeProfile?.id,
             currentReasoning = translationReasoning,
             currentPrompt = translationPrompt,
             currentConcurrency = translationConcurrency,
-            onSave = { base, key, model, reasoning, prompt, concurrency ->
+            onSave = { profiles, activeId, reasoning, prompt, concurrency ->
                 showTranslationDialog = false
                 scope.launch {
-                    sessionManager.setTranslationBaseUrl(base)
-                    sessionManager.setTranslationApiKey(key)
-                    sessionManager.setTranslationModel(model)
+                    // 档案整表加密存；activeId 空着表示用第一个
+                    sessionManager.setTranslationProfiles(
+                        TranslationProfileStore(sessionManager).encode(profiles),
+                    )
+                    sessionManager.setTranslationActiveProfile(activeId.orEmpty())
                     sessionManager.setTranslationReasoning(reasoning)
                     sessionManager.setTranslationPrompt(prompt)
                     sessionManager.setTranslationConcurrency(concurrency)

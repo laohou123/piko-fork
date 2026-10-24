@@ -158,6 +158,10 @@ class MemoryPreferences : PikoUserPreferences {
     override suspend fun setTranslationPrompt(prompt: String) { translationPromptFlow.value = prompt }
     override val translationConcurrencyFlow = MutableStateFlow(0)
     override suspend fun setTranslationConcurrency(count: Int) { translationConcurrencyFlow.value = count }
+    override val translationProfilesFlow = MutableStateFlow("")
+    override suspend fun setTranslationProfiles(json: String) { translationProfilesFlow.value = json }
+    override val translationActiveProfileFlow = MutableStateFlow("")
+    override suspend fun setTranslationActiveProfile(id: String) { translationActiveProfileFlow.value = id }
 }
 
 /** 内存会话存储，行为与两端的实现一致：会话、上次账号、密码三份各自独立。 */

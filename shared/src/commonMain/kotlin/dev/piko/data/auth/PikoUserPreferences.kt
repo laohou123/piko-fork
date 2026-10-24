@@ -267,17 +267,31 @@ interface PikoUserPreferences {
     /**
      * AI 翻译用的接口地址，OpenAI 兼容（`/chat/completions`），如 `https://api.deepseek.com/v1`。
      * 空串表示没配，界面上翻译入口置灰。每台设备各自的：本地模型与中转站的地址不通用。
+     *
+     * 1.3.11 起改由「档案」承载（见 [translationProfilesFlow]）：地址、Key、模型合成一套档案，
+     * 这套旧字段只留作升级迁移的源，之后不再单独使用。
      */
     val translationBaseUrlFlow: Flow<String>
     suspend fun setTranslationBaseUrl(url: String)
 
-    /** 翻译用的 API Key。机密，由平台加密存放，不进设置同步。空串表示没填。 */
+    /** 翻译用的 API Key。机密，由平台加密存放，不进设置同步。空串表示没填。迁移源，见上。 */
     val translationApiKeyFlow: Flow<String>
     suspend fun setTranslationApiKey(key: String)
 
-    /** 模型名，如 `deepseek-chat`、`gpt-4o-mini`。空串表示没填。 */
+    /** 模型名，如 `deepseek-chat`、`gpt-4o-mini`。空串表示没填。迁移源，见上。 */
     val translationModelFlow: Flow<String>
     suspend fun setTranslationModel(model: String)
+
+    /**
+     * AI 翻译档案列表的 JSON（含密钥，平台层加密落盘）。空串表示没配过。
+     * 升级时由旧三件套迁来第一个档案，见 `TranslationProfileStore`。
+     */
+    val translationProfilesFlow: Flow<String>
+    suspend fun setTranslationProfiles(json: String)
+
+    /** 当前激活的档案 id；空串表示用列表里第一个。 */
+    val translationActiveProfileFlow: Flow<String>
+    suspend fun setTranslationActiveProfile(id: String)
 
     /**
      * 推理强度：空串表示关（不传参数，最快），或 `low` / `medium` / `high`。
