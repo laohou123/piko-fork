@@ -191,7 +191,9 @@ class TranslationClient(
             status.value == 413 -> "请求内容太长（413），可减少并发后重试"
             else -> "翻译接口出错（${status.value}）"
         }
-        return if (detail.isBlank()) head else "$head\n服务端说明：$detail"
+        // 服务端原话整段给出：错误只有一两个字的码时（如 "o86"），只取 error.message 会漏掉上下文
+        val raw = body.trim().take(500)
+        return "$head\n服务端响应：$raw"
     }
 
     private companion object {

@@ -139,7 +139,8 @@ class AppUpdater(private val context: Context) : GithubUpdateService<AndroidUpda
     internal fun onInstallFailed(message: String) {
         PikoLog.w(TAG, "系统安装未完成：$message")
         val update = (status as? UpdateStatus.Installing)?.update
-        status = UpdateStatus.Failed("安装未完成", update)
+        // 界面上要说清是取消了还是失败了：只有一句「安装未完成」时，用户不知道该重试还是放弃
+        status = UpdateStatus.Failed("安装未完成：$message", update)
         mutableMessages.tryEmit(message)
     }
 

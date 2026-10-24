@@ -1,5 +1,6 @@
 package dev.piko.ui.screens.player
 
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
@@ -29,6 +30,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.piko.shared.media.player.SubtitleBrowserState
 import dev.piko.shared.state.SubtitleTranslateState
+import dev.piko.ui.platform.LocalPikoPlatform
 import dev.piko.ui.LocalPikoServices
 import dev.piko.ui.components.PikoEmptyState
 
@@ -190,13 +192,28 @@ internal fun SubtitleTranslatePanel(
 }
 
 @Composable
-private fun HintLine(text: String, isError: Boolean = false, maxLines: Int = Int.MAX_VALUE) {
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+private fun HintLine(
+    text: String,
+    isError: Boolean = false,
+    maxLines: Int = Int.MAX_VALUE,
+    onLongClick: (() -> Unit)? = null,
+) {
     Text(
         text = text,
         style = MaterialTheme.typography.bodySmall,
         color = if (isError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
         maxLines = maxLines,
         overflow = TextOverflow.Ellipsis,
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 6.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(
+                if (onLongClick != null) {
+                    Modifier.combinedClickable(onClick = onLongClick, onLongClick = onLongClick)
+                } else {
+                    Modifier
+                },
+            )
+            .padding(horizontal = 24.dp, vertical = 6.dp),
     )
 }

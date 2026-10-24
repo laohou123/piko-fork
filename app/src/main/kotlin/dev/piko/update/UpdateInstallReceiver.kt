@@ -31,7 +31,12 @@ class UpdateInstallReceiver : BroadcastReceiver() {
             }
             PackageInstaller.STATUS_SUCCESS -> Unit
             PackageInstaller.STATUS_FAILURE_ABORTED -> PikoApplication.instance.appUpdater.onInstallFailed("已取消安装")
-            else -> PikoApplication.instance.appUpdater.onInstallFailed("安装失败")
+            else -> {
+                val detail = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE)
+                PikoApplication.instance.appUpdater.onInstallFailed(
+                    if (detail.isNullOrBlank()) "安装失败（状态码 $status）" else "安装失败：$detail",
+                )
+            }
         }
     }
 }
