@@ -219,7 +219,7 @@ fun WorkDetailScreen(
                     }
                     Column(modifier = Modifier.padding(horizontal = 16.dp)) {
                         // 编号（认不出番号时这一串就是文件名，可能很长）与两个按钮同一行。
-                        // 文字占满剩余宽度、最多两行；提示单独一行放在下面——
+                        // 文字占满剩余宽度、最多三行；提示单独一行放在下面——
                         // 以前提示跟编号挤在同一个 Row 里，编号一长提示就被压成一个字宽，逐字换行成一列，
                         // 把这一块撑得老高，整页看着就乱了。
                         Row(
@@ -230,7 +230,7 @@ fun WorkDetailScreen(
                                 text = d.work.code.substringBeforeLast('.', d.work.code),
                                 style = MaterialTheme.typography.labelLarge,
                                 color = MaterialTheme.colorScheme.primary,
-                                maxLines = 2,
+                                maxLines = 3,
                                 overflow = TextOverflow.Ellipsis,
                                 modifier = Modifier.weight(1f),
                             )
@@ -281,7 +281,7 @@ fun WorkDetailScreen(
                             Text(
                                 text = title,
                                 style = MaterialTheme.typography.titleMedium,
-                                maxLines = 2,
+                                maxLines = 3,
                                 overflow = TextOverflow.Ellipsis,
                                 modifier = Modifier.padding(top = 6.dp),
                             )
