@@ -101,6 +101,13 @@ class SrtDocument private constructor(
             return cues.takeIf { it.isNotEmpty() }?.let { SrtDocument(it) }
         }
 
-        private val STYLE_TAG = Regex("""</?[a-zA-Z][^>]*>|\{\\[^}]*}""")
+        /**
+         * 样式标记：<i>、</font> 这类 HTML 标签，以及 {\an8} 这类 ASS 定位标记。
+         *
+         * 结尾那个 } 一定要转义：Java 的 Pattern 容忍裸的 }，Android 底下是 ICU，
+         * 直接抛 PatternSyntaxException；这个正则写在 companion object 里，一抛就是
+         * ExceptionInInitializerError，整个 SrtDocument 类用不了，字幕翻译一进来就失败。
+         */
+        private val STYLE_TAG = Regex("""</?[a-zA-Z][^>]*>|\{\\[^}]*\}""")
     }
 }
