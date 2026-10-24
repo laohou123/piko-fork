@@ -1,7 +1,6 @@
 package dev.piko.ui.screens.poster
 
 import androidx.compose.foundation.ExperimentalFoundationApi
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.clickable
@@ -891,31 +890,29 @@ private fun SectionLabel(text: String) {
     )
 }
 
-/** 标签行末尾的「+ 标签」：虚线感的浅色底，不抢已有关注点。 */
+/**
+ * 标签行末尾的「+ 标签」。外观与旁边的标签芯片一致（同样的圆角、底色、内边距与字号），
+ * 只是内容是一个加号加两个字——放在一排里不该看着像另一种控件。
+ */
 @Composable
 private fun AddTagChip(onClick: () -> Unit) {
     Surface(
-        onClick = onClick,
         shape = RoundedCornerShape(8.dp),
-        color = MaterialTheme.colorScheme.surfaceContainerLow,
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        modifier = Modifier.clickable(onClick = onClick),
     ) {
         Row(
             verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
         ) {
             Icon(
                 Icons.Filled.Add,
                 contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
                 modifier = Modifier.size(14.dp),
-                tint = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            Text(
-                text = "标签",
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(start = 3.dp),
-            )
+            Spacer(modifier = Modifier.width(4.dp))
+            Text(text = "标签", style = MaterialTheme.typography.labelLarge)
         }
     }
 }
