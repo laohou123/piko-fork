@@ -69,7 +69,7 @@
 
 到 [Releases](../../releases/latest) 下载安装包。
 
-- **Android**：`piko-1.0-universal.apk`，Android 8.0+，约 40 MB（含三 ABI 的 libmpv）
+- **Android**：`piko-1.1-universal.apk`，Android 8.0+，约 40 MB（含三 ABI 的 libmpv）
 - **桌面端**：Windows／macOS／Linux 构建方式见下方「从源码构建」
 
 > 本分支的包名是 `dev.piko.fork`，官方版是 `dev.piko`，两者签名也不同，因此**可以同时安装、各自独立运行**。
@@ -96,8 +96,8 @@ export ANDROID_KEYSTORE_PATH=/path/to/release.jks
 export ANDROID_KEYSTORE_PASSWORD='<your-store-password>'
 export ANDROID_KEY_ALIAS='<your-key-alias>'
 export ANDROID_KEY_PASSWORD='<your-key-password>'
-export PIKO_VERSION_NAME=1.0
-export PIKO_VERSION_CODE=10000
+export PIKO_VERSION_NAME=1.1
+export PIKO_VERSION_CODE=10100
 ./gradlew :app:assembleRelease -Ppiko.enableAbiSplits=false
 ```
 
@@ -120,6 +120,7 @@ xvfb-run -a ./gradlew :desktopApp:desktopTest   # 桌面 UI 测试需要显示�
 
 - 上游：<https://github.com/NihilDigit/piko>
 - 本分支的改动集中在海报墙（`shared/.../library`、`shared/.../state`、`ui/.../screens/poster`）与 AI 翻译（`shared/.../translate`），其余保持上游结构，便于跟进更新
+- 1.1 起已把上游 2026-10-24 的 main（含 v1.3.0 的归档、驱动与界面改进）整套合并进来，海报墙与翻译功能保持不变
 - 检查更新指向本仓库，不会被上游版本覆盖
 
 ## 许可

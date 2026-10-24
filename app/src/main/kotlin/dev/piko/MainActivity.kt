@@ -128,6 +128,7 @@ class MainActivity : ComponentActivity() {
         intent.dataString?.let(PikPakAppLink::parse)?.let { target ->
             when (target) {
                 PikPakAppLink.Target.Drive -> PikoApplication.instance.services.requestOpenDrive()
+                is PikPakAppLink.Target.Import -> PikoApplication.instance.instantMagnetRepository.onIncomingMagnet(target.text)
             }
             return
         }
@@ -203,9 +204,7 @@ class MainActivity : ComponentActivity() {
 
     private fun extractShareText(intent: Intent): String? {
         val texts = sharedTexts(intent)
-        return texts.takeIf { candidates -> candidates.any {
-            InstantSheetState.findShareLink(it) != null || extractLinks(it).isNotEmpty()
-        } }
+        return texts.takeIf { candidates -> candidates.any { InstantSheetState.findShareLink(it) != null } }
             ?.joinToString("\n")
     }
 

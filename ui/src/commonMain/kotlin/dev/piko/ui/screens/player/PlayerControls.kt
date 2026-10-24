@@ -64,7 +64,9 @@ import androidx.compose.material.icons.outlined.StarOutline
 import androidx.compose.material.icons.filled.Replay10
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
+import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.PushPin
+import androidx.compose.material.icons.outlined.Subtitles
 import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material.icons.outlined.VideoLibrary
 import androidx.compose.material3.ButtonDefaults
@@ -170,6 +172,8 @@ fun PlayerTopBar(
     isLocalPlayback: Boolean,
     onBackClick: () -> Unit,
     modifier: Modifier = Modifier,
+    onTracksClick: (() -> Unit)? = null,
+    onStatsClick: (() -> Unit)? = null,
     onSettingsClick: (() -> Unit)? = null,
     /** 作品收藏（海报墙收藏夹）：心形按钮，[onFavoriteClick] 为 null 时不显示。 */
     isFavorite: Boolean = false,
@@ -232,6 +236,23 @@ fun PlayerTopBar(
                     }
                 }
             }
+        }
+        if (onTracksClick != null) {
+            PlayerIconButton(
+                icon = Icons.Outlined.Subtitles,
+                label = "音轨与字幕",
+                onClick = onTracksClick,
+                tooltipBelow = true,
+                shortcut = "C",
+            )
+        }
+        if (onStatsClick != null) {
+            PlayerIconButton(
+                icon = Icons.Outlined.Info,
+                label = "详细信息",
+                onClick = onStatsClick,
+                tooltipBelow = true,
+            )
         }
         if (onSettingsClick != null) {
             PlayerIconButton(
@@ -996,11 +1017,12 @@ internal fun PlayerSeekBar(
     )
     val positionText = formatTime((fraction * durationMillis).toLong())
     val durationText = formatTime(durationMillis)
+    val currentDurationMillis by rememberUpdatedState(durationMillis)
     val currentOnSeek by rememberUpdatedState(onSeek)
     val currentOnScrub by rememberUpdatedState(onScrub)
 
     fun commitSeek(target: Float) {
-        val millis = (target * durationMillis).toLong()
+        val millis = (target * currentDurationMillis).toLong()
         pendingSeekMillis = millis
         currentOnSeek(millis)
     }
@@ -1025,7 +1047,7 @@ internal fun PlayerSeekBar(
                 .requiredHeight(SeekTouchHeight)
                 .handCursor(enabled)
                 // 按下即跳到该处并开始拖动，松手才真正 seek
-                .pointerInput(enabled, durationMillis) {
+                .pointerInput(enabled) {
                     if (!enabled) return@pointerInput
                     val inset = SeekThumbDraggingRadius.toPx()
                     awaitEachGesture {
@@ -1034,7 +1056,7 @@ internal fun PlayerSeekBar(
                         fun follow(x: Float) {
                             val target = seekFractionAt(x, size.width.toFloat(), inset)
                             dragFraction = target
-                            currentOnScrub((target * durationMillis).toLong())
+                            currentOnScrub((target * currentDurationMillis).toLong())
                         }
                         follow(down.position.x)
                         while (true) {

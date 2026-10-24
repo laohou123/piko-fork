@@ -63,7 +63,8 @@ fun SnailModeToggle(modifier: Modifier = Modifier) {
     val inner = CornerSize(4.dp)
     val leading = RoundedCornerShape(topStart = full, topEnd = inner, bottomEnd = inner, bottomStart = full)
     val trailing = RoundedCornerShape(topStart = inner, topEnd = full, bottomEnd = full, bottomStart = inner)
-    // 按中线对齐、两块同为 40dp 高：两个按钮外面各包着一圈高度不同的最小触控区，按顶边排就一高一低
+    val height = 36.dp
+    // 按中线对齐、两块同高：两个按钮外面各包着一圈高度不同的最小触控区，按顶边排就一高一低
     Row(
         modifier = modifier,
         horizontalArrangement = Arrangement.spacedBy(ButtonGroupDefaults.ConnectedSpaceBetween),
@@ -78,11 +79,15 @@ fun SnailModeToggle(modifier: Modifier = Modifier) {
                     checkedContainerColor = colors.tertiaryContainer,
                     checkedContentColor = colors.onTertiaryContainer,
                 ),
-                modifier = Modifier.height(40.dp),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+                modifier = Modifier.height(height),
             ) {
-                Icon(Icons.Outlined.SlowMotionVideo, contentDescription = null, modifier = Modifier.size(18.dp))
-                Spacer(Modifier.width(8.dp))
-                Text(if (mode.enabled) "限速 ${mode.limitLabel()}" else "蜗牛模式", maxLines = 1)
+                Icon(Icons.Outlined.SlowMotionVideo, contentDescription = "蜗牛模式", modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    if (mode.enabled) "限速 ${mode.limitLabel()}" else "蜗牛模式",
+                    maxLines = 1,
+                )
             }
         }
         TooltipBox(
@@ -101,7 +106,7 @@ fun SnailModeToggle(modifier: Modifier = Modifier) {
                 } else {
                     IconButtonDefaults.filledTonalIconButtonColors()
                 },
-                modifier = Modifier.size(width = 44.dp, height = 40.dp),
+                modifier = Modifier.size(width = 36.dp, height = height),
             ) {
                 Icon(Icons.Outlined.Tune, contentDescription = "设置上限", modifier = Modifier.size(18.dp))
             }

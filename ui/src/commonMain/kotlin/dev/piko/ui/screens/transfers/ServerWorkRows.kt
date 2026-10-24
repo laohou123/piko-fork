@@ -6,6 +6,8 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.OpenInNew
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Inventory2
+import androidx.compose.material.icons.outlined.Key
+import androidx.compose.material.icons.outlined.Link
 import androidx.compose.material.icons.outlined.Stop
 import androidx.compose.material.icons.outlined.Unarchive
 import androidx.compose.material.icons.outlined.Refresh
@@ -41,7 +43,16 @@ private fun WorkDetails(work: WorkProgress, note: String) {
 
 
 /** 解压的全部操作。提交后的解压在服务端取消不了，只有待输密码的能放弃。 */
-internal fun extractTransferActions(item: TransferItem.Extract, onShowInDrive: () -> Unit, onSkip: () -> Unit, onRecheck: () -> Unit): List<SheetAction> = buildList {
+internal fun extractTransferActions(
+    item: TransferItem.Extract,
+    onShowInDrive: () -> Unit,
+    onSkip: () -> Unit,
+    onRecheck: () -> Unit,
+    onInputPassword: (() -> Unit)? = null,
+): List<SheetAction> = buildList {
+    if (item.job.status is ArchiveJobStatus.NeedsPassword && onInputPassword != null) {
+        add(SheetAction(Icons.Outlined.Key, "输入解压密码", onInputPassword))
+    }
     add(SheetAction(Icons.AutoMirrored.Outlined.OpenInNew, "在网盘中显示", onShowInDrive))
     if (item.job.status is ArchiveJobStatus.NeedsPassword) add(SheetAction(Icons.Outlined.Close, "放弃解压", onSkip, destructive = true))
     val finished = item.job.status as? ArchiveJobStatus.Finished
@@ -81,7 +92,10 @@ internal fun vaultTransferActions(
     canUndo: Boolean,
     undo: DriveChangeJournal.UndoResult?,
     onUndo: () -> Unit,
+    onCreateImport: (String) -> Unit,
 ): List<SheetAction> = buildList {
+    val sources = item.record?.missingSources.orEmpty()
+    if (sources.isNotEmpty()) add(SheetAction(Icons.Outlined.Link, "解析来源链接", { onCreateImport(sources.joinToString("\n")) }))
     if (item.record == null) {
         if (!stopping) add(SheetAction(Icons.Outlined.Stop, if (item.restoring) "停止恢复" else "停止归档", onStop))
     } else if (undo?.status != DriveChangeJournal.UndoStatus.RUNNING) {

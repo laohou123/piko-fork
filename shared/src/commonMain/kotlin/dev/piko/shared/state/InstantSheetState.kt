@@ -37,10 +37,11 @@ import io.github.nihildigit.pikpak.shareIdFromUrl
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlin.concurrent.Volatile
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.collectLatest
@@ -97,8 +98,9 @@ internal class InstantSharedContext {
     val targetNotice = mutableStateOf<String?>(null)
 
     /** 用户在面板里另选过目标，此后不再跟随网盘页的当前目录。 */
+    @Volatile
     var targetChosen = false
-    val targetHeld = mutableStateOf(false)
+    val targetHeld = MutableStateFlow(false)
 
     // gcid 到 Piko-Temp 里的文件 id。同一会话内再预览、或保存这一项时直接复用；
     // 两条链接里的同一个文件也共用这一份
@@ -179,6 +181,11 @@ class InstantSheetState private constructor(
     var input by mutableStateOf(initialMagnet)
         private set
 
+    var needsSharePassCode by mutableStateOf(false)
+        private set
+    var sharePassCode by mutableStateOf("")
+        private set
+
     var isResolving by mutableStateOf(false)
         private set
 
@@ -206,7 +213,6 @@ class InstantSheetState private constructor(
             (batch?.isSaving == true && batch?.rows?.none { it.state.hasTrackedOfflineSubmission } == true)
     var shareSave by mutableStateOf<ShareSaveState?>(null)
         private set
-    private var shareScope: CoroutineScope? = null
     private val saveAccount = driveRepo.currentAccount
     private var instantAttemptId: String? = null
     private var saveAttempts by mutableStateOf(saveRecords.attempts.value)
@@ -427,6 +433,9 @@ class InstantSheetState private constructor(
         sourceSelectedIndices.sorted().mapNotNull(items::getOrNull)
     }
 
+    val referenceItemsToSave: List<InstantFileItem> by derivedStateOf { itemsToSave.filter { it.file.gcid != null } }
+    val missingReferenceCount: Int by derivedStateOf { itemsToSave.size - referenceItemsToSave.size }
+
     val sourceSelectedIndices: Set<Int> by derivedStateOf {
         if (saveAttachedSubtitles || sourceSelectionEdited) selectedIndices
         else selectedIndices - tree?.rows?.flatMap { it.subtitleIndices }?.toSet().orEmpty()
@@ -434,13 +443,18 @@ class InstantSheetState private constructor(
 
     /** Exact accepted inputs for the passive result browser; querying this never writes or previews. */
     val projectedSaveFiles: List<io.github.nihildigit.pikpak.ResolvedFile> by derivedStateOf {
-        sourceSelectedIndices.sorted().map { index ->
+        projectedSaveEntries.map { it.second }
+    }
+
+    /** (sourceIndex, projected ResolvedFile) pairs for virtual directory projection in Drive. */
+    val projectedSaveEntries: List<Pair<Int, io.github.nihildigit.pikpak.ResolvedFile>> by derivedStateOf {
+        sourceSelectedIndices.sorted().filter { !saveAsReference || items[it].file.gcid != null }.map { index ->
             val item = items[index]
             val name = nameToSave(index)
             val relative = if (willCreateFolder) item.file.path.substringBeforeLast('/', "").let { dir ->
                 if (dir.isEmpty()) name else "$dir/$name"
             } else name
-            item.file.copy(path = if (willCreateFolder) "$folderNameToSave/$relative" else relative)
+            index to item.file.copy(path = if (willCreateFolder) "$folderNameToSave/$relative" else relative)
         }
     }
 
@@ -451,7 +465,7 @@ class InstantSheetState private constructor(
     val willCreateFolder: Boolean by derivedStateOf { resolution != null && selectedEntryCount > 1 }
 
     val canSaveSelection: Boolean by derivedStateOf {
-        !isSaving && selectedItems.isNotEmpty() && (!saveAsReference || itemsToSave.all { it.file.gcid != null }) && target != null && saveBlockReason == null &&
+        !isSaving && selectedItems.isNotEmpty() && (!saveAsReference || referenceItemsToSave.isNotEmpty()) && target != null && saveBlockReason == null &&
             !(willCreateFolder && folderNameToSave.isBlank())
     }
 
@@ -470,7 +484,9 @@ class InstantSheetState private constructor(
 
     /** 路线与代价，见 [planSave]。没勾任何一项时为 null。 */
     val savePlan: SavePlan? by derivedStateOf {
-        if (saveAsReference && selectedItems.isNotEmpty()) SavePlan(SaveRoute.INSTANT, itemsToSave.size)
+        if (saveAsReference && selectedItems.isNotEmpty()) SavePlan(SaveRoute.INSTANT, referenceItemsToSave.size, skippedCount = missingReferenceCount)
+        else if (findShareLink(input) != null && itemsToSave.isNotEmpty() && itemsToSave.all { it.file.gcid != null })
+            planSave(items, selectedIndices, selectedEntryCount, remainingBytes, shared.account.value.copy(free = true))
         else planSave(items, selectedIndices, selectedEntryCount, remainingBytes, shared.account.value,
             catalogComplete = resolution?.resource?.truncated == false)
     }
@@ -550,13 +566,17 @@ class InstantSheetState private constructor(
             resolution != null -> {
                 val plan = savePlan
                 InstantPrimaryAction(
-                    kind = if (plan?.route == SaveRoute.OFFLINE_PACK) InstantActionKind.OFFLINE_PACK else InstantActionKind.INSTANT_SAVE,
+                    kind = when {
+                        !saveAsReference && normalizedMagnet == null && findShareLink(input) == null -> InstantActionKind.SUBMIT_OFFLINE
+                        plan?.route == SaveRoute.OFFLINE_PACK -> InstantActionKind.OFFLINE_PACK
+                        else -> InstantActionKind.INSTANT_SAVE
+                    },
                     fileCount = plan?.fileCount ?: 0,
                     enabled = canSaveSelection && plan?.blocked != true,
                 )
             }
-            input.isBlank() -> null
-            normalizedMagnet != null && errorMessage == null -> null
+            input.isBlank() || needsSharePassCode -> null
+            resolvedKey != null && errorMessage == null -> null
             else -> InstantPrimaryAction(
                 kind = InstantActionKind.SUBMIT_OFFLINE,
                 fileCount = 0,
@@ -613,12 +633,7 @@ class InstantSheetState private constructor(
         scope.launch { preferences.bundleSubtitlesFlow.collect { saveAttachedSubtitles = it } }
         refreshShare()
         if (initialMagnet.isNotBlank() && !startBatchIfMany()) {
-            if (normalizeMagnet(initialMagnet) == null) {
-                // 外部唤起的链不合法时自动解析不会发生，说明一句它只能整条离线
-                errorMessage = "非磁力链接，可离线下载"
-            } else {
-                scheduleResolve()
-            }
+            scheduleResolve()
         }
     }
 
@@ -632,25 +647,43 @@ class InstantSheetState private constructor(
         startBatchIfMany()
     }
 
+    fun updateSharePassCode(value: String) { if (canEdit) sharePassCode = value.trim() }
+    fun submitSharePassCode() { if (canEdit) { resolvedKey = null; scheduleResolve(false) } }
     private fun refreshShare() {
-        val id = findShareLink(input)?.let(::shareIdFromUrl)
-        if (id == shareSave?.shareId) return
-        shareScope?.cancel()
-        shareScope = null
-        shareSave = id?.let {
-            val child = CoroutineScope(scope.coroutineContext + SupervisorJob(scope.coroutineContext[Job]))
-            shareScope = child
-            ShareSaveState(driveRepo, child, it, initialPassCode = findSharePassCode(input).orEmpty(), session = shareSaves,
-                holdTarget = { held -> shared.targetHeld.value = held }, saveTarget = saveTargetContext)
+        sharePassCode = findSharePassCode(input).orEmpty()
+        needsSharePassCode = false
+    }
+
+    private suspend fun resolveShare(url: String): Result<MagnetResolutionResult?> = runSuspendCatching {
+        val id = requireNotNull(shareIdFromUrl(url))
+        val info = driveRepo.shareInfo(id, sharePassCode).getOrThrow()
+        val root = info.files.singleOrNull()?.takeIf { it.isFolder }
+        val files = mutableListOf<io.github.nihildigit.pikpak.ResolvedFile>()
+        val pending = ArrayDeque<Pair<io.github.nihildigit.pikpak.FileStat, String>>()
+        info.files.forEach { pending.add(it to if (it == root) "" else it.name) }
+        val visited = mutableSetOf<String>()
+        var truncated = info.nextPageToken.isNotEmpty()
+        while (pending.isNotEmpty()) {
+            val (file, path) = pending.removeFirst()
+            if (file.isFolder) {
+                if (!visited.add(file.id)) continue
+                if (visited.size > 64) { truncated = true; continue }
+                driveRepo.shareFolder(id, info.passCodeToken, file.id).getOrThrow().forEach {
+                    pending.add(it to if (path.isEmpty()) it.name else "$path/${it.name}")
+                }
+            } else files += io.github.nihildigit.pikpak.ResolvedFile(path, file.sizeBytes, file.hash.ifBlank { null })
         }
+        val items = files.map { InstantFileItem(it, it.gcid != null) }
+        MagnetResolutionResult(io.github.nihildigit.pikpak.MagnetResource(root?.name ?: info.title, files, truncated),
+            items, items.count { it.isInstantReady }, items.size)
     }
 
     /**
-     * 输入里有两条以上链接就换成批量列表，返回是否换了。分享链接仍走转存，不进列表。
+     * 输入里有两条以上链接就换成批量列表，返回是否换了。分享、磁力与下载链接共用同一列表。
      * 批量列表里没有输入框：要换一批链接就点 × 结束这一次，或把列表里的行删光回到空的输入框。
      */
     private fun startBatchIfMany(): Boolean {
-        if (!isRoot || findShareLink(input) != null) return false
+        if (!isRoot) return false
         val links = extractLinks(input)
         if (links.size < 2) return false
         // 逐字输入时每多识别出一条链接就会走到这里
@@ -718,6 +751,10 @@ class InstantSheetState private constructor(
         selectionPicked = true
     }
 
+    fun deselectUnindexed() {
+        setSourceSelected(items.indices.filter { items[it].file.gcid == null }.toSet(), false)
+    }
+
     fun toggleSelectAll() {
         if (!canEdit) return
         resetEditableAttempt()
@@ -732,7 +769,7 @@ class InstantSheetState private constructor(
         folderNameEdited = true
     }
 
-    /** 更换本次的保存目标。只管这一次会话，下次仍默认存进网盘页的当前目录。 */
+    /** 更换本次的保存目标；用户显式指定后不再被 followDriveFolder 覆盖。 */
     fun changeTarget(breadcrumb: PikoPathBreadcrumb) {
         if (!canEdit) return
         resetEditableAttempt()
@@ -754,6 +791,17 @@ class InstantSheetState private constructor(
     fun preview(index: Int) {
         val item = items.getOrNull(index) ?: return
         previewFile(item.file, index)
+    }
+
+    /**
+     * 把待保存虚拟压缩包临时秒传到 Piko-Temp，返回真实的文件 ID，供 [ArchiveBrowser] 列包内目录。
+     * 同一会话里按 gcid 复用，不重复消耗额度。
+     */
+    suspend fun leaseForArchiveBrowse(file: io.github.nihildigit.pikpak.ResolvedFile): Result<String> {
+        val gcid = file.gcid ?: return Result.failure(IllegalStateException("压缩包尚未收录，需离线保存后打开"))
+        previewedIds[gcid]?.let { return Result.success(it) }
+        val lease = shared.previewLease ?: return Result.failure(IllegalStateException("预览会话未就绪"))
+        return lease.put(file).onSuccess { fileId -> previewedIds[gcid] = fileId }
     }
 
     var previewingSharedId by mutableStateOf<String?>(null)
@@ -793,7 +841,8 @@ class InstantSheetState private constructor(
 
     /** 按 [savePlan] 的路线保存当前勾选。 */
     fun saveSelection() {
-        if (saveAsReference && itemsToSave.any { it.file.gcid == null }) { errorMessage = "所选内容缺少引用，无法保存"; return }
+        if (saveAsReference && itemsToSave.isNotEmpty() && referenceItemsToSave.isEmpty()) { errorMessage = "所选内容均缺少引用，无法以引用保存"; return }
+        if (!saveAsReference && normalizedMagnet == null && findShareLink(input) == null) { submitOfflineTask(); return }
         if (!scope.isActive || isSaving) return
         saveBlockReason?.let { errorMessage = it; return }
         if (instantRetry != null) {
@@ -810,7 +859,7 @@ class InstantSheetState private constructor(
         if (saveIssue?.requiresInspection == true) return
         val plan = savePlan ?: return
         if (isSaving || plan.blocked) return
-        val toSave = itemsToSave
+        val toSave = if (saveAsReference) referenceItemsToSave else itemsToSave
         isSaving = true
         saveScope.launch {
             try {
@@ -937,14 +986,15 @@ class InstantSheetState private constructor(
      */
     internal suspend fun submitForBatch(target: PikoPathBreadcrumb): Result<List<String>?> {
         val plan = savePlan
-        val toSave = itemsToSave
+        val toSave = if (saveAsReference) referenceItemsToSave else itemsToSave
         isSaving = true
         try {
             return when {
                 instantRetry != null -> resumeInstant().map { it }
                 saveBlockReason != null -> Result.failure(IllegalStateException(saveBlockReason))
                 saveIssue?.requiresInspection == true -> Result.failure(IllegalStateException("本次保存结果待确认，请先在任务页核对"))
-                resolution == null -> submitWhole(target).map { null }
+                saveAsReference && toSave.isEmpty() -> Result.failure(IllegalStateException("所选内容均缺少引用，无法以引用保存"))
+                resolution == null || (!saveAsReference && normalizedMagnet == null && findShareLink(input) == null) -> submitWhole(target).map { null }
                 plan == null -> Result.failure(IllegalStateException("未勾选文件"))
                 plan.route == SaveRoute.INSTANT && willCreateFolder -> saveIntoNewFolder(target, toSave).map { it.createdIds }
                 plan.route == SaveRoute.INSTANT -> saveInstantOrOffline(target, toSave)
@@ -969,7 +1019,7 @@ class InstantSheetState private constructor(
     }
 
     private fun scheduleResolve(debounce: Boolean = true) {
-        val magnet = normalizeMagnet(input)
+        val magnet = extractLinks(input).singleOrNull()?.uri
         if (magnet == resolvedKey) return
         resolvedKey = magnet
         resolveJob?.cancel()
@@ -981,6 +1031,7 @@ class InstantSheetState private constructor(
         selectionPicked = false
         errorMessage = null
         isUnindexed = false
+        needsSharePassCode = false
         contentMissing = false
         if (magnet == null) return
         resolveJob = scope.launch {
@@ -988,11 +1039,21 @@ class InstantSheetState private constructor(
             if (debounce) delay(AUTO_RESOLVE_DEBOUNCE_MS)
             isResolving = true
             try {
-                shared.resolvePermits.withPermit { instantRepo.resolve(magnet) }
+                shared.resolvePermits.withPermit {
+                    when {
+                        findShareLink(magnet) != null -> resolveShare(magnet)
+                        magnet.startsWith("http", true) -> instantRepo.probeHttpResource(magnet)
+                        normalizeMagnet(magnet) != null -> instantRepo.resolve(magnet)
+                        else -> Result.success(null)
+                    }
+                }
                     .onSuccess { data -> applyResolution(data) }
                     .onFailure { err ->
-                        PikoLog.w(TAG, "解析链接失败", err)
-                        errorMessage = "解析失败：${err.message}"
+                        needsSharePassCode = (err as? io.github.nihildigit.pikpak.ShareUnavailableException)?.needsPassCode == true
+                        if (!needsSharePassCode) {
+                            PikoLog.w(TAG, "解析链接失败", err)
+                            errorMessage = "解析失败：${err.message}"
+                        }
                     }
             } finally {
                 // 换链取消上一次解析时也要走到这里，否则指示器会一直转
@@ -1025,7 +1086,7 @@ class InstantSheetState private constructor(
         expandedGroups.clear()
         showsOnlyUnindexed = false
         folderName = built.folderName
-        selectedIndices = built.defaultSelection
+        selectedIndices = if (data.items.size == 1 && normalizedMagnet == null) setOf(0) else built.defaultSelection
         selectionPicked = false
         // 批量时余量由列表按合计查，逐行查只是多发请求
         if (isRoot) scope.launch { refreshRemainingBytes() }
@@ -1042,6 +1103,8 @@ class InstantSheetState private constructor(
 
     // 只粘了 infohash 的输入要补成磁力链再交给离线，createUrlFile 不认裸的 hash。
     // 夹在一段话里的单条链接只交链接本身
+    private fun referenceSource(): String? = findShareLink(input)?.let { it + if (sharePassCode.isNotBlank()) "?pwd=$sharePassCode" else "" } ?: resolvedKey
+
     private fun submittedUrl(): String = normalizedMagnet ?: extractLinks(input).singleOrNull()?.uri ?: input.trim()
 
     /**
@@ -1052,12 +1115,16 @@ class InstantSheetState private constructor(
      * 两者同时生效时，用户看着一个目录，东西却进了另一个，而当前目录恰是他此刻最可能想要的。
      */
     private suspend fun followDriveFolder() {
-        combine(saveTargetContext.folders, snapshotFlow { shared.targetHeld.value || isSaving || hasPendingOfflineSubmission || batch?.rows?.any { it.state.hasPendingOfflineSubmission } == true }) { folder, held -> folder to held }
+        combine(
+            saveTargetContext.folders,
+            shared.targetHeld,
+            snapshotFlow { isSaving || hasPendingOfflineSubmission || batch?.rows?.any { it.state.hasPendingOfflineSubmission } == true },
+        ) { folder, held, busy -> folder to (held || busy) }
             .distinctUntilChanged()
             .collectLatest { (folder, held) ->
-                if (shared.targetChosen || held) return@collectLatest
+                if (held || shared.targetChosen) return@collectLatest
                 val resolved = targetFor(folder)
-                if (!shared.targetChosen) target = resolved
+                if (!shared.targetChosen && !shared.targetHeld.value) target = resolved
             }
     }
 
@@ -1114,7 +1181,9 @@ class InstantSheetState private constructor(
     private suspend fun executeInstant(plan: InstantRetryPlan, submitted: List<InstantFileItem>): Result<List<String>> {
         val result = if (saveAsReference) {
             val vault = driveRepo.vaultAccess(requireNotNull(saveAccount)) ?: throw kotlinx.coroutines.CancellationException("保存账号已结束")
-            instantRepo.saveReferences(submitted, plan.target.id, plan.keepStructure, plan.names, plan.receipt.folders, vault, resolvedKey)
+            instantRepo.saveReferences(submitted.filter { it.file.gcid != null }, plan.target.id, plan.keepStructure, plan.names, plan.receipt.folders, vault, referenceSource()) { members ->
+                if (driveRepo.currentAccount == saveAccount) driveRepo.vaultTrees.merge(members)
+            }
         } else instantRepo.instantSave(submitted, plan.target.id, reuse = previewedIds.toMap(), keepStructure = plan.keepStructure,
             names = plan.names, existingFolders = plan.receipt.folders)
         if (driveRepo.currentAccount != saveAccount) throw kotlinx.coroutines.CancellationException("保存账号已结束")
@@ -1139,7 +1208,9 @@ class InstantSheetState private constructor(
             receipt.folders.values.toSet() + plan.target.id + listOfNotNull(saveParent?.id),
         ))
         if (!saveAsReference) submitted.filter { it.file.path in current.confirmed }.forEach { item -> item.file.gcid?.let(previewedIds::remove) }
-        resolvedKey?.let { magnet -> driveRepo.sourceLedger.record(magnet, submitted.filter { it.file.path in current.confirmed }.map { it.file }) }
+        (normalizedMagnet ?: findShareLink(input))?.let { source ->
+            driveRepo.sourceLedger.record(source, submitted.filter { it.file.path in current.confirmed }.map { it.file })
+        }
         instantAttemptId?.let { saveRecords.finishAttempt(it, receipt) }
         val complete = receipt.confirmed.keys.containsAll(plan.files.filter { it.file.gcid != null }.map { it.file.path }) && !receipt.requiresInspection
         return if (complete) {
@@ -1299,14 +1370,25 @@ class InstantSheetState private constructor(
 
         /**
          * 一段文本里的 PikPak 分享链接。分享常以「链接：https://mypikpak.com/s/… 提取码：abcd」的整段话转发，
-         * 链接不在开头，SDK 的 shareIdFromUrl 只认以链接开头的串，所以先在这里把它找出来。
+         * SDK 的 shareIdFromUrl 只认 mypikpak.com，所以先提取 ID 并统一域名。
          */
-        fun findShareLink(text: String): String? = SHARE_LINK.find(text)?.value
+        fun findShareLink(text: String): String? {
+            val webId = SHARE_LINK.find(text)?.groupValues?.get(1)
+            val appId = SHARE_APP_LINK.findAll(text).firstNotNullOfOrNull { link ->
+                SHARE_ID.find(link.value)?.groupValues?.get(1)
+            }
+            return (webId ?: appId)?.let { "https://mypikpak.com/s/$it" }
+        }
 
-        /** 与分享链接一起转发的提取码：「提取码：abcd」「密码 abcd」，或链接上的 ?pwd=abcd。 */
-        fun findSharePassCode(text: String): String? = SHARE_PASS_CODE.find(text)?.groupValues?.get(1)
+        /** 与分享链接一起转发的提取码，也支持官方 App 的 pass_code 查询参数。 */
+        fun findSharePassCode(text: String): String? =
+            SHARE_QUERY_PASS_CODE.find(text)?.groupValues?.get(1)
+                ?: SHARE_PASS_CODE.find(text)?.groupValues?.get(1)
 
-        private val SHARE_LINK = Regex("""https?://(?:www\.)?mypikpak\.com/s/[A-Za-z0-9_-]+""")
-        private val SHARE_PASS_CODE = Regex("""(?:提取码|密码|访问码|pwd|passcode)\s*[:：=]?\s*([A-Za-z0-9]{4,10})""", RegexOption.IGNORE_CASE)
+        private val SHARE_LINK = Regex("""https?://(?:[A-Za-z0-9-]+\.)*(?:mypikpak\.com|mypikpak\.net|pikpak\.me|pikpakdrive\.com|pickpackapp\.com)/s/([A-Za-z0-9_-]+)""", RegexOption.IGNORE_CASE)
+        private val SHARE_APP_LINK = Regex("""pikpakapp://[^\s/?#]+/drive/share_watch\?[^\s#]*""", RegexOption.IGNORE_CASE)
+        private val SHARE_ID = Regex("""[?&]share_id=([A-Za-z0-9_-]+)(?=[&#\s]|$)""", RegexOption.IGNORE_CASE)
+        private val SHARE_QUERY_PASS_CODE = Regex("""[?&](?:pwd|passcode|pass_code)=([A-Za-z0-9]{4,10})(?=[&#\s]|$)""", RegexOption.IGNORE_CASE)
+        private val SHARE_PASS_CODE = Regex("""(?<![A-Za-z0-9_?&])(?:提取码|密码|访问码|pwd|passcode|pass_code)(?:\s*[:：=]\s*|\s+)([A-Za-z0-9]{4,10})(?![A-Za-z0-9])""", RegexOption.IGNORE_CASE)
     }
 }

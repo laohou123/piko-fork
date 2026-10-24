@@ -1,5 +1,13 @@
 package dev.piko.ui.workbench
 
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.EnterTransition
+import androidx.compose.animation.ExitTransition
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.background
 import androidx.compose.material.icons.Icons
@@ -21,6 +29,7 @@ import dev.piko.shared.presentation.WorkspaceContext
 import dev.piko.ui.components.PikoDialog
 import dev.piko.ui.components.PikoDialogConfirm
 import dev.piko.ui.platform.LocalPikoPlatform
+import dev.piko.ui.theme.LocalPikoMotion
 import dev.piko.ui.theme.frame
 import dev.piko.ui.screens.drive.*
 import dev.piko.ui.screens.instant.InstantSheetContent
@@ -58,10 +67,11 @@ internal fun WorkspaceContextHost(
                     when (context) {
                         is WorkspaceContext.File -> fileContent()
                         is WorkspaceContext.Duplicate -> {
+                            val requestCloseDuplicate = { model.requestCloseContext(context.id) }
                             CompositionLocalProvider(
-                                LocalWorkspaceSurface provides if (!wide) WorkspaceSurface(context.id, onMinimize) else null,
+                                LocalWorkspaceSurface provides if (!wide) WorkspaceSurface(context.id, requestCloseDuplicate) else null,
                             ) {
-                                BackHandler(enabled = !wide, onBack = onMinimize)
+                                BackHandler(enabled = !wide, onBack = requestCloseDuplicate)
                                 Box(Modifier.fillMaxSize().then(if (!wide) Modifier.imePadding() else Modifier)) {
                                     if (context.id in model.duplicateSessions) DriveScreen(
                                         onNavigateToFolder = { _, _ -> },
@@ -69,14 +79,10 @@ internal fun WorkspaceContextHost(
                                         browserSession = model.duplicateBrowser(context.id),
                                         onRevealInDrive = onReveal,
                                         onOpenTransfers = onTransfers,
-                                        onCloseContext = { model.requestCloseContext(context.id) },
+                                        onCloseContext = requestCloseDuplicate,
                                         rootTitle = workspaceTitle(model, context),
                                         interactionEnabled = true,
-                                        onLibraryLeft = {
-                                            if (!wide) {
-                                                onMinimize()
-                                            }
-                                        },
+                                        onLibraryLeft = requestCloseDuplicate,
                                     )
                                 }
                             }
@@ -108,11 +114,14 @@ internal fun WorkspaceContextHost(
                             } else {
                                 CompositionLocalProvider(LocalWorkspaceSurface provides WorkspaceSurface(context.id, onMinimize)) {
                                     BackHandler(onBack = onMinimize)
+                                    val topTitle = draft.resolution?.resource?.name
+                                        ?: draft.batch?.let { "${it.rows.size} 条链接" }
+                                        ?: "添加链接"
                                     dev.piko.ui.components.PikoScaffold(
                                         modifier = Modifier.fillMaxSize().imePadding(),
                                         topBar = {
                                             dev.piko.ui.components.PikoTopBar(
-                                                title = "添加链接",
+                                                title = topTitle,
                                                 navigationIcon = { dev.piko.ui.components.TooltipIconButton(Icons.AutoMirrored.Outlined.ArrowBack, "返回来源", onMinimize) },
                                                 persistentActions = { WorkspaceControls() },
                                             )
@@ -135,11 +144,14 @@ internal fun WorkspaceContextHost(
         if (wide) {
             val workspace = requireNotNull(model.driveWorkspace)
             val files by workspace.tabsFlow.collectAsStateWithLifecycle()
-            val tabs = contexts.map { context ->
-                when (context) {
-                    is WorkspaceContext.File -> files.firstOrNull { it.id == context.id } ?: DriveTab(context.id, emptyList())
-                    is WorkspaceContext.Duplicate -> DriveTab(context.id, listOf(PikoPathBreadcrumb("context:${context.id}", "查重：${context.root.name}")))
-                    is WorkspaceContext.ImportDraft -> DriveTab(context.id, listOf(PikoPathBreadcrumb("context:${context.id}", "添加链接")))
+            val tabs = remember(contexts, files) {
+                val fileById = files.associateBy { it.id }
+                contexts.map { context ->
+                    when (context) {
+                        is WorkspaceContext.File -> fileById[context.id] ?: DriveTab(context.id, emptyList())
+                        is WorkspaceContext.Duplicate -> DriveTab(context.id, listOf(PikoPathBreadcrumb("context:${context.id}", "查重：${context.root.name}")))
+                        is WorkspaceContext.ImportDraft -> DriveTab(context.id, listOf(PikoPathBreadcrumb("context:${context.id}", "添加链接")))
+                    }
                 }
             }
             val shortcut = LocalPikoPlatform.current.shortcutModifier
@@ -172,6 +184,15 @@ internal fun WorkspaceContextHost(
 
 @Composable
 internal fun WorkspaceContextDialogs(model: WorkspaceViewModel) {
+    model.blockedCloseMessage?.let { message ->
+        PikoDialog(
+            onDismissRequest = model::dismissBlockedClose,
+            title = { Text("无法关闭标签页") },
+            text = { Text(message) },
+            confirmButton = { TextButton(model::dismissBlockedClose) { Text("知道了") } },
+        )
+        return
+    }
     if (model.pendingCloseOtherIds.isNotEmpty()) {
         PikoDialog(
             onDismissRequest = model::cancelCloseOtherContexts,
@@ -187,10 +208,17 @@ internal fun WorkspaceContextDialogs(model: WorkspaceViewModel) {
     val duplicate = context is WorkspaceContext.Duplicate
     val scanning = model.duplicateSessions[context.id]?.state?.isScanning == true
     val name = workspaceTitle(model, context)
+    val hasAddLinkOnTab = context is WorkspaceContext.File && model.hasUncommittedAddLinkOnTab(context.id)
+    val hasGalleryOnTab = context is WorkspaceContext.File && model.hasGalleryOnTab(context.id)
+    val fileCloseText = when {
+        hasAddLinkOnTab && hasGalleryOnTab -> "关闭此标签页将退出瀑布流浏览，并一并放弃当前输入的链接和勾选的文件。"
+        hasGalleryOnTab -> "将退出瀑布流浏览并关闭此标签页，回到文件列表。"
+        else -> "关闭此标签页将一并放弃当前输入的链接和勾选的文件。"
+    }
     PikoDialog(
         onDismissRequest = model::cancelCloseContext,
-        title = { Text(if (duplicate) "关闭查重？" else "关闭草稿？") },
-        text = { Text("「$name」" + if (duplicate) (if (scanning) "的扫描将停止，已有结果不再保留。已执行的文件操作不会撤销。" else "的本次查重结果将不再保留。已执行的文件操作不会撤销。")
+        title = { Text(if (context is WorkspaceContext.File) "关闭标签页？" else if (duplicate) "关闭查重？" else "关闭草稿？") },
+        text = { Text(if (context is WorkspaceContext.File) fileCloseText else "「$name」" + if (duplicate) (if (scanning) "的扫描将停止，已有结果不再保留。已执行的文件操作不会撤销。" else "的本次查重结果将不再保留。已执行的文件操作不会撤销。")
             else "中未提交的内容将不再保留。已提交的保存继续执行，结果可在任务页查看。") },
         confirmButton = { PikoDialogConfirm("关闭", model::confirmCloseContext, destructive = true,
             modifier = Modifier.semantics { contentDescription = "确认关闭工作" }) },

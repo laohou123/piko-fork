@@ -66,16 +66,20 @@ class DriveCommandsTest {
             val idle = driveCommands(inputs(place, selecting = false))
             val selecting = driveCommands(inputs(place, selecting = true))
             assertEquals(false, idle.selectAll, "$place")
-            assertEquals(idle.copy(create = false, selectAll = selecting.selectAll, feed = false), selecting, "$place")
+            assertEquals(idle.copy(create = false, selectAll = selecting.selectAll, gallery = false, feed = false), selecting, "$place")
         }
     }
     @Test
     fun `selected videos open a fixed feed from browsable places`() {
+        val nonFeedPlaces = setOf(CommandPlace.TRASH, CommandPlace.ARCHIVE, CommandPlace.IMPORT_PREVIEW)
         for (place in CommandPlace.entries) {
             val selected = inputs(place, selecting = true, selectedVideoCount = 2)
-            assertEquals(place != CommandPlace.TRASH && place != CommandPlace.ARCHIVE,
+            assertEquals(place !in nonFeedPlaces,
+                driveCommands(selected).gallery, "$place")
+            assertEquals(place !in nonFeedPlaces,
                 driveCommands(selected).feed, "$place")
             assertEquals(false, driveCommands(inputs(place, selecting = true, selectedVideoCount = 2, feedSupported = false)).feed)
+            assertEquals(false, driveCommands(inputs(place, selecting = true)).gallery)
             assertEquals(false, driveCommands(inputs(place, selecting = true)).feed)
         }
     }

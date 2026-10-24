@@ -32,9 +32,11 @@ import androidx.compose.ui.unit.dp
 import dev.piko.data.repository.isPlayableVideo
 import dev.piko.data.repository.FileCategory
 import dev.piko.data.repository.fileCategory
+import dev.piko.shared.data.isImportPreview
 import dev.piko.shared.data.isVaulted
 import io.github.nihildigit.pikpak.FileStat
 import io.github.nihildigit.pikpak.ResolvedFile
+import io.github.nihildigit.pikpak.thumbnailUrlOf
 
 internal data class FileItemName(val title: String, val original: String? = null, val fullName: String = title)
 
@@ -47,7 +49,7 @@ internal data class FileVisual(
     val category: FileCategory = name.fileCategory(),
 )
 
-internal enum class FileItemMark { Starred, Vaulted, ContainsVault }
+internal enum class FileItemMark { Starred, Vaulted, ContainsVault, ImportPreview }
 internal data class FileItemStatus(val text: String, val needsAttention: Boolean = false)
 
 /** Presentation only: a source entry does not need a remote file id or an executable drive command. */
@@ -63,21 +65,32 @@ internal data class FilePresentation(
     val status: FileItemStatus? = null,
 )
 
-internal fun FileStat.fileVisual(emptyFolder: Boolean = false) = FileVisual(
-    name, isFolder, thumbnailLink.takeIf { it.isNotEmpty() }, !isFolder && isPlayableVideo(), emptyFolder, fileCategory(),
-)
+internal fun FileStat.fileVisual(emptyFolder: Boolean = false): FileVisual {
+    val isVideo = !isFolder && isPlayableVideo()
+    val cover = thumbnailLink.ifBlank { if (isVideo && hash.isNotBlank()) thumbnailUrlOf(hash) else "" }
+    return FileVisual(
+        name, isFolder, cover.takeIf { it.isNotEmpty() }, isVideo, emptyFolder, fileCategory(),
+    )
+}
 
 @Composable
 internal fun FileStat.filePresentation(
     title: String? = null, original: String? = null, tags: List<String> = emptyList(), code: String? = null,
     resolution: String? = null, folderHasVault: Boolean = false, emptyFolder: Boolean = false,
-): FilePresentation = FilePresentation(
-    key = id, name = FileItemName(title ?: displayTitle(), original, name), visual = fileVisual(emptyFolder),
-    metadata = metaParts(), tags = tags, code = code, resolution = resolution,
-    marks = fileItemMarks(folderHasVault),
-)
+): FilePresentation {
+    val showExt = LocalShowExtensions.current
+    val resolvedTitle = title ?: displayTitle()
+    return remember(this, resolvedTitle, original, tags, code, resolution, folderHasVault, emptyFolder, showExt) {
+        FilePresentation(
+            key = id, name = FileItemName(resolvedTitle, original, name), visual = fileVisual(emptyFolder),
+            metadata = metaParts(), tags = tags, code = code, resolution = resolution,
+            marks = fileItemMarks(folderHasVault),
+        )
+    }
+}
 
 internal fun FileStat.fileItemMarks(folderHasVault: Boolean): Set<FileItemMark> = buildSet {
+    if (isImportPreview) add(FileItemMark.ImportPreview)
     if (isStarred) add(FileItemMark.Starred)
     if (isVaulted || (isFolder && folderHasVault)) add(if (isFolder) FileItemMark.ContainsVault else FileItemMark.Vaulted)
 }
@@ -122,7 +135,8 @@ internal fun FileItemInformation(
 
 @Composable
 internal fun FileItemMarks(marks: Set<FileItemMark>) {
-    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+    Row(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
+        if (FileItemMark.ImportPreview in marks) ImportPreviewMark()
         if (FileItemMark.Starred in marks) StarMark()
         if (FileItemMark.Vaulted in marks || FileItemMark.ContainsVault in marks) VaultMark(FileItemMark.ContainsVault in marks)
     }
@@ -215,8 +229,10 @@ internal fun fileItemLongPress(action: (() -> Unit)?): (() -> Unit)? {
     val haptic = LocalHapticFeedback.current
     return if (action == null) null else remember(pointers, haptic) {
         {
-            if (pointers.isTouchLike) haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-            current?.invoke()
+            if (pointers.isTouchLike) {
+                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                current?.invoke()
+            }
         }
     }
 }

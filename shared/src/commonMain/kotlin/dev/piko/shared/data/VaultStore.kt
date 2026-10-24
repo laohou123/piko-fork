@@ -8,6 +8,7 @@ import io.github.nihildigit.pikpak.ResolvedFile
 import io.github.nihildigit.pikpak.TaskPhase
 import io.github.nihildigit.pikpak.thumbnailUrlOf
 import dev.piko.data.repository.isPlayableVideo
+import dev.piko.data.repository.isPreviewableImage
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.update
@@ -86,8 +87,8 @@ data class VaultEntry(
             phase = TaskPhase.COMPLETE,
             params = source?.let { mapOf("url" to it) }.orEmpty(),
         )
-        // 缩略图只由 gcid 决定、不带签名，不借文件就有；只给视频拼，别的类型 PikPak 没有截图
-        return if (row.isPlayableVideo()) row.copy(thumbnailLink = thumbnailUrlOf(gcid)) else row
+        // 缩略图只由 gcid 决定、不带签名，不借文件就有；给视频与图片拼上
+        return if (row.isPlayableVideo() || row.isPreviewableImage()) row.copy(thumbnailLink = thumbnailUrlOf(gcid)) else row
     }
 
     companion object {
@@ -222,6 +223,11 @@ class VaultStore(
         val file = winner(listing)?.file ?: return emptyList()
         return parsed.value[file.id]
     }
+
+    /** 查找已知清单中含 [entryId] 的文件夹 ID。 */
+    fun folderOfEntry(entryId: String): String? =
+        known.value.entries.firstOrNull { (_, entries) -> entries.any { it.id == entryId } }?.key
+            ?: pending.value.entries.firstOrNull { (_, entries) -> entries.any { it.id == entryId } }?.key
 
     /**
      * 把 [edit] 写进 [folderId] 的清单。现列目录再读，不用调用方手上的列表：它可能已经过时。

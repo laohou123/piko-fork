@@ -2,8 +2,13 @@ package dev.piko.shared.data
 
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
 import kotlinx.io.Buffer
 import io.ktor.utils.io.toByteArray
+import io.github.nihildigit.pikpak.UploadStart
+import io.github.nihildigit.pikpak.cancelUpload
+import io.github.nihildigit.pikpak.continueUpload
+import io.github.nihildigit.pikpak.startUpload
 import io.github.nihildigit.pikpak.streamRangeFromUrl
 import io.github.nihildigit.pikpak.upload
 import io.github.nihildigit.pikpak.PikPakHash
@@ -98,7 +103,7 @@ import kotlin.time.Duration.Companion.seconds
 import kotlin.time.TimeMark
 import kotlin.time.TimeSource
 
-enum class PikoFileSortOrder { NAME_ASC, NAME_DESC, TIME_DESC, TIME_ASC, SIZE_DESC, SIZE_ASC }
+enum class PikoFileSortOrder { NAME_ASC, NAME_DESC, TIME_DESC, TIME_ASC, SIZE_DESC, SIZE_ASC, DURATION_DESC, DURATION_ASC }
 
 data class PikoPathBreadcrumb(val id: String, val name: String)
 
@@ -252,8 +257,40 @@ open class PikoDriveRepository(
      */
     suspend fun locateFolder(fileId: String): Result<List<PikoPathBreadcrumb>> = withContext(Dispatchers.Default) {
         runSuspendCatching {
+            val asked = client
+            val vaultEntryId = VaultEntry.entryIdOf(fileId)
+            if (vaultEntryId != null) {
+                val store = vault
+                var parentId = store.folderOfEntry(vaultEntryId)
+                if (parentId == null) {
+                    val candidates = buildList {
+                        add("")
+                        addAll(childContents.vaultedFolders.value)
+                        addAll(vaultTrees.flow.value.values.flatten())
+                        addAll(vaultTrees.flow.value.keys)
+                    }.distinct()
+                    for (candidateId in candidates) {
+                        runSuspendCatching {
+                            val listing = cachedListing(candidateId) ?: fetchListing(candidateId, asked)
+                            store.read(candidateId, listing).getOrNull()?.let { vaultEntriesKnown(candidateId, it) }
+                        }
+                        parentId = store.folderOfEntry(vaultEntryId)
+                        if (parentId != null) break
+                    }
+                }
+                val resolvedParent = parentId ?: error("找不到归档条目所在的文件夹")
+                if (resolvedParent.isEmpty()) return@runSuspendCatching listOf(ROOT_BREADCRUMB)
+                val folder = folderIndex.node(resolvedParent)?.takeUnless { it.provisional }
+                if (folder != null) {
+                    val above = if (folder.parentId.isNullOrEmpty()) listOf(ROOT_BREADCRUMB) else locateFolder(resolvedParent).getOrThrow()
+                    return@runSuspendCatching above + PikoPathBreadcrumb(resolvedParent, folder.name)
+                }
+                val detail = fetchDetail(resolvedParent, asked)
+                val above = if (detail.parentId.isEmpty()) listOf(ROOT_BREADCRUMB) else locateFolder(resolvedParent).getOrThrow()
+                return@runSuspendCatching above + PikoPathBreadcrumb(detail.id, detail.name)
+            }
             val chain = ArrayDeque<PikoPathBreadcrumb>()
-            var parentId = knownParentOf(fileId) ?: fetchDetail(fileId).parentId
+            var parentId = knownParentOf(fileId) ?: fetchDetail(fileId, asked).parentId
             repeat(MAX_LOCATE_DEPTH) {
                 if (parentId.isEmpty()) return@runSuspendCatching listOf(ROOT_BREADCRUMB) + chain
                 val known = folderIndex.node(parentId)?.takeUnless { it.provisional }
@@ -262,7 +299,7 @@ open class PikoDriveRepository(
                     chain.addFirst(PikoPathBreadcrumb(parentId, known.name))
                     parentId = knownParent
                 } else {
-                    val folder = fetchDetail(parentId)
+                    val folder = fetchDetail(parentId, asked)
                     chain.addFirst(PikoPathBreadcrumb(folder.id, folder.name))
                     parentId = folder.parentId
                 }
@@ -347,7 +384,7 @@ open class PikoDriveRepository(
     suspend fun folderMapLevel(folderId: String): Result<List<FileStat>> = withContext(Dispatchers.Default) {
         runSuspendCatching {
             val files = freshListing(folderId) ?: fetchListing(folderId)
-            files.filter { !it.trashed && !isPikoInternalFolder(it, folderId) && !VaultStore.looksLikeManifest(it) }
+            files.filter { !it.trashed && !isPikoInternalFolder(it, folderId) && !VaultStore.looksLikeManifest(it) && !VaultStore.isRecoveryFile(it) }
                 .sortedWith(compareBy<FileStat> { !it.isFolder }.thenBy(NaturalOrder) { it.name })
         }
     }
@@ -532,22 +569,48 @@ open class PikoDriveRepository(
         entries: List<VaultEntry>,
         sortOrder: PikoFileSortOrder,
     ): List<FileStat> {
-        val visible = withVaultCovers(listing.filterNot { isPikoInternalFolder(it, folderId) })
+        val visible = withVaultCovers(listing.filterNot { isPikoInternalFolder(it, folderId) || VaultStore.isRecoveryFile(it) })
         if (entries.isEmpty() && visible.none(VaultStore::looksLikeManifest)) return sortFiles(visible, sortOrder, folderId)
         val real = visible.filterNot(VaultStore::looksLikeManifest)
         val restoredMetadata = entries.filterNot { it.isArchived }
-        val enriched = real.map { file -> restoredMetadata.firstOrNull { it.matches(file) }?.enrich(file) ?: file }
+        val enriched = if (restoredMetadata.isEmpty()) {
+            real
+        } else {
+            val byFileId = HashMap<String, Pair<Int, VaultEntry>>()
+            val byName = HashMap<String, Pair<Int, VaultEntry>>()
+            restoredMetadata.forEachIndexed { index, entry ->
+                val gcidKey = "${entry.gcid.uppercase()}:${entry.size}"
+                val fileId = entry.restoredFileId
+                if (!fileId.isNullOrEmpty()) {
+                    byFileId.putIfAbsent("$gcidKey|id:$fileId", index to entry)
+                }
+                byName.putIfAbsent("$gcidKey|name:${entry.name}", index to entry)
+            }
+            real.map { file ->
+                if (file.isFolder) return@map file
+                val gcidKey = "${file.hash.uppercase()}:${file.sizeBytes}"
+                val matchById = byFileId["$gcidKey|id:${file.id}"]
+                val matchByName = byName["$gcidKey|name:${file.name}"]
+                val matched = when {
+                    matchById != null && matchByName != null -> if (matchById.first <= matchByName.first) matchById.second else matchByName.second
+                    matchById != null -> matchById.second
+                    matchByName != null -> matchByName.second
+                    else -> null
+                }
+                matched?.enrich(file) ?: file
+            }
+        }
         return sortFiles(enriched + entries.filter { it.isArchived }.map { it.toFileStat(folderId) }, sortOrder, folderId)
     }
 
     /**
-     * 服务端没给封面的文件夹，用其中归档条目的封面补上，见 FolderContentMemory.vaultCovers。
+     * 已归档文件夹优先使用归档视频封面，避免残留小文件抢占；其他文件夹只补空封面。
      * 归档时选的那一层往往只有子文件夹，取 [VaultTrees] 里其下文件夹的。没有可补的时原样返回同一个列表。
      */
     fun withVaultCovers(files: List<FileStat>): List<FileStat> {
-        if (files.none { it.isFolder && it.thumbnailLink.isEmpty() && vaultCoverOf(it.id) != null }) return files
+        if (files.none { it.isFolder && (it.thumbnailLink.isEmpty() || it.id in vaultedFolders.value) && vaultCoverOf(it.id) != null }) return files
         return files.map { file ->
-            if (!file.isFolder || file.thumbnailLink.isNotEmpty()) return@map file
+            if (!file.isFolder || (file.thumbnailLink.isNotEmpty() && file.id !in vaultedFolders.value)) return@map file
             vaultCoverOf(file.id)?.let { file.copy(thumbnailLink = thumbnailUrlOf(it)) } ?: file
         }
     }
@@ -557,8 +620,13 @@ open class PikoDriveRepository(
 
     private fun vaultCoverOf(folderId: String): String? {
         val covers = childContents.vaultCovers.value
-        return covers[folderId]?.ifEmpty { null }
-            ?: vaultTrees.flow.value[folderId]?.sorted()?.firstNotNullOfOrNull { covers[it]?.ifEmpty { null } }
+        val visited = mutableSetOf<String>()
+        fun cover(id: String): String? {
+            if (!visited.add(id)) return null
+            return covers[id]?.ifEmpty { null }
+                ?: vaultTrees.flow.value[id]?.sorted()?.firstNotNullOfOrNull(::cover)
+        }
+        return cover(folderId)
     }
 
     /**
@@ -570,7 +638,13 @@ open class PikoDriveRepository(
         if (vaultCoverOf(folderId) != null) return@withContext
         val known = childContents.vaultCovers.value
         val direct = folderId.takeIf { it in childContents.vaultedFolders.value && it !in known }
-        val members = vaultTrees.flow.value[folderId].orEmpty().sorted().filter { it != folderId && it !in known }
+        val descendants = mutableSetOf<String>()
+        fun visit(id: String) {
+            if (!descendants.add(id)) return
+            vaultTrees.flow.value[id].orEmpty().forEach(::visit)
+        }
+        visit(folderId)
+        val members = descendants.sorted().filter { it != folderId && it !in known }
         for (candidate in listOfNotNull(direct) + members.take(COVER_PROBE_MEMBERS)) {
             childNameFetches.withPermit {
                 if (candidate in childContents.vaultCovers.value) return@withPermit
@@ -658,13 +732,35 @@ open class PikoDriveRepository(
 
     /** [complete] 为假时 [files] 只是一页：其中没有清单不说明文件夹里没有，只加标记、不去掉。 */
     private fun rememberChildContents(folderId: String, files: List<FileStat>, complete: Boolean = true) {
-        // 清单文件不是用户的文件，不拿来解析作品名；有没有它说明这个文件夹里有没有归档条目。
+        // 清单文件与归档来源兜底文件不是用户的文件，不拿来解析作品名；有没有清单说明这个文件夹里有没有归档条目。
         // 清单读过、确认已经空了的不算
         val (manifests, real) = files.partition(VaultStore::looksLikeManifest)
-        childContents.put(folderId, real.filterNot(FileStat::isFolder).take(MAX_REMEMBERED_CHILD_NAMES).map(ChildFile::of))
+        val visibleReal = real.filterNot { it.trashed || VaultStore.isRecoveryFile(it) }
+        childContents.put(folderId, visibleReal.filterNot(FileStat::isFolder).take(MAX_REMEMBERED_CHILD_NAMES).map(ChildFile::of))
         val hasEntries = manifests.isNotEmpty() && vault.cached(folderId, files)?.any { it.isArchived } != false
         if (hasEntries || complete) childContents.markVaulted(folderId, hasEntries)
+        val subfolders = visibleReal.filter { it.isFolder }.mapTo(mutableSetOf()) { it.id }
+        val hasRealFiles = visibleReal.any { !it.isFolder && !it.isVaulted }
+        childContents.rememberCompleteness(folderId, hasRealFiles, subfolders, complete)
+        val marked = VaultTrees.marked(childContents.vaultedFolders.value, childContents.state.value.keys, vaultTrees.flow.value)
+        if (complete && folderId.isNotEmpty() && visibleReal.none { !it.isFolder && !it.isVaulted } &&
+            subfolders.isNotEmpty() && subfolders.all { it in marked }) {
+            vaultTrees.merge(mapOf(folderId to subfolders))
+        }
         _folderEmptiness.update { it + (folderId to files.isEmpty()) }
+    }
+
+    internal fun knownVaultParents(): Map<String, String> = folderIndex.flow.value.nodes
+        .filterValues { !it.provisional }.mapNotNull { (id, node) -> node.parentId?.let { id to it } }.toMap()
+
+    internal fun rememberFullyVaulted(folderIds: Set<String>) {
+        childContents.markFullyVaulted(folderIds, knownVaultParents())
+    }
+
+    /** 完整列举或全量归档成功确认无剩余真实文件；未知目录保留继续归档入口。 */
+    val fullyVaultedFolders: StateFlow<Set<String>> by lazy {
+        combine(childContents.fullyVaultedFolders, vaultedFolders) { full, marked -> full intersect marked }
+            .stateIn(backgroundScope, SharingStarted.Eagerly, emptySet())
     }
 
     /** 挂归档标记的文件夹：直接放着归档条目的，加上归档时选的那一层到它们之间的各层，见 VaultTrees.marked。 */
@@ -789,13 +885,15 @@ open class PikoDriveRepository(
     }.flowOn(Dispatchers.Default)
 
     suspend fun getFileDetail(fileId: String): Result<FileDetail> = withContext(Dispatchers.Default) {
-        runSuspendCatching { fetchDetail(fileId) }
+        runSuspendCatching { fetchDetail(fileId, client) }
     }
 
-    /** 查详情，是文件夹就记进索引。 */
-    private suspend fun fetchDetail(fileId: String): FileDetail = client.getFile(fileId).also { detail ->
-        val isFolder = detail.kind == FileKind.FOLDER
-        if (folderIndex.learned(detail.id, detail.name, detail.parentId, isFolder, detail.trashed)) normalizeLocations()
+    /** 查详情，是文件夹就记进索引（仅当请求归属的 client 仍为当前活跃 client 时）。 */
+    private suspend fun fetchDetail(fileId: String, asked: PikPakClient = client): FileDetail = asked.getFile(fileId).also { detail ->
+        if (clientManager.currentClient.value === asked) {
+            val isFolder = detail.kind == FileKind.FOLDER
+            if (folderIndex.learned(detail.id, detail.name, detail.parentId, isFolder, detail.trashed)) normalizeLocations()
+        }
     }
 
     /**
@@ -845,7 +943,36 @@ open class PikoDriveRepository(
     private suspend fun uploadBytes(asked: PikPakClient, parentId: String, name: String, bytes: ByteArray): String {
         val size = bytes.size.toLong()
         val gcid = PikPakHash.fromSource(Buffer().apply { write(bytes) }, size)
-        return asked.upload(parentId, name, size, gcid, { Buffer().apply { write(bytes) } }, {}).fileId
+        val session = when (val start = asked.startUpload(parentId, name, size, gcid)) {
+            is UploadStart.Instant -> return start.fileId
+            is UploadStart.Pending -> start.session
+        }
+        var lastError: Throwable? = null
+        try {
+            for (attempt in 0 until UPLOAD_BYTES_ATTEMPTS) {
+                try {
+                    asked.continueUpload(
+                        session,
+                        open = { offset: Long ->
+                            val startOffset = offset.toInt().coerceIn(0, bytes.size)
+                            Buffer().apply { write(bytes, startOffset, bytes.size) }
+                        },
+                        onProgress = {},
+                    )
+                    return session.fileId
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Throwable) {
+                    lastError = e
+                    if (e is PikPakException || attempt == UPLOAD_BYTES_ATTEMPTS - 1) throw e
+                    delay(LINK_RETRY_DELAYS.getOrElse(attempt) { 1.seconds })
+                }
+            }
+            throw lastError ?: error("上传失败")
+        } catch (e: Throwable) {
+            withContext(NonCancellable) { runCatching { asked.cancelUpload(session) } }
+            throw e
+        }
     }
 
     /**
@@ -973,7 +1100,7 @@ open class PikoDriveRepository(
      */
     fun searchRecursive(query: String, parentId: String = ""): Flow<SearchHit> =
         client.searchFilesRecursive(query, parentId).filter { hit ->
-            !isPikoInternalFolder(hit.file) && !VaultStore.looksLikeManifest(hit.file) &&
+            !isPikoInternalFolder(hit.file) && !VaultStore.looksLikeManifest(hit.file) && !VaultStore.isRecoveryFile(hit.file) &&
                 !(parentId.isEmpty() && hit.breadcrumb.firstOrNull()?.let(::isPikoInternalFolderName) == true)
         }.map { hit -> hit.copy(file = sourceLedger.enrich(hit.file)) }
 
@@ -1140,18 +1267,42 @@ open class PikoDriveRepository(
      */
     fun sortFiles(files: List<FileStat>, order: PikoFileSortOrder, parentId: String): List<FileStat> {
         val (folders, regularFiles) = files.partition { it.isFolder }
+        fun durationOf(file: FileStat): Double? = file.params["duration"]?.toDoubleOrNull()?.takeIf { it > 0.0 }
+        val nameComparator = compareBy(NaturalOrder, FileStat::name)
         val comparator = when (order) {
             // 自然顺序：第 2 集排在第 10 集前面
-            PikoFileSortOrder.NAME_ASC -> compareBy(NaturalOrder, FileStat::name)
-            PikoFileSortOrder.NAME_DESC -> compareBy(NaturalOrder, FileStat::name).reversed()
+            PikoFileSortOrder.NAME_ASC -> nameComparator
+            PikoFileSortOrder.NAME_DESC -> nameComparator.reversed()
             // 按创建时间而非 modified_time：目录的 modified_time 不随其中内容变动而更新，
             // 与创建时间相同（2026-09-23 实测），按它排序只会让「修改时间」名不副实
             PikoFileSortOrder.TIME_DESC -> compareByDescending(FileStat::createdTime)
             PikoFileSortOrder.TIME_ASC -> compareBy(FileStat::createdTime)
             PikoFileSortOrder.SIZE_DESC -> compareByDescending(FileStat::sizeBytes)
             PikoFileSortOrder.SIZE_ASC -> compareBy(FileStat::sizeBytes)
+            // 按时长排序时，无时长的非音视频文件排在有具体时长的音视频文件之后，同为无时长时按自然名称排
+            PikoFileSortOrder.DURATION_DESC -> Comparator { a, b ->
+                val da = durationOf(a)
+                val db = durationOf(b)
+                when {
+                    da != null && db != null -> db.compareTo(da).takeIf { it != 0 } ?: nameComparator.compare(a, b)
+                    da != null -> -1
+                    db != null -> 1
+                    else -> nameComparator.compare(a, b)
+                }
+            }
+            PikoFileSortOrder.DURATION_ASC -> Comparator { a, b ->
+                val da = durationOf(a)
+                val db = durationOf(b)
+                when {
+                    da != null && db != null -> da.compareTo(db).takeIf { it != 0 } ?: nameComparator.compare(a, b)
+                    da != null -> -1
+                    db != null -> 1
+                    else -> nameComparator.compare(a, b)
+                }
+            }
         }
-        val sortedFolders = folders.sortedWith(comparator)
+        val folderComparator = if (order == PikoFileSortOrder.DURATION_DESC || order == PikoFileSortOrder.DURATION_ASC) nameComparator else comparator
+        val sortedFolders = folders.sortedWith(folderComparator)
         val pinned = if (parentId.isEmpty()) sortedFolders.firstOrNull { it.isMyPacksFolder() } else null
         val orderedFolders = if (pinned == null) sortedFolders else listOf(pinned) + (sortedFolders - pinned)
         return orderedFolders + regularFiles.sortedWith(comparator)
@@ -1160,12 +1311,13 @@ open class PikoDriveRepository(
     private fun FileStat.isMyPacksFolder() = isFolder && name.lowercase() in MY_PACKS_FOLDER_NAMES
 
     companion object {
-        val ROOT_BREADCRUMB = PikoPathBreadcrumb("", "网盘")
+        val ROOT_BREADCRUMB = PikoPathBreadcrumb("", "我的网盘")
         private const val TAG = "DriveRepository"
 
         // 批量操作的日志里列出的 ID 个数：够在网盘里对上是哪几项，几百项的移动不至于占满一屏
         private const val LOGGED_IDS = 5
         private val LINK_RETRY_DELAYS = listOf(500.milliseconds, 1.seconds, 2.seconds)
+        private const val UPLOAD_BYTES_ATTEMPTS = 3
         private const val MAX_LOCATE_DEPTH = 64
         private const val CHILD_NAME_PAGE = 20
         private const val CHILD_NAME_CONCURRENCY = 2

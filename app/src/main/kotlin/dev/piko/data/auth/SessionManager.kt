@@ -93,6 +93,7 @@ class SessionManager(private val context: Context) : PikoUserPreferences {
         val DOWNLOAD_DIR_PATH = stringPreferencesKey("download_dir_path")
         val SPOILER_BLUR_ENABLED = booleanPreferencesKey("spoiler_blur_enabled")
         val AUTO_CHECK_UPDATES = booleanPreferencesKey("auto_check_updates")
+        val AUTO_DETECT_CLIPBOARD_LINKS = booleanPreferencesKey("auto_detect_clipboard_links")
         val REDUCE_MOTION = booleanPreferencesKey("reduce_motion")
         /** 作品详情页顶部自动播放预览片，默认开。 */
         val POSTER_AUTO_PREVIEW = booleanPreferencesKey("poster_auto_preview")
@@ -176,7 +177,7 @@ class SessionManager(private val context: Context) : PikoUserPreferences {
         val prefs = context.dataStore.data.first()
         return Triple(
             prefs[PreferencesKeys.LAST_FOLDER_ID] ?: "",
-            prefs[PreferencesKeys.LAST_FOLDER_NAME] ?: "网盘",
+            prefs[PreferencesKeys.LAST_FOLDER_NAME] ?: "我的网盘",
             prefs[PreferencesKeys.LAST_FOLDER_STACK_SERIALIZED] ?: "",
         )
     }
@@ -196,6 +197,14 @@ class SessionManager(private val context: Context) : PikoUserPreferences {
     override suspend fun setAutoCheckUpdates(enabled: Boolean) {
         context.dataStore.edit { preferences ->
             preferences[PreferencesKeys.AUTO_CHECK_UPDATES] = enabled
+        }
+    }
+
+    override val autoDetectClipboardLinksFlow: Flow<Boolean> = preference { it[PreferencesKeys.AUTO_DETECT_CLIPBOARD_LINKS] ?: false }
+
+    override suspend fun setAutoDetectClipboardLinks(enabled: Boolean) {
+        context.dataStore.edit { preferences ->
+            preferences[PreferencesKeys.AUTO_DETECT_CLIPBOARD_LINKS] = enabled
         }
     }
 

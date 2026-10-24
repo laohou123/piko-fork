@@ -3,6 +3,7 @@ package dev.piko.ui.screens.drive
 import dev.piko.shared.data.isArchiveVolume
 import dev.piko.shared.data.isExtractableArchive
 import dev.piko.shared.data.isVaulted
+import dev.piko.shared.data.isImportPreview
 import dev.piko.shared.upload.isUploading
 import dev.piko.data.repository.isPlayableVideo
 import io.github.nihildigit.pikpak.FileStat
@@ -42,6 +43,7 @@ internal enum class CommandPlace {
 
     /** 压缩包里（见 ArchiveLocation）：条目不在网盘里，只能打开、下载文件与解压选中的几项。 */
     ARCHIVE,
+    IMPORT_PREVIEW,
 }
 
 internal class CommandInputs(
@@ -82,6 +84,7 @@ internal data class DriveCommands(
     val canonicalNaming: Boolean,
     val sort: Boolean,
     val filter: Boolean,
+    val gallery: Boolean,
     val feed: Boolean,
     val addLink: Boolean,
 )
@@ -102,17 +105,20 @@ internal class ItemCommands(
     val downloadAtQuality: Boolean,
     val extract: Boolean,
     val removeRecord: Boolean,
-    /** 归档，文件夹另有取消归档。 */
+    /** 选中范围仍有可归档的文件。 */
     val vault: Boolean,
+    /** 网盘上下文中的文件夹可取消归档，具体标记由条目提供。 */
+    val unvault: Boolean,
 )
 
-internal fun itemCommands(place: CommandPlace, targets: List<FileStat>): ItemCommands {
+internal fun itemCommands(place: CommandPlace, targets: List<FileStat>, fullyVaultedFolders: Set<String> = emptySet()): ItemCommands {
     val inTrash = place == CommandPlace.TRASH
     val inArchive = place == CommandPlace.ARCHIVE
     val eventLog = place == CommandPlace.RECENT || place == CommandPlace.HISTORY
     val hasTargets = targets.isNotEmpty()
     // 上传中的文件改名、移动、分享都会失败，作用对象里有它就不给这几样；归档条目与压缩包里的条目在网盘里没有文件，同理
-    val settled = hasTargets && !inArchive && targets.none { it.isUploading || it.isVaulted }
+    val settled = hasTargets && !inArchive && targets.none { it.isUploading || it.isVaulted || it.isImportPreview }
+    val vaultContext = settled && (place == CommandPlace.ROOT || place == CommandPlace.FOLDER || place == CommandPlace.SEARCH)
     return ItemCommands(
         cutCopy = settled && !inTrash,
         rename = settled && !inTrash,
@@ -121,24 +127,26 @@ internal fun itemCommands(place: CommandPlace, targets: List<FileStat>): ItemCom
         restoreOrDelete = hasTargets && inTrash,
         moveCopyTo = settled && !inTrash,
         // 文件夹整个下载，见 PikoDownloadCoordinator.enqueueFolders；压缩包里的文件夹不在网盘里，列不出内容，只下文件
-        download = hasTargets && !inTrash && targets.any { !it.isUploading && !(inArchive && it.isFolder) },
+        download = hasTargets && !inTrash && targets.any { !it.isUploading && !(inArchive && it.isFolder) && (!it.isImportPreview || it.isFolder || it.hash.isNotBlank()) },
         downloadAtQuality = hasTargets && !inTrash && !inArchive && targets.any {
-            !it.isUploading && !it.isVaulted && (it.isFolder || it.isPlayableVideo())
+            !it.isUploading && !it.isVaulted && !it.isImportPreview && (it.isFolder || it.isPlayableVideo())
         },
         // 压缩包里解压的是选中的几项本身，不是选中项里的压缩包
-        extract = hasTargets && !inTrash && (inArchive || targets.any { it.isExtractableArchive || it.isArchiveVolume }),
+        extract = hasTargets && !inTrash && (inArchive || targets.any { !it.isVaulted && !it.isImportPreview && (it.isExtractableArchive || it.isArchiveVolume) }),
         removeRecord = hasTargets && eventLog,
         // 回收站与压缩包里的不在网盘里。库（星标、最近添加、播放历史、查重的结果）里要做的是回到原处、下载、移走或删除，
         // 不给：移动端面板在最近添加里已满 8 行，见 MobilePanelSizeTest。搜索结果的条目仍在各自的文件夹里，清单按所在文件夹写，照常给
-        vault =settled && (place == CommandPlace.ROOT || place == CommandPlace.FOLDER || place == CommandPlace.SEARCH),
+        vault = vaultContext && targets.any { !it.isFolder || it.id !in fullyVaultedFolders },
+        unvault = vaultContext,
     )
 }
 
 internal fun driveCommands(input: CommandInputs): DriveCommands = with(input) {
+    val importPreview = place == CommandPlace.IMPORT_PREVIEW
     val folder = place == CommandPlace.ROOT || place == CommandPlace.FOLDER
     val inTrash = place == CommandPlace.TRASH
     DriveCommands(
-        home = !atRoot,
+        home = importPreview || !atRoot,
         // 多选时左端换成「已选 N 项」；搜索结果不是目录
         create = folder && !selecting,
         paste = clipboardFull && folder,
@@ -151,10 +159,13 @@ internal fun driveCommands(input: CommandInputs): DriveCommands = with(input) {
         // 范围同查重；关了文件名解析就认不出番号，扫出来必然是空的
         canonicalNaming = folder && itemCount > 0 && nameParsing,
         // 库里按各自的先后（添加、播放的时间）排；一项以下没得排
-        sort = (folder || place == CommandPlace.SEARCH) && itemCount >= 2,
+        sort = (importPreview || folder || place == CommandPlace.SEARCH) && itemCount >= 2,
         // 只有一类时筛了等于没筛；筛着的时候要留着，才撤得掉
         filter = typeCount >= 2 || filtering,
-        feed = feedSupported && if (selecting) {
+        gallery = !importPreview && if (selecting) {
+            selectedVideoCount > 0 && place != CommandPlace.TRASH && place != CommandPlace.ARCHIVE
+        } else folder,
+        feed = !importPreview && feedSupported && if (selecting) {
             selectedVideoCount > 0 && place != CommandPlace.TRASH && place != CommandPlace.ARCHIVE
         } else folder,
         // 默认存进眼前的目录（InstantSheetState.followDriveFolder）。库、查重、压缩包的栈顶是 piko: 一类的虚拟 ID，

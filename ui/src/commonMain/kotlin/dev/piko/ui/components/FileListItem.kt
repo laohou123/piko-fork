@@ -26,6 +26,10 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.role
@@ -40,7 +44,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
-import dev.piko.ui.theme.LocalFixedColors
+import dev.piko.shared.data.isImportPreview
+import dev.piko.ui.adaptive.isDesktopLayout
 import io.github.nihildigit.pikpak.FileStat
 
 /** M3 列表的前导图像尺寸（ItemLeadingImage 56x56dp）。 */
@@ -101,6 +106,7 @@ fun FileListItem(
     isSelected: Boolean = false,
     onSelectToggle: (Boolean) -> Unit = {},
     isHighlighted: Boolean = false,
+    isImportPreview: Boolean = false,
     dimmed: Boolean = false,
 ) {
     val longClick = fileItemLongPress(onLongClick)
@@ -110,6 +116,10 @@ fun FileListItem(
     } else if (isHighlighted) {
         ListItemDefaults.colors(
             containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f),
+        )
+    } else if (isImportPreview) {
+        ListItemDefaults.colors(
+            containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.28f),
         )
     } else {
         ListItemDefaults.colors()
@@ -260,6 +270,7 @@ fun FileListItem(
         isSelected = isSelected,
         onSelectToggle = onSelectToggle,
         isHighlighted = isHighlighted,
+        isImportPreview = file.isImportPreview,
     )
 }
 
@@ -287,19 +298,22 @@ fun ListLeadingMedia(
     ) {
         // 本地文件与 SAF 地址也走 SpoilerThumbnail：传输列表的缩略图可能来自已下载的文件，
         // 只对 URL 做遮蔽的话，下载下来的东西反而绕过了防窥
-        if (thumbnail == null) {
+        var coverFailed by remember(thumbnail) { mutableStateOf(false) }
+        val activeThumbnail = thumbnail?.takeUnless { coverFailed }
+        if (activeThumbnail == null) {
             fallback()
         } else {
             SpoilerThumbnail(
-                model = thumbnail,
+                model = activeThumbnail,
                 isBlurred = isSpoilerBlurred,
                 blur = ListSpoilerBlur,
                 modifier = Modifier.fillMaxSize(),
+                onError = { coverFailed = true },
             )
         }
         // 遮蔽时 SpoilerThumbnail 已画了遮蔽图标，再叠播放键就是两个图标摞在一起
-        if (showPlayOverlay && thumbnail != null && !isSpoilerBlurred) {
-            val fixed = LocalFixedColors.current
+        if (showPlayOverlay && activeThumbnail != null && !isSpoilerBlurred) {
+            val fixed = dev.piko.ui.theme.LocalFixedColors.current
             Box(
                 modifier = Modifier
                     .fillMaxSize()
@@ -367,6 +381,23 @@ fun VaultMark(inFolder: Boolean, modifier: Modifier = Modifier) {
         tint = MaterialTheme.colorScheme.secondary,
         modifier = modifier.size(StarMarkSize),
     )
+}
+
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+fun ImportPreviewMark(modifier: Modifier = Modifier) {
+    Surface(
+        shape = MaterialTheme.shapes.extraSmall,
+        color = MaterialTheme.colorScheme.tertiaryContainer,
+        modifier = modifier,
+    ) {
+        Text(
+            text = "待保存",
+            style = MaterialTheme.typography.labelSmallEmphasized,
+            color = MaterialTheme.colorScheme.onTertiaryContainer,
+            modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp),
+        )
+    }
 }
 
 /**

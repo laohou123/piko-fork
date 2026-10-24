@@ -1,6 +1,22 @@
 package dev.piko.desktop
 
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.selection.toggleable
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.Role
+import dev.piko.ui.components.PikoDialog
+import dev.piko.ui.components.PikoDialogConfirm
 import dev.piko.shared.PikoHome
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
@@ -93,6 +109,7 @@ import kotlinx.coroutines.withTimeoutOrNull
  */
 private const val AOT_TRAINING_PROPERTY = "compose.aot.training-run"
 private const val AOT_TRAINING_MILLIS = 12_000L
+private const val CLOSE_BEHAVIOR_ASKED_KEY = "window.closeToTrayAsked"
 
 fun main(args: Array<String>) {
     // 最先做：之后任何一处碰到 JNA 都会让它按当时的属性初始化
@@ -235,13 +252,19 @@ fun main(args: Array<String>) {
             .collectAsState(initial = services.hasBackgroundWork() || services.hasDesktopResumeContext())
         // 执行结束但仍有待输入、报告或未知结果时保留托盘，避免自动退出丢失恢复入口。
         var isInBackground by remember { mutableStateOf(false) }
+        var manualTraySession by remember { mutableStateOf(false) }
         var isMainWindowFocused by remember { mutableStateOf(true) }
+        var askCloseBehavior by remember { mutableStateOf(false) }
 
         // 主窗口在前台时列表与 Snackbar 已经说明了，不再弹 Toast
         WorkNotifications(services) { isInBackground || !isMainWindowFocused }
 
-        LaunchedEffect(isInBackground, keepSessionAlive) {
-            if (isInBackground && !keepSessionAlive && !services.hasBackgroundWork() && !services.hasDesktopResumeContext()) exitApplication()
+        val closeToTray = platform.closeToTray?.enabled?.collectAsState()?.value == true
+        LaunchedEffect(isInBackground) {
+            if (!isInBackground) manualTraySession = false
+        }
+        LaunchedEffect(isInBackground, manualTraySession, keepSessionAlive, closeToTray) {
+            if (isInBackground && !manualTraySession && !closeToTray && !keepSessionAlive && !services.hasBackgroundWork() && !services.hasDesktopResumeContext()) exitApplication()
         }
         // 更新脚本等本进程退出后才替换文件。下载会被中断，更新对话框已先征得用户同意
         LaunchedEffect(Unit) {
@@ -251,7 +274,7 @@ fun main(args: Array<String>) {
         if (isInBackground) {
             Tray(
                 icon = appIcon ?: BitmapPainter(ImageBitmap(16, 16)),
-                tooltip = if (hasActiveTransfers) backgroundTooltip(downloads.values, uploads.values.filter { it.account == account }) else "Piko：有待处理工作",
+                tooltip = if (hasActiveTransfers) backgroundTooltip(downloads.values, uploads.values.filter { it.account == account }) else "Piko",
                 onAction = { isInBackground = false },
                 menu = {
                     Item("显示 Piko", onClick = { isInBackground = false })
@@ -260,20 +283,27 @@ fun main(args: Array<String>) {
             )
         }
 
+        val hideToTray: (manual: Boolean) -> Unit = { manual ->
+            manualTraySession = manual
+            isInBackground = true
+            // Toast 同步等系统结果，不能压在界面线程上
+            Thread {
+                val reopenHint = when {
+                    isMacOs -> "可从菜单栏图标重新打开"
+                    isLinux -> LinuxDesktop.backgroundHint()
+                    else -> "可从通知区域图标重新打开"
+                }
+                if (closeToTray || manual) showSystemNotification("Piko 已最小化到系统托盘", "$reopenHint；可从托盘菜单退出程序。")
+                else if (services.hasBackgroundWork()) showSystemNotification("Piko 在后台继续处理", "工作完成后自动退出；需你处理的结果会保留，$reopenHint。")
+                else showSystemNotification("Piko 已保留待处理工作", "重新打开窗口可继续处理，$reopenHint。")
+            }.start()
+        }
+
         val closeMainWindow = {
-            if (services.hasBackgroundWork() || services.hasDesktopResumeContext()) {
-                isInBackground = true
-                // Toast 同步等系统结果，不能压在界面线程上
-                Thread {
-                    // macOS 的托盘图标在菜单栏；Linux 未必有托盘
-                    val reopenHint = when {
-                        isMacOs -> "可从菜单栏图标重新打开"
-                        isLinux -> LinuxDesktop.backgroundHint()
-                        else -> "可从通知区域图标重新打开"
-                    }
-                    if (services.hasBackgroundWork()) showSystemNotification("Piko 在后台继续处理", "工作完成后自动退出；需你处理的结果会保留，$reopenHint。")
-                    else showSystemNotification("Piko 已保留待处理工作", "重新打开窗口可继续处理，$reopenHint。")
-                }.start()
+            if (services.hasBackgroundWork() || services.hasDesktopResumeContext() || closeToTray) {
+                hideToTray(closeToTray)
+            } else if (platform.closeToTray != null && settings.get(CLOSE_BEHAVIOR_ASKED_KEY) != "true") {
+                askCloseBehavior = true
             } else {
                 exitApplication()
             }
@@ -342,6 +372,60 @@ fun main(args: Array<String>) {
                                 videoPlayer = videoPlayer,
                             )
                         }
+                    }
+                    if (askCloseBehavior) {
+                        var rememberCloseChoice by remember { mutableStateOf(true) }
+                        PikoDialog(
+                            onDismissRequest = { askCloseBehavior = false },
+                            title = { Text("关闭主窗口") },
+                            text = {
+                                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                                    Text("选择点击关闭按钮时的操作，之后可在设置「外观」中随时更改。")
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .heightIn(min = 40.dp)
+                                            .toggleable(
+                                                value = rememberCloseChoice,
+                                                role = Role.Checkbox,
+                                                onValueChange = { rememberCloseChoice = it },
+                                            ),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        Checkbox(checked = rememberCloseChoice, onCheckedChange = null)
+                                        Spacer(Modifier.width(8.dp))
+                                        Text("记住我的选择，不再询问", style = MaterialTheme.typography.bodyMedium)
+                                    }
+                                }
+                            },
+                            confirmButton = {
+                                PikoDialogConfirm(
+                                    label = "最小化到托盘",
+                                    onClick = {
+                                        askCloseBehavior = false
+                                        if (rememberCloseChoice) {
+                                            settings.set(CLOSE_BEHAVIOR_ASKED_KEY, "true")
+                                            platform.closeToTray?.set(true)
+                                        }
+                                        hideToTray(true)
+                                    },
+                                )
+                            },
+                            dismissButton = {
+                                TextButton(
+                                    onClick = {
+                                        askCloseBehavior = false
+                                        if (rememberCloseChoice) {
+                                            settings.set(CLOSE_BEHAVIOR_ASKED_KEY, "true")
+                                            platform.closeToTray?.set(false)
+                                        }
+                                        exitApplication()
+                                    },
+                                ) {
+                                    Text("直接退出")
+                                }
+                            },
+                        )
                     }
                     // 两个对话框不叠在一起：先说数据去了哪里，关掉之后才问关联
                     val fallback = portableFallback

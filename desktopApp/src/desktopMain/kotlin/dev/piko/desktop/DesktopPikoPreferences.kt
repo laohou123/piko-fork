@@ -31,6 +31,7 @@ class DesktopPikoPreferences(
 
     private val spoiler = MutableStateFlow(settings.get(KEY_SPOILER, "true").toBoolean())
     private val autoCheckUpdates = MutableStateFlow(settings.get(KEY_AUTO_CHECK_UPDATES, "true").toBoolean())
+    private val autoDetectClipboardLinks = MutableStateFlow(settings.get("ui.autoDetectClipboardLinks") == "true")
     private val reduceMotion = MutableStateFlow(settings.get(KEY_REDUCE_MOTION) == "true")
     /** 详情页顶部自动播放预览片，默认开。 */
     private val posterAutoPreview = MutableStateFlow(settings.get(KEY_POSTER_AUTO_PREVIEW, "true").toBoolean())
@@ -110,7 +111,7 @@ class DesktopPikoPreferences(
     override suspend fun getLastFolder(): Triple<String, String, String> =
         Triple(
             settings.get(KEY_LAST_FOLDER_ID),
-            settings.get(KEY_LAST_FOLDER_NAME, "网盘"),
+            settings.get(KEY_LAST_FOLDER_NAME, "我的网盘"),
             settings.get(KEY_LAST_FOLDER_STACK),
         )
 
@@ -124,6 +125,12 @@ class DesktopPikoPreferences(
     override suspend fun setAutoCheckUpdates(enabled: Boolean) {
         settings.set(KEY_AUTO_CHECK_UPDATES, enabled.toString())
         autoCheckUpdates.value = enabled
+    }
+
+    override val autoDetectClipboardLinksFlow: Flow<Boolean> = autoDetectClipboardLinks.asStateFlow()
+    override suspend fun setAutoDetectClipboardLinks(enabled: Boolean) {
+        settings.set("ui.autoDetectClipboardLinks", enabled.toString())
+        autoDetectClipboardLinks.value = enabled
     }
 
     override val reduceMotionFlow: Flow<Boolean> = reduceMotion.asStateFlow()

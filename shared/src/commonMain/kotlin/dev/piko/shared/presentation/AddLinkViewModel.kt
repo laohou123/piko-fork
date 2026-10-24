@@ -14,6 +14,8 @@ class AddLinkViewModel private constructor(
     constructor(session: InstantSession) : this(session, null)
     constructor(draft: InstantDraft) : this(null, draft)
     private var collapsedGeneration by mutableStateOf<Long?>(null)
+    var ownerTabId by mutableStateOf<Long?>(null)
+        private set
     private var rejectedAction by mutableStateOf<ActionAvailability.Blocked?>(null)
     val blockedAction: ActionAvailability.Blocked? get() = rejectedAction.takeIf { state != null }
 
@@ -22,21 +24,26 @@ class AddLinkViewModel private constructor(
     val isExpanded: Boolean get() = state != null && generation != collapsedGeneration
     val hasCollapsedWork: Boolean get() = state?.isBlank == false && !isExpanded
     val discardNeedsConfirm: Boolean get() = draft?.endNeedsConfirm ?: (session?.endNeedsConfirm == true)
+    val tabCloseNeedsConfirm: Boolean get() = draft?.hasUncommittedWork ?: (session?.hasUncommittedWork == true)
     val replacementAvailability: ActionAvailability
         get() = if (draft == null && (state?.isSaving == true || state?.batch?.isSaving == true)) {
             ActionAvailability.Blocked("文件正在保存，完成后才能放弃或换一条链接。可以先收起添加链接。")
         } else ActionAvailability.Available
 
-    fun open(initialLink: String = "") {
+    fun open(initialLink: String = "", tabId: Long? = ownerTabId) {
         if (!allowReplacement()) return
+        ownerTabId = tabId
         if (draft != null) {
             if (!draft.isClosed && initialLink.isNotBlank() && draft.state.isBlank) draft.state.updateInput(initialLink)
         } else session?.start(initialLink)
         collapsedGeneration = null
     }
 
-    fun resume() {
-        if (state == null) open() else collapsedGeneration = null
+    fun resume(tabId: Long? = ownerTabId) {
+        if (state == null) open(tabId = tabId) else {
+            if (ownerTabId == null && tabId != null) ownerTabId = tabId
+            collapsedGeneration = null
+        }
     }
 
     fun collapse() {
@@ -46,8 +53,13 @@ class AddLinkViewModel private constructor(
 
     fun discard() {
         if (!allowReplacement()) return
+        forceDiscard()
+    }
+
+    fun forceDiscard() {
         if (draft != null) draft.close() else session?.end()
         collapsedGeneration = null
+        ownerTabId = null
     }
 
     fun dismissBlockedAction() {

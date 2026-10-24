@@ -39,13 +39,16 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import coil3.compose.AsyncImage
+import coil3.compose.AsyncImagePainter
 import coil3.compose.LocalPlatformContext
 import coil3.request.ImageRequest
 import coil3.size.Precision
+import kotlinx.coroutines.CancellationException
 import dev.piko.data.repository.FileCategory
 import dev.piko.data.repository.fileCategory
 import dev.piko.data.repository.isPlayableVideo
 import dev.piko.data.repository.isPreviewableImage
+import dev.piko.shared.data.isImportPreview
 import dev.piko.shared.data.isVaulted
 import dev.piko.shared.upload.isUploading
 import dev.piko.ui.platform.LocalPikoPlatform
@@ -89,6 +92,7 @@ fun FileStat.displayTitle(): String =
 /** 副标题的各段：文件为类型、大小、日期，文件夹为「文件夹」、日期。由 [MetaRow] 排成一行。 */
 fun FileStat.metaParts(includeDate: Boolean = true): List<String> = buildList {
     if (isUploading) add("上传中")
+    if (isImportPreview) add("待保存")
     // 网盘里没有它的文件，打开时才临时造出来；与「上传中」同处，一眼能分出哪些不占空间
     if (isVaulted) add("已归档")
     if (isFolder) {
@@ -315,7 +319,7 @@ fun SpoilerThumbnail(
                 val image = state.result.image
                 if (image.width > 0 && image.height > 0) onAspectRatio?.invoke(image.width.toFloat() / image.height)
             },
-            onError = { onError?.invoke() },
+            onError = { state -> if (!state.isCancellation()) onError?.invoke() },
         )
         return
     }
@@ -375,6 +379,9 @@ private fun BlurredThumbnail(model: Any, blur: SpoilerBlur, modifier: Modifier, 
             val image = state.result.image
             if (image.width > 0 && image.height > 0) onAspectRatio?.invoke(image.width.toFloat() / image.height)
         },
-        onError = { onError?.invoke() },
+        onError = { state -> if (!state.isCancellation()) onError?.invoke() },
     )
 }
+
+private fun AsyncImagePainter.State.Error.isCancellation(): Boolean =
+    result.throwable is CancellationException || result.throwable.cause is CancellationException

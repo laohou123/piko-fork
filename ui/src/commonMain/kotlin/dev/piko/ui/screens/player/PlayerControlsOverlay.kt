@@ -67,6 +67,27 @@ import androidx.compose.ui.unit.toSize
 import dev.piko.shared.media.player.MediaTrack
 import dev.piko.shared.media.player.PlayerAspectRatio
 import dev.piko.shared.media.player.PlaylistEntry
+import dev.piko.shared.media.player.VideoCropRegion
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.width
+import androidx.compose.material3.Button
+import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.BlendMode
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.unit.IntSize
 import dev.piko.ui.components.LocalPointerSource
 import dev.piko.ui.components.SheetAction
 import androidx.compose.material.icons.outlined.Subtitles
@@ -116,6 +137,8 @@ fun MobilePlayerControls(
     bufferedPositionMillis: Long,
     playbackSpeed: Float?,
     aspectRatio: PlayerAspectRatio?,
+    cropRegion: VideoCropRegion? = null,
+    videoAspect: Float? = null,
     qualityOptions: List<String>,
     currentQuality: String?,
     errorMessage: String?,
@@ -124,6 +147,7 @@ fun MobilePlayerControls(
     onSeek: (Long) -> Unit,
     onSpeedChange: (Float) -> Unit,
     onAspectRatioChange: (PlayerAspectRatio) -> Unit,
+    onCropRegionChange: (VideoCropRegion?) -> Unit = {},
     onQualityChange: (String) -> Unit,
     onRetry: () -> Unit,
     onRestartFromBeginning: () -> Unit,
@@ -196,6 +220,8 @@ fun MobilePlayerControls(
     var isScrubbing by remember { mutableStateOf(false) }
     var isDraggingVolume by remember { mutableStateOf(false) }
     var openSheet by remember { mutableStateOf<PlayerSheet?>(null) }
+    var isEditingCropRegion by remember { mutableStateOf(false) }
+    var aspectBeforeEdit by remember { mutableStateOf<PlayerAspectRatio?>(null) }
     var isSpeedPopupOpen by remember { mutableStateOf(false) }
     var mouseMoveCount by remember { mutableIntStateOf(0) }
     var isMouseIdle by remember { mutableStateOf(false) }
@@ -419,19 +445,29 @@ fun MobilePlayerControls(
     // 键位照主流桌面播放器（YouTube、mpv、PotPlayer 的公约数），加了要同时写进 ShortcutsDialog 的「播放器」一节。
     // 带 Ctrl、Alt、⌘ 的一律放过，留给窗口与系统
     fun handleKey(event: KeyEvent): Boolean {
+        if (isEditingCropRegion) {
+            if (event.type == KeyEventType.KeyDown && event.key == Key.Escape) {
+                isEditingCropRegion = false
+                aspectBeforeEdit?.let(onAspectRatioChange)
+                return true
+            }
+            return false
+        }
         if (event.type == KeyEventType.KeyUp) return arrowUp(event.key)
         if (event.type != KeyEventType.KeyDown) return false
         if (event.isCtrlPressed || event.isAltPressed || event.isMetaPressed) return false
         val shift = event.isShiftPressed
         when (event.key) {
-            Key.Spacebar, Key.K -> onPlayPause()
+            Key.Spacebar, Key.K, Key.MediaPlayPause -> onPlayPause()
+            Key.MediaPlay -> if (!isPlaying) onPlayPause() else return true
+            Key.MediaPause, Key.MediaStop -> if (isPlaying) onPlayPause() else return true
             Key.DirectionLeft, Key.DirectionRight -> {
                 val forward = event.key == Key.DirectionRight
                 // Shift 的大步不接按住，按下即进退
                 if (shift) stepSeek(forward, LONG_SEEK_STEP_MILLIS) else arrowDown(event.key)
             }
-            Key.J -> stepSeek(forward = false)
-            Key.L -> stepSeek(forward = true)
+            Key.J, Key.MediaRewind -> stepSeek(forward = false)
+            Key.L, Key.MediaFastForward -> stepSeek(forward = true)
             Key.DirectionUp -> stepVolume(VOLUME_KEY_STEP)
             Key.DirectionDown -> stepVolume(-VOLUME_KEY_STEP)
             Key.M -> toggleMute()
@@ -441,8 +477,8 @@ fun MobilePlayerControls(
             Key.RightBracket -> stepSpeed(faster = true)
             Key.Backspace -> onSpeedChange(1f)
             Key.C -> return toggleSubtitles()
-            Key.PageUp -> if (hasPrevious) onPrevious() else return false
-            Key.PageDown -> if (hasNext) onNext() else return false
+            Key.PageUp, Key.MediaPrevious -> if (hasPrevious) onPrevious() else return false
+            Key.PageDown, Key.MediaNext -> if (hasNext) onNext() else return false
             Key.MoveHome -> onSeek(0L)
             else -> {
                 // 数字键跳到全片的几成处，0 是开头
@@ -470,7 +506,7 @@ fun MobilePlayerControls(
     val isHoveringControls by controlsHover.collectIsHoveredAsState()
     // 倍速浮层挂在底栏上，底栏一收起它就跟着消失，开着时同样不收
     val holdControls = !isPlaying || isScrubbing || isDraggingVolume || openSheet != null || isSpeedPopupOpen || errorMessage != null ||
-        isHoveringControls
+        isHoveringControls || isEditingCropRegion
     val currentHoldControls by rememberUpdatedState(holdControls)
     // 鼠标与手指对点按的解释不同，见 [PointerSource]。鼠标沿用桌面播放器的通行约定：单击播放或暂停，
     // 双击全屏，控件由移动光标唤出；手指单击切换控件，双击按落点进退或暂停
@@ -488,7 +524,22 @@ fun MobilePlayerControls(
     }
     // 出错时控件栏必须可见：返回键在顶栏里
     LaunchedEffect(errorMessage) {
-        if (errorMessage != null) controlsVisible = true
+        if (errorMessage != null) {
+            controlsVisible = true
+            isEditingCropRegion = false
+        }
+    }
+    LaunchedEffect(currentFileId) {
+        isEditingCropRegion = false
+    }
+    var viewportSize by remember { mutableStateOf(IntSize.Zero) }
+    LaunchedEffect(viewportSize, aspectRatio, cropRegion) {
+        if (aspectRatio == PlayerAspectRatio.RegionCrop && cropRegion != null && viewportSize.width > 0 && viewportSize.height > 0) {
+            val currentAspect = viewportSize.width.toFloat() / viewportSize.height.toFloat()
+            if (abs(cropRegion.containerAspect - currentAspect) > 0.001f) {
+                onCropRegionChange(cropRegion.copy(containerAspect = currentAspect))
+            }
+        }
     }
 
     LaunchedEffect(showResumeTip) {
@@ -593,16 +644,20 @@ fun MobilePlayerControls(
     // 不停在目标处的话手柄先跳回原处再过去
     val seekPreviewMillis = (activeGesture as? PlayerGesture.Seek)?.targetMillis(durationMillis) ?: settledSeekMillis
 
-    val chromeVisible = controlsVisible && !isLocked
-    val bottomBarVisible = chromeVisible || seekPreviewMillis != null
-    val centerVisible = ((chromeVisible && !isBoosting) || isLoading || centerIndicator != null) && errorMessage == null
+    val chromeVisible = controlsVisible && !isLocked && !isEditingCropRegion
+    val bottomBarVisible = (chromeVisible || seekPreviewMillis != null) && !isEditingCropRegion
+    val centerVisible = ((chromeVisible && !isBoosting) || isLoading || centerIndicator != null) && errorMessage == null && !isEditingCropRegion
     // 面板的 BackHandler 在它之后组合，面板开着时先关面板
-    BackHandler(enabled = isFullscreen, onBack = onToggleFullscreen)
+    BackHandler(enabled = isFullscreen && !isEditingCropRegion, onBack = onToggleFullscreen)
+    BackHandler(enabled = isEditingCropRegion) {
+        isEditingCropRegion = false
+        aspectBeforeEdit?.let(onAspectRatioChange)
+    }
 
     // 焦点在点过的按钮上时，按钮随控件栏收起或面板关闭，焦点也跟着没了，之后的按键无处可去。
-    // 每逢这两种变化把焦点收回根节点
-    LaunchedEffect(chromeVisible, openSheet) {
-        runCatching { focusRequester.requestFocus() }
+    // 每逢这两种变化把焦点收回根节点（仅非触屏模式：触屏模式下 requestFocus 会吃掉 Android 的第一次返回键，见 Issue #30）
+    LaunchedEffect(chromeVisible, openSheet, isEditingCropRegion, pointerSource.isTouchLike) {
+        if (!pointerSource.isTouchLike) runCatching { focusRequester.requestFocus() }
     }
     val hasPlaylist = playlist.size > 1
     // 文件本身没有字幕时也要给入口：正是这种时候才要自己挑一个
@@ -627,11 +682,12 @@ fun MobilePlayerControls(
         Box(
             modifier = modifier
                 .fillMaxSize()
+                .onSizeChanged { viewportSize = it }
                 // 在根节点先行拦截：焦点落在某个按钮上时，空格不该变成「点一下那个按钮」
                 .onPreviewKeyEvent(::handleKey)
                 // 只接焦点不进无障碍树：focusable 会让读屏在整个画面上多停一站
                 .focusRequester(focusRequester)
-                .focusTarget()
+                .then(if (!pointerSource.isTouchLike) Modifier.focusTarget() else Modifier)
                 // Initial 阶段只观察不消费，停在按钮与面板上的移动也算。只认没按键、位置真变了的
                 // 鼠标移动：触屏的移动都是拖动，不该顺带唤出控件；指针不动而底下的布局变了时，
                 // 桌面端可能补发原地的移动，不滤掉的话控件收起后会被它重新唤出
@@ -666,7 +722,7 @@ fun MobilePlayerControls(
                 .then(if (hideCursor) Modifier.pointerHoverIcon(idleCursor) else Modifier),
         ) {
             PlayerGestureLayer(
-                isLocked = isLocked,
+                isLocked = isLocked || isEditingCropRegion,
                 durationMillis = durationMillis,
                 positionProvider = { currentPosition },
                 brightness = brightness,
@@ -701,8 +757,8 @@ fun MobilePlayerControls(
                 onSpeedBoost = { active -> if (active) startBoost() else endBoost() },
                 // 滚轮调音量，与上下方向键同一步长。挂在手势层而不是根节点：面板里的列表滚到头后
                 // 剩下的滚轮位移会冒泡到根节点，那时不该变成调音量
-                modifier = Modifier.pointerInput(isLocked) {
-                    if (isLocked) return@pointerInput
+                modifier = Modifier.pointerInput(isLocked, isEditingCropRegion) {
+                    if (isLocked || isEditingCropRegion) return@pointerInput
                     awaitPointerEventScope {
                         while (true) {
                             val event = awaitPointerEvent()
@@ -732,8 +788,15 @@ fun MobilePlayerControls(
                 }
                 // 竖屏放横屏片子时画面只占中间一条，下面整片黑边闲着，这里再给一个全屏入口
                 FullscreenPromptButton(
-                    visible = !isLocked && !isLandscape && isLandscapeVideo == true && errorMessage == null,
+                    visible = !isLocked && !isLandscape && isLandscapeVideo == true && errorMessage == null && !isEditingCropRegion,
                     onClick = onToggleFullscreen,
+                )
+                RestoreCropPromptButton(
+                    visible = chromeVisible && aspectRatio == PlayerAspectRatio.RegionCrop && errorMessage == null,
+                    onClick = {
+                        interacted()
+                        onCropRegionChange(null)
+                    },
                 )
             }
 
@@ -749,6 +812,14 @@ fun MobilePlayerControls(
                         episodeLabel = episodeLabel,
                         isLocalPlayback = isLocalPlayback,
                         onBackClick = onBack,
+                        onTracksClick = {
+                            interacted()
+                            openSheet = PlayerSheet.Tracks
+                        }.takeIf { hasTracksEntry },
+                        onStatsClick = {
+                            interacted()
+                            openSheet = PlayerSheet.Stats
+                        }.takeIf { playbackStats != null },
                         onSettingsClick = {
                             interacted()
                             openSheet = PlayerSheet.Settings
@@ -853,7 +924,7 @@ fun MobilePlayerControls(
             }
 
             PlayerHud(
-                indicator = hudIndicator,
+                indicator = if (isEditingCropRegion) null else hudIndicator,
                 modifier = Modifier
                     .align(Alignment.TopCenter)
                     .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top))
@@ -881,7 +952,7 @@ fun MobilePlayerControls(
 
             // 锁定键跟随控件栏显隐；锁定后单击只唤出它自己
             AnimatedVisibility(
-                visible = controlsVisible && errorMessage == null,
+                visible = controlsVisible && errorMessage == null && !isEditingCropRegion,
                 enter = fadeIn(motion.defaultEffectsSpec()),
                 exit = fadeOut(motion.fastEffectsSpec()),
                 modifier = Modifier
@@ -894,6 +965,25 @@ fun MobilePlayerControls(
                     onToggle = {
                         isLocked = !isLocked
                         interacted()
+                    },
+                )
+            }
+
+            if (isEditingCropRegion) {
+                CropRegionEditorOverlay(
+                    initialRegion = cropRegion ?: VideoCropRegion(),
+                    videoAspect = videoAspect,
+                    onCancel = {
+                        isEditingCropRegion = false
+                        aspectBeforeEdit?.let(onAspectRatioChange)
+                    },
+                    onReset = {
+                        isEditingCropRegion = false
+                        onCropRegionChange(null)
+                    },
+                    onConfirm = { region ->
+                        isEditingCropRegion = false
+                        onCropRegionChange(region)
                     },
                 )
             }
@@ -924,14 +1014,7 @@ fun MobilePlayerControls(
                     )
                     PlayerSheet.Settings -> PlayerSettingsPanel(
                         title = title,
-                        // 音轨与字幕换到它自己的面板；分享、下载这类先收起面板再做，免得面板挡着随后弹出的东西
-                        actions = listOfNotNull(
-                            // 与分享、下载排在一排，一律两个字：竖屏的手机上一格只有 60dp 上下，四个字就被截断
-                            SheetAction(Icons.Outlined.Subtitles, "音轨与字幕", { openSheet = PlayerSheet.Tracks }, shortLabel = "字幕")
-                                .takeIf { hasTracksEntry },
-                            SheetAction(Icons.Outlined.Info, "详细信息", { openSheet = PlayerSheet.Stats }, shortLabel = "信息")
-                                .takeIf { playbackStats != null },
-                        ),
+                        actions = emptyList(),
                         fileActions = fileActions.map { action ->
                             SheetAction(action.icon, action.label, {
                                 openSheet = null
@@ -947,7 +1030,16 @@ fun MobilePlayerControls(
                             onQualityChange(it)
                         },
                         aspectRatio = aspectRatio,
-                        onAspectRatioChange = onAspectRatioChange,
+                        onAspectRatioChange = { mode ->
+                            if (mode == PlayerAspectRatio.RegionCrop) {
+                                aspectBeforeEdit = aspectRatio ?: PlayerAspectRatio.Fit
+                                openSheet = null
+                                onAspectRatioChange(PlayerAspectRatio.Fit)
+                                isEditingCropRegion = true
+                            } else {
+                                onAspectRatioChange(mode)
+                            }
+                        },
                         seekStepSeconds = seekStepSeconds,
                         onSeekStepChange = onSeekStepChange,
                         longPressSpeed = longPressSpeed,
@@ -1029,3 +1121,214 @@ private val DigitKeys = listOf(
 )
 private const val SUBTITLE_LABEL_MAX_LENGTH = 16
 private val PLAIN_EPISODE = Regex("""[0-9]+(\.[0-9]+)?""")
+
+private enum class CropDragHandle {
+    TopLeft, TopRight, BottomLeft, BottomRight, Inside
+}
+
+/**
+ * 画面框选填充编辑器：在适应屏幕的完整画面上叠加可拖动四角、四边或内部的矩形选框，确定后将该区域放大铺满窗口。
+ */
+@Composable
+private fun CropRegionEditorOverlay(
+    initialRegion: VideoCropRegion,
+    videoAspect: Float?,
+    onCancel: () -> Unit,
+    onReset: () -> Unit,
+    onConfirm: (VideoCropRegion) -> Unit,
+) {
+    var region by remember(initialRegion) { mutableStateOf(initialRegion) }
+    var containerSize by remember { mutableStateOf(IntSize.Zero) }
+    var isDraggingBox by remember { mutableStateOf(false) }
+    val density = LocalDensity.current
+    val hitRadiusPx = with(density) { 44.dp.toPx() }
+    val cornerRadiusPx = with(density) { 6.dp.toPx() }
+    val strokePx = with(density) { 2.5.dp.toPx() }
+
+    // 计算适应屏幕（Fit）下视频画面在容器内的真实像素矩形
+    fun videoBounds(size: IntSize): Rect {
+        if (size.width <= 0 || size.height <= 0) return Rect.Zero
+        val w = size.width.toFloat()
+        val h = size.height.toFloat()
+        val aspect = videoAspect?.takeIf { it > 0f } ?: (w / h)
+        val containerAspect = w / h
+        return if (containerAspect > aspect) {
+            val vw = h * aspect
+            val left = (w - vw) * 0.5f
+            Rect(left, 0f, left + vw, h)
+        } else {
+            val vh = w / aspect
+            val top = (h - vh) * 0.5f
+            Rect(0f, top, w, top + vh)
+        }
+    }
+
+    val primaryColor = MaterialTheme.colorScheme.primary
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .onSizeChanged { containerSize = it }
+            .pointerInput(videoAspect, initialRegion) {
+                var activeHandle: CropDragHandle? = null
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    val bounds = videoBounds(size)
+                    if (bounds.width <= 0f || bounds.height <= 0f) return@awaitEachGesture
+                    val leftPx = bounds.left + region.left * bounds.width
+                    val topPx = bounds.top + region.top * bounds.height
+                    val rightPx = bounds.left + region.right * bounds.width
+                    val bottomPx = bounds.top + region.bottom * bounds.height
+                    val offset = down.position
+                    fun distSq(x: Float, y: Float) = (offset.x - x) * (offset.x - x) + (offset.y - y) * (offset.y - y)
+                    val rSq = hitRadiusPx * hitRadiusPx
+                    val corners = listOf(
+                        CropDragHandle.TopLeft to distSq(leftPx, topPx),
+                        CropDragHandle.TopRight to distSq(rightPx, topPx),
+                        CropDragHandle.BottomLeft to distSq(leftPx, bottomPx),
+                        CropDragHandle.BottomRight to distSq(rightPx, bottomPx),
+                    )
+                    val closestCorner = corners.minByOrNull { it.second }?.takeIf { it.second <= rSq }?.first
+                    activeHandle = closestCorner ?: if (offset.x in (leftPx - hitRadiusPx)..(rightPx + hitRadiusPx) &&
+                        offset.y in (topPx - hitRadiusPx)..(bottomPx + hitRadiusPx)
+                    ) {
+                        CropDragHandle.Inside
+                    } else null
+                    if (activeHandle == null) return@awaitEachGesture
+                    down.consume()
+                    var prevPos = down.position
+                    try {
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                            if (!change.pressed) {
+                                change.consume()
+                                break
+                            }
+                            val delta = change.position - prevPos
+                            prevPos = change.position
+                            if (delta != Offset.Zero) {
+                                isDraggingBox = true
+                                change.consume()
+                                val currentBounds = videoBounds(size)
+                                if (currentBounds.width > 0f && currentBounds.height > 0f) {
+                                    val dx = delta.x / currentBounds.width
+                                    val dy = delta.y / currentBounds.height
+                                    val minSpan = 0.12f
+                                    region = when (requireNotNull(activeHandle)) {
+                                        CropDragHandle.TopLeft -> region.copy(
+                                            left = (region.left + dx).coerceIn(0f, region.right - minSpan),
+                                            top = (region.top + dy).coerceIn(0f, region.bottom - minSpan),
+                                        )
+                                        CropDragHandle.TopRight -> region.copy(
+                                            right = (region.right + dx).coerceIn(region.left + minSpan, 1f),
+                                            top = (region.top + dy).coerceIn(0f, region.bottom - minSpan),
+                                        )
+                                        CropDragHandle.BottomLeft -> region.copy(
+                                            left = (region.left + dx).coerceIn(0f, region.right - minSpan),
+                                            bottom = (region.bottom + dy).coerceIn(region.top + minSpan, 1f),
+                                        )
+                                        CropDragHandle.BottomRight -> region.copy(
+                                            right = (region.right + dx).coerceIn(region.left + minSpan, 1f),
+                                            bottom = (region.bottom + dy).coerceIn(region.top + minSpan, 1f),
+                                        )
+                                        CropDragHandle.Inside -> {
+                                            val w = region.width
+                                            val h = region.height
+                                            val newLeft = (region.left + dx).coerceIn(0f, 1f - w)
+                                            val newTop = (region.top + dy).coerceIn(0f, 1f - h)
+                                            region.copy(left = newLeft, top = newTop, right = newLeft + w, bottom = newTop + h)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } finally {
+                        activeHandle = null
+                        isDraggingBox = false
+                    }
+                }
+            },
+    ) {
+        Canvas(
+            modifier = Modifier
+                .fillMaxSize()
+                .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen },
+        ) {
+            val bounds = videoBounds(IntSize(size.width.toInt(), size.height.toInt()))
+            drawRect(Color.Black.copy(alpha = 0.58f))
+            if (bounds.width > 0f && bounds.height > 0f) {
+                val leftPx = bounds.left + region.left * bounds.width
+                val topPx = bounds.top + region.top * bounds.height
+                val wPx = (region.right - region.left) * bounds.width
+                val hPx = (region.bottom - region.top) * bounds.height
+                drawRoundRect(
+                    color = Color.Transparent,
+                    topLeft = Offset(leftPx, topPx),
+                    size = Size(wPx, hPx),
+                    cornerRadius = CornerRadius(cornerRadiusPx, cornerRadiusPx),
+                    blendMode = BlendMode.Clear,
+                )
+                drawRoundRect(
+                    color = Color.White,
+                    topLeft = Offset(leftPx, topPx),
+                    size = Size(wPx, hPx),
+                    cornerRadius = CornerRadius(cornerRadiusPx, cornerRadiusPx),
+                    style = Stroke(width = strokePx),
+                )
+                val handleRadius = strokePx * 3.2f
+                listOf(
+                    Offset(leftPx, topPx),
+                    Offset(leftPx + wPx, topPx),
+                    Offset(leftPx, topPx + hPx),
+                    Offset(leftPx + wPx, topPx + hPx),
+                ).forEach { corner ->
+                    drawCircle(color = primaryColor, radius = handleRadius, center = corner)
+                    drawCircle(color = Color.White, radius = handleRadius, center = corner, style = Stroke(width = strokePx * 0.8f))
+                }
+            }
+        }
+
+        if (!isDraggingBox) {
+            Surface(
+                shape = MaterialTheme.shapes.large,
+                color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.92f),
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top))
+                    .padding(horizontal = 16.dp, vertical = 20.dp),
+            ) {
+                Text(
+                    text = "拖动选框四角或内部选择要铺满画面的区域",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                )
+            }
+
+            Surface(
+                shape = MaterialTheme.shapes.large,
+                color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.92f),
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Bottom))
+                    .padding(horizontal = 16.dp)
+                    .padding(bottom = 28.dp),
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    FilledTonalButton(onClick = onReset) { Text("还原适应") }
+                    FilledTonalButton(onClick = onCancel) { Text("取消") }
+                    Button(onClick = {
+                        val containerAspect = if (containerSize.width > 0 && containerSize.height > 0) {
+                            containerSize.width.toFloat() / containerSize.height.toFloat()
+                        } else 0f
+                        onConfirm(region.copy(containerAspect = containerAspect))
+                    }) { Text("铺满画面") }
+                }
+            }
+        }
+    }
+}

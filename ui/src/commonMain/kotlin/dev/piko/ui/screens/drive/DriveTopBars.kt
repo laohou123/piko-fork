@@ -32,11 +32,16 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.SwipeVertical
 import androidx.compose.material.icons.outlined.ArrowDropDown
+import androidx.compose.material.icons.outlined.Check
+import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material.icons.outlined.SwipeVertical
+import androidx.compose.material3.ButtonGroupDefaults
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.TonalToggleButton
+import dev.piko.ui.components.connectedToggleShapes
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -314,6 +319,111 @@ internal fun FeedToggle(
         )
         Spacer(Modifier.width(6.dp))
         Text("信息流")
+    }
+}
+
+/**
+ * 窄窗口命令栏右端的连体探索组：左段瀑布流（开启时点开菜单可调尺寸或退出瀑布流），右段信息流（随机片段）。
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+internal fun ExploreToggleGroup(
+    galleryShown: Boolean,
+    onGalleryShownChange: ((Boolean) -> Unit)?,
+    feedShown: Boolean,
+    onFeedShownChange: ((Boolean) -> Unit)?,
+    tileSize: TileSize? = null,
+    onTileSizeChange: ((TileSize) -> Unit)? = null,
+) {
+    val count = (if (onGalleryShownChange != null) 1 else 0) + (if (onFeedShownChange != null) 1 else 0)
+    if (count == 0) return
+    var index = 0
+    Row(
+        modifier = Modifier.padding(end = 4.dp),
+        horizontalArrangement = Arrangement.spacedBy(ButtonGroupDefaults.ConnectedSpaceBetween),
+    ) {
+        if (onGalleryShownChange != null) {
+            var sizeMenuOpen by remember { mutableStateOf(false) }
+            val currentIndex = index++
+            Box {
+                TonalToggleButton(
+                    checked = galleryShown,
+                    onCheckedChange = {
+                        if (galleryShown && tileSize != null && onTileSizeChange != null) {
+                            sizeMenuOpen = true
+                        } else {
+                            onGalleryShownChange(!galleryShown)
+                        }
+                    },
+                    shapes = connectedToggleShapes(currentIndex, count),
+                    contentPadding = PaddingValues(
+                        start = 12.dp,
+                        end = if (galleryShown && tileSize != null && onTileSizeChange != null) 8.dp else if (count == 1) 16.dp else 12.dp,
+                    ),
+                    modifier = Modifier.heightIn(min = 40.dp),
+                ) {
+                    Icon(
+                        imageVector = if (galleryShown) Icons.Filled.PhotoLibrary else Icons.Outlined.PhotoLibrary,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp),
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Text("瀑布流")
+                    if (galleryShown && tileSize != null && onTileSizeChange != null) {
+                        Spacer(Modifier.width(2.dp))
+                        Icon(Icons.Outlined.ArrowDropDown, contentDescription = null, modifier = Modifier.size(18.dp))
+                    }
+                }
+                if (tileSize != null && onTileSizeChange != null) {
+                    PikoDropdownMenu(expanded = sizeMenuOpen, onDismissRequest = { sizeMenuOpen = false }) {
+                        val sizes = TileSize.entries
+                        val totalItems = sizes.size + 1
+                        sizes.forEachIndexed { sizeIndex, size ->
+                            val current = tileSize == size
+                            DropdownMenuItem(
+                                text = { Text("${size.label}尺寸", color = if (current) MaterialTheme.colorScheme.primary else androidx.compose.ui.graphics.Color.Unspecified) },
+                                trailingIcon = if (current) ({
+                                    Icon(Icons.Outlined.Check, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
+                                }) else null,
+                                shape = menuItemShape(sizeIndex, totalItems),
+                                onClick = {
+                                    sizeMenuOpen = false
+                                    onTileSizeChange(size)
+                                },
+                            )
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        DropdownMenuItem(
+                            text = { Text("关闭瀑布流") },
+                            leadingIcon = { Icon(Icons.Outlined.Close, contentDescription = null, modifier = Modifier.size(18.dp)) },
+                            shape = menuItemShape(sizes.size, totalItems),
+                            onClick = {
+                                sizeMenuOpen = false
+                                onGalleryShownChange(false)
+                            },
+                        )
+                    }
+                }
+            }
+        }
+        if (onFeedShownChange != null) {
+            val currentIndex = index
+            TonalToggleButton(
+                checked = feedShown,
+                onCheckedChange = onFeedShownChange,
+                shapes = connectedToggleShapes(currentIndex, count),
+                contentPadding = PaddingValues(start = 12.dp, end = 16.dp),
+                modifier = Modifier.heightIn(min = 40.dp),
+            ) {
+                Icon(
+                    imageVector = if (feedShown) Icons.Filled.SwipeVertical else Icons.Outlined.SwipeVertical,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp),
+                )
+                Spacer(Modifier.width(6.dp))
+                Text("信息流")
+            }
+        }
     }
 }
 

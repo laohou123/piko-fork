@@ -17,10 +17,10 @@ import kotlin.test.assertTrue
 class FileActionsRowTest {
     private val file = FileStat(kind = FileKind.FILE, id = "f", name = "a.txt", fileExtension = ".txt")
 
-    private fun handlers(desktop: Boolean) = FileActionHandlers(
+    private fun handlers(desktop: Boolean, unvault: (() -> Unit)? = null) = FileActionHandlers(
         toggleStar = {}, download = {}, downloadAtQuality = {}, share = {}, rename = {}, move = {}, copy = {}, trash = {}, extract = {},
         findDuplicates = {}, canonicalNameFolder = null, downloadSegment = {}, prepareQualities = {}, copySource = {}, openSource = {},
-        openInExternalPlayer = null, openInNewTab = null, togglePin = null, isPinned = false, vault = {}, unvault = null,
+        openInExternalPlayer = null, openInNewTab = null, togglePin = null, isPinned = false, vault = {}, unvault = unvault,
         previewHidden = null, togglePreview = {},
         putOnClipboard = if (desktop) ({ _ -> }) else null,
     )
@@ -38,17 +38,31 @@ class FileActionsRowTest {
     }
 
     @Test
-    fun `the desktop menu row follows the windows 11 context menu and lists the star`() {
-        val layout = layoutActions(actions(desktop = true), quickLimit = MenuQuickLimit)
-        assertEquals(listOf("剪切", "复制", "重命名", "分享", "下载到本地"), layout.quick.map { it.label })
-        val organize = layout.sections.single { section -> section.all { it.group == ActionGroup.Organize } }
-        assertEquals("添加星标", organize.first().label)
+    fun `fully vaulted folders retain only unvault while partial folders retain both`() {
+        val folder = FileStat(kind = FileKind.FOLDER, id = "folder", name = "folder")
+        for (desktop in listOf(false, true)) {
+            val on = handlers(desktop, unvault = {})
+            val partial = fileActions(folder, itemCommands(CommandPlace.FOLDER, listOf(folder)), on).map { it.label }
+            assertTrue("归档" in partial)
+            assertTrue("取消归档" in partial)
+            val full = fileActions(folder, itemCommands(CommandPlace.FOLDER, listOf(folder), setOf(folder.id)), on).map { it.label }
+            assertTrue("归档" !in full)
+            assertTrue("取消归档" in full)
+        }
     }
 
     @Test
-    fun `the mobile panel row keeps download share star and rename`() {
+    fun `the desktop menu row highlights core actions and keeps clipboard in manage`() {
+        val layout = layoutActions(actions(desktop = true), quickLimit = MenuQuickLimit)
+        assertEquals(listOf("下载到本地", "重命名", "分享", "添加星标"), layout.quick.map { it.label })
+        val manage = layout.sections.single { section -> section.all { it.group == ActionGroup.Manage } }
+        assertTrue(manage.map { it.label }.containsAll(listOf("剪切", "复制")))
+    }
+
+    @Test
+    fun `the mobile panel row keeps download rename share and star`() {
         val layout = layoutActions(actions(desktop = false))
-        assertEquals(listOf("下载到本地", "分享", "添加星标", "重命名"), layout.quick.map { it.label })
+        assertEquals(listOf("下载到本地", "重命名", "分享", "添加星标"), layout.quick.map { it.label })
         assertTrue(layout.sections.flatten().none { it.label == "剪切" || it.label == "复制" })
     }
     @Test

@@ -93,6 +93,15 @@ class PlayerScreenState(
     val positionMillis: Long get() = backend.positionMillis
     val bufferedPositionMillis: Long get() = backend.bufferedPositionMillis
     val aspectRatio: PlayerAspectRatio? get() = backend.aspectRatio
+    val cropRegion: VideoCropRegion? get() = backend.cropRegion
+    val videoAspect: Float? by derivedStateOf {
+        backend.videoAspect ?: mediaInfo?.let { info ->
+            if (info.width > 0 && info.height > 0) {
+                if (rotationDegrees % 180 == 0) info.width.toFloat() / info.height
+                else info.height.toFloat() / info.width
+            } else null
+        }
+    }
 
     val isLoading by derivedStateOf { isPreparing || isRecovering || (!isImage && backend.isBuffering) }
 
@@ -326,6 +335,7 @@ class PlayerScreenState(
 
     fun setRotation(degrees: Int) {
         val normalized = degrees.mod(360) / 90 * 90
+        if (normalized != rotationDegrees && cropRegion != null) setCropRegion(null)
         rotationDegrees = normalized
         backend.setRotation(normalized)
     }
@@ -400,6 +410,8 @@ class PlayerScreenState(
     }
 
     fun setAspectRatio(mode: PlayerAspectRatio) = backend.setAspectRatio(mode)
+
+    fun setCropRegion(region: VideoCropRegion?) = backend.setCropRegion(region)
 
     /** 播放详细信息面板的内容：从哪里读、哪一档，再加 mpv 读得到的编码与缓冲。面板开着时每秒取一次。 */
     fun stats(): List<PlaybackStatsSection> {

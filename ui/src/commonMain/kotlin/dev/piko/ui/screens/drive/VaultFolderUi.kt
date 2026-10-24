@@ -46,13 +46,17 @@ import dev.piko.shared.state.FolderVaultSession
 import dev.piko.ui.components.InlineLoadingIndicator
 import dev.piko.ui.components.toReadableSize
 
+internal fun offersVaultSizeChoice(survey: FolderVaultSession.Survey?): Boolean {
+    val largeFiles = survey?.largeFiles?.files ?: return false
+    return largeFiles in 1 until survey.files
+}
+
 /**
  * 归档之前的确认，文件夹与单独选的文件共用。先清点：多少文件、多大，其中没有来源记录的（自己上传、秒传）单独计，
  * 默认不带上：它们没有磁力或分享链接可凭，PikPak 不再保存时就找不回来。
  *
- * 只有文件时，对这几个文件不起作用的选项不显示，也不生效：大小全在门槛同一侧时「不归档小文件」只会把它们全留下，
- * 全有来源或全无来源时「仅归档有来源记录的文件」同理。全无来源时改为直接说明，归不归档由人按确认或取消决定。
- * 文件夹的选项照旧全给：整棵树里有什么，打开前看不到。
+ * 大小全在门槛同一侧时隐藏大小选项且不应用过滤，避免仅剩小文件时被上次的偏好全部排除。
+ * 只有文件时，全有来源或全无来源也隐藏来源选项。全无来源时改为直接说明，归不归档由人按确认或取消决定。
  *
  * 丢失的风险只在这里讲清楚。考虑过给回收站里的原件打标记、清空时再提醒，否决了：官方客户端照样能清空回收站，
  * Piko 拦不住，拦一半只会让人以为有保护。
@@ -71,9 +75,20 @@ internal fun VaultDialog(
     LaunchedEffect(Unit) { options = VaultArchiveOptions.load(preferences) }
     val scope = rememberCoroutineScope()
     val chosen = options ?: VaultArchiveOptions()
+    val current = options
+    if (current != null && !current.riskNoticeAcknowledged) {
+        VaultRiskWarningDialog(
+            onAcknowledge = {
+                val next = current.copy(riskNoticeAcknowledged = true)
+                options = next
+                scope.launch { VaultArchiveOptions.save(preferences, next) }
+            },
+            onDismiss = onDismiss,
+        )
+        return
+    }
     val all = survey?.getOrNull()
-    val largeFiles = all?.largeFiles?.files
-    val offersSizeChoice = !target.filesOnly || (all != null && largeFiles != null && largeFiles in 1 until all.files)
+    val offersSizeChoice = offersVaultSizeChoice(all)
     val skipSmallFiles = offersSizeChoice && chosen.skipSmallFiles
     val counted = all?.let { if (skipSmallFiles) it.largeFiles else it }
     val offersSourceChoice = !target.filesOnly || (counted != null && counted.unsourcedFiles in 1 until counted.files)
@@ -96,23 +111,6 @@ internal fun VaultDialog(
             Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 VaultDialogHeading(target.name, survey, counted?.files, files, bytes, emptyText = "无可归档的文件")
                 blocked?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-                // 原文件放进回收站也一样醒目：清空回收站是常事，人会想「反正有归档」，清空后只剩引用
-                Surface(
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = MaterialTheme.shapes.medium,
-                    color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.15f),
-                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.25f)),
-                ) {
-                    Row(Modifier.padding(14.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Icon(Icons.Outlined.Warning, contentDescription = null, modifier = Modifier.size(20.dp), tint = MaterialTheme.colorScheme.error)
-                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                            Text("仅保存引用，文件可能无法找回", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.error)
-                            Text("归档不保存文件内容。云端不再保存对应内容时，将无法播放、下载或恢复。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurface)
-                            Text("建议用于很少使用的合集文件。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        }
-                    }
-                }
-                val current = options
                 if (current != null) {
                     // 是偏好而不是这一次的参数：一改就存，取消归档也记住，与设置页的开关相同
                     fun update(next: VaultArchiveOptions) {
@@ -264,4 +262,53 @@ private fun VaultCheckboxOption(
             }
         }
     }
+}
+
+/**
+ * 首次使用「归档」或「以引用保存」之前弹出的一次性风险提示弹窗。
+ * 相比常驻在对话框里的文字说明，首次触发时的独立警告更能让用户明确意识到引用机制的丢失风险。
+ */
+@Composable
+internal fun VaultRiskWarningDialog(
+    onAcknowledge: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    PikoDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Icon(Icons.Outlined.Warning, contentDescription = null, tint = MaterialTheme.colorScheme.error)
+                Text("归档与引用保存风险提示")
+            }
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    "归档（及「以引用保存」）不会在你的网盘中实际存储文件内容，仅保留几 KB 的内容哈希（GCID）与来源记录以释放空间。",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                Text(
+                    "后续播放、下载或恢复文件时，完全依赖 PikPak 云端仍存有相同哈希的副本以完成秒传。一旦云端清理了冷门资源或秒传失效，仅靠引用将无法找回原文件。",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.error,
+                )
+                Text(
+                    "请勿将个人独有文件、自行上传的孤本或无外部备份的重要资料转为归档引用。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        },
+        confirmButton = {
+            PikoDialogConfirm(
+                label = "我已知晓风险，继续",
+                destructive = true,
+                onClick = onAcknowledge,
+            )
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
+        },
+    )
 }

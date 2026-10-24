@@ -41,6 +41,12 @@ interface PikoPlatform {
     /** 标题栏并进内容、窗口按钮画在界面右上角（见 WindowCaption）。为 null 表示平台没有这一项，设置页不给开关。 */
     val compactTitleBar: PlatformToggle? get() = null
 
+    /** 当前设备的登录启动能力；开发启动器和不支持的平台不提供。 */
+    val launchAtStartup: LaunchAtStartup? get() = null
+
+    /** 仅在系统托盘可用时提供。 */
+    val closeToTray: PlatformToggle? get() = null
+
     /**
      * 界面字体。汉字不在其中时由系统按系统语言挑后备字体，英文系统上会逐字混用日文与中文字体，
      * 需要的平台在这里给出一款带简体中文的字体。
@@ -100,6 +106,16 @@ interface PikoPlatform {
 
     /** 为 null 表示该平台不能由应用自己登记为磁力链接与种子文件的打开方式，设置页不给入口。 */
     val linkAssociation: LinkAssociation?
+
+    /** 打开系统设置里的「默认打开」页（Android），添加支持的分享与深链域名。不支持的平台为 null。 */
+    /** 跳转系统「默认打开 -> 添加链接」设置页（Android 12+），不支持的平台为 null。 */
+    val openAppLinkSettings: (() -> Unit)? get() = null
+
+    /** 当前是否尚未在系统「默认打开」中添加 PikPak 分享与跳转域名，用于「我的」页提醒卡片。 */
+    suspend fun needsAppLinkPrompt(): Boolean = false
+
+    /** 标记用户已关闭「我的」页的深链默认打开提醒。 */
+    fun dismissAppLinkPrompt() = Unit
 
     /**
      * 铺满窗口的对话框。Android 要关掉 decorFitsSystemWindows，内容自己按 safeDrawing 避让；
@@ -197,6 +213,12 @@ interface UploadPicker {
  */
 /** 一块磁盘还能写多少、一共多少，字节。 */
 data class DiskSpace(val freeBytes: Long, val totalBytes: Long)
+
+/** 登录启动项以系统登记为准，不另外存一份偏好；写入失败返回 false。 */
+interface LaunchAtStartup {
+    suspend fun isEnabled(): Boolean
+    suspend fun setEnabled(enabled: Boolean): Boolean
+}
 
 /**
  * 平台自有的一个开关，值存在该平台自己的设置里，不跨设备同步。只有一个平台有的项走这里，

@@ -13,7 +13,7 @@ import androidx.compose.runtime.LaunchedEffect
 import dev.piko.shared.data.PikoDriveRepository
 import androidx.compose.material.icons.outlined.PushPin
 import androidx.compose.material.icons.outlined.SwipeVertical
-import androidx.compose.material.icons.outlined.Tab
+import androidx.compose.material.icons.outlined.AddToPhotos
 import dev.piko.ui.components.SheetAction
 import dev.piko.ui.components.ContextMenuArea
 import dev.piko.ui.components.fileDropTarget
@@ -77,11 +77,11 @@ internal fun ColumnScope.QuickAccessSection(
     val myPacks = state.myPacks
     SectionLabel("快速访问")
     val root = PikoDriveRepository.ROOT_BREADCRUMB
-    ContextMenuArea(actions = { listOf(SheetAction(Icons.Outlined.Tab, "在新标签页打开", { state.openRootInNewTab() })) }) {
+    ContextMenuArea(actions = { listOf(SheetAction(Icons.Outlined.AddToPhotos, "在新标签页打开", { state.openRootInNewTab() })) }) {
         SidebarItem(
             icon = Icons.Outlined.Home,
             selectedIcon = Icons.Filled.Home,
-            label = "根目录",
+            label = root.name,
             // 拖到这里就是移回根目录
             modifier = Modifier.fileDropTarget("quick:root", root),
             selected = atRoot,
@@ -90,7 +90,7 @@ internal fun ColumnScope.QuickAccessSection(
         )
     }
     if (myPacks != null) {
-        ContextMenuArea(actions = { listOf(SheetAction(Icons.Outlined.Tab, "在新标签页打开", { state.openMyPacksInNewTab(myPacks) })) }) {
+        ContextMenuArea(actions = { listOf(SheetAction(Icons.Outlined.AddToPhotos, "在新标签页打开", { state.openMyPacksInNewTab(myPacks) })) }) {
             SidebarItem(
                 icon = Icons.Outlined.CloudDownload,
                 selectedIcon = Icons.Filled.CloudDownload,
@@ -108,7 +108,7 @@ internal fun ColumnScope.QuickAccessSection(
         // 右键与网盘里的文件夹同一种说法，再加这一栏自己的「取消固定」
         ContextMenuArea(actions = {
             listOf(
-                SheetAction(Icons.Outlined.Tab, "在新标签页打开", { state.openInNewTab(folder) }),
+                SheetAction(Icons.Outlined.AddToPhotos, "在新标签页打开", { state.openInNewTab(folder) }),
                 SheetAction(Icons.Outlined.PushPin, "从快速访问取消固定", { state.unpin(folder) }),
             )
         }) {
