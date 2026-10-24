@@ -23,6 +23,7 @@ import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -221,10 +222,13 @@ internal fun TranslationSettingsDialog(
                 Text("恢复默认")
             }
         }
-        PikoTextField(
+        // 大多行框：提示词动辄十几行，用单行框会塌成一条（1.3.11 改档案 UI 时踩过）
+        OutlinedTextField(
             value = prompt,
             onValueChange = { prompt = it },
-            label = "提示词",
+            minLines = 6,
+            maxLines = 12,
+            textStyle = MaterialTheme.typography.bodySmall,
             modifier = Modifier.fillMaxWidth(),
         )
         Text(
