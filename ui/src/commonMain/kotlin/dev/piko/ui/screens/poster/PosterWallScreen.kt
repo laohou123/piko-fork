@@ -183,6 +183,9 @@ fun PosterWallScreen(
                     query = state.query,
                     onQueryChange = state::updateQuery,
                     onClose = { state.setSearchOpen(false) },
+                    // 只有刚点搜索进来才抢焦点；从详情页返回时这里读到 false，
+                    // 不然输入框一出现就把光标塞进去、自动弹起输入法
+                    autoFocus = remember { state.consumeSearchFocus() },
                 )
             }
             // 筛选行固定在顶部；目录与进度放在网格里，跟着列表一起滚走（参考图的行为）
@@ -504,9 +507,11 @@ private fun SearchBar(
     query: String,
     onQueryChange: (String) -> Unit,
     onClose: () -> Unit,
+    autoFocus: Boolean,
 ) {
     val focusRequester = remember { FocusRequester() }
     LaunchedEffect(Unit) {
+        if (!autoFocus) return@LaunchedEffect
         // 等一帧再要焦点：组合刚建立时焦点节点还没挂上，直接 requestFocus 会抛异常
         withFrameNanos { }
         runCatching { focusRequester.requestFocus() }

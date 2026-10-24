@@ -83,7 +83,7 @@
 
 到 [Releases](../../releases/latest) 下载安装包。
 
-- **Android**：`piko-1.4.0-universal.apk`，Android 8.0+，约 40 MB（含三 ABI 的 libmpv）
+- **Android**：`piko-1.3.3-universal.apk`，Android 8.0+，约 40 MB（含三 ABI 的 libmpv）
 - **桌面端**：Windows／macOS／Linux 构建方式见下方「从源码构建」
 
 > 本分支的包名是 `dev.piko.fork`，官方版是 `dev.piko`，两者签名也不同，因此**可以同时安装、各自独立运行**。
@@ -110,8 +110,8 @@ export ANDROID_KEYSTORE_PATH=/path/to/release.jks
 export ANDROID_KEYSTORE_PASSWORD='<your-store-password>'
 export ANDROID_KEY_ALIAS='<your-key-alias>'
 export ANDROID_KEY_PASSWORD='<your-key-password>'
-export PIKO_VERSION_NAME=1.4.0
-export PIKO_VERSION_CODE=10400
+export PIKO_VERSION_NAME=1.3.3
+export PIKO_VERSION_CODE=10303
 ./gradlew :app:assembleRelease -Ppiko.enableAbiSplits=false
 ```
 

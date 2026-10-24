@@ -86,11 +86,26 @@ class PosterWallState(
     var searchActive by mutableStateOf(false)
         private set
 
+    /**
+     * 这次展开搜索要不要把光标放进输入框。只有用户刚点搜索时为 true；
+     * 从详情页返回、切 tab 回来时海报墙会重新组合，若每次都抢焦点就会自动弹起输入法。
+     */
+    var searchFocusPending by mutableStateOf(false)
+        private set
+
     // 不叫 setSearchActive：var searchActive 的属性 setter 会生成同 JVM 签名的方法，撞名
     fun setSearchOpen(active: Boolean) {
+        if (active && !searchActive) searchFocusPending = true
         searchActive = active
         // 收起搜索就把词清掉：留下一个看不见的词，列表还按它过滤，摸不着头脑
         if (!active && query.isNotEmpty()) updateQuery("")
+    }
+
+    /** 取走「要不要抢焦点」，取过就清掉：同一次展开只抢一次。 */
+    fun consumeSearchFocus(): Boolean {
+        val pending = searchFocusPending
+        searchFocusPending = false
+        return pending
     }
 
     /**
