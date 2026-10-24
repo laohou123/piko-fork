@@ -1,6 +1,7 @@
 package dev.piko.shared.sync
 
 import dev.piko.data.auth.PikoUserPreferences
+import dev.piko.data.auth.SnailMode
 import dev.piko.shared.data.PikoCacheStore
 import dev.piko.shared.data.PikoClientProvider
 import dev.piko.shared.data.PikoDriveRepository
@@ -9,6 +10,7 @@ import dev.piko.shared.log.logFailure
 import io.github.nihildigit.pikpak.FileStat
 import io.github.nihildigit.pikpak.TaskPhase
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -24,26 +26,38 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.builtins.MapSerializer
 import kotlinx.serialization.builtins.serializer
 import kotlinx.serialization.json.Json
+import kotlin.io.encoding.Base64
+import kotlin.io.encoding.ExperimentalEncodingApi
 import kotlin.time.Clock
 
 /**
  * 同步到网盘的一项偏好。值一律存成字符串，[read] 与 [write] 负责换算。
- * 加一项只在 [SyncedSettings] 里加一行；窗口大小、下载目录、代理这类每台设备各自的不要加。
+ * 加一项只在 [SyncedSettings] 里加一行；下载目录、代理这类每台设备各自的不要加。
  */
 class SyncedSetting(
     val key: String,
     val read: (PikoUserPreferences) -> Flow<String>,
     val write: suspend (PikoUserPreferences, String) -> Unit,
+    /**
+     * 值是机密（MetaTube 令牌、翻译接口的 Key）：进网盘前用账号密码派生的密钥加密，
+     * 拉下来先解密再参与比较与合并。没有加密器（截图环境）时这一项整轮不参与。
+     */
+    val secret: Boolean = false,
 )
 
 private fun bool(key: String, read: (PikoUserPreferences) -> Flow<Boolean>, write: suspend PikoUserPreferences.(Boolean) -> Unit) =
     SyncedSetting(key, { read(it).map(Boolean::toString) }, { prefs, value -> value.toBooleanStrictOrNull()?.let { prefs.write(it) } })
 
+private fun int(key: String, read: (PikoUserPreferences) -> Flow<Int>, write: suspend PikoUserPreferences.(Int) -> Unit) =
+    SyncedSetting(key, { prefs -> read(prefs).map(Int::toString) }, { prefs, value -> value.toIntOrNull()?.let { prefs.write(it) } })
+
 val SyncedSettings: List<SyncedSetting> = listOf(
+    // ---------------------------------------------------------------- 更新与文件处理
     // 关掉自动检查是不想被打扰，换一台设备也一样
     bool("autoCheckUpdates", { it.autoCheckUpdatesFlow }) { setAutoCheckUpdates(it) },
     bool("heuristicFilter", { it.heuristicFilterFlow }) { setHeuristicFilterEnabled(it) },
@@ -53,24 +67,91 @@ val SyncedSettings: List<SyncedSetting> = listOf(
     bool("syncPlayHistory", { it.syncPlayHistoryFlow }) { setSyncPlayHistoryEnabled(it) },
     // 批量重命名用积木还是写正则，看的是这个人的水平，不是这台设备
     bool("renameRegexTextMode", { it.renameRegexTextModeFlow }) { setRenameRegexTextMode(it) },
+    bool("autoDetectClipboardLinks", { it.autoDetectClipboardLinksFlow }) { setAutoDetectClipboardLinks(it) },
+    SyncedSetting("batchRename", { it.batchRenameFlow }, { prefs, value -> prefs.saveBatchRename(value) }),
+    SyncedSetting("vaultArchiveOptions", { it.vaultArchiveOptionsFlow }, { prefs, value -> prefs.saveVaultArchiveOptions(value) }),
+
+    // ---------------------------------------------------------------- 外观与界面
     // 空串是「跟随系统」。设置接口没有写回跟随系统的入口，远端的空值不往本机写
     SyncedSetting("themeMode", { prefs -> prefs.themeModeFlow.map { it.orEmpty() } }, { prefs, value -> if (value.isNotEmpty()) prefs.setThemeMode(value) }),
     SyncedSetting("themeSeed", { prefs -> prefs.themeSeedFlow.map { it.orEmpty() } }, { prefs, value -> prefs.setThemeSeed(value.ifEmpty { null }) }),
     SyncedSetting("driveViewMode", { it.driveViewModeFlow }, { prefs, value -> prefs.setDriveViewMode(value) }),
+    bool("sidebarCollapsed", { it.sidebarCollapsedFlow }) { setSidebarCollapsed(it) },
+    bool("showExtensions", { it.showExtensionsFlow }) { setShowExtensions(it) },
+    bool("reduceMotion", { it.reduceMotionFlow }) { setReduceMotion(it) },
+    bool("folderMapOpen", { it.folderMapOpenFlow }) { setFolderMapOpen(it) },
+    bool("folderMapPinned", { it.folderMapPinnedFlow }) { setFolderMapPinned(it) },
+    // 剪贴板面板拆成两项：开关与宽度各自比较，免得改宽度被当成整项变更
+    SyncedSetting(
+        "clipPanelOpen",
+        { prefs -> prefs.clipPanelFlow.map { it.open.toString() } },
+        { prefs, value -> value.toBooleanStrictOrNull()?.let { prefs.setClipPanelOpen(it) } },
+    ),
+    SyncedSetting(
+        "clipPanelWidth",
+        { prefs -> prefs.clipPanelFlow.map { it.widthDp?.toString().orEmpty() } },
+        { prefs, value -> value.toFloatOrNull()?.let { prefs.setClipPanelWidth(it) } },
+    ),
+
+    // ---------------------------------------------------------------- 目录
     // 最近移动到的目录：换一台设备也用得上
     SyncedSetting("recentMoveTargets", { it.recentMoveTargetsFlow }, { prefs, value -> prefs.saveRecentMoveTargets(value) }),
     // 快速访问是 Piko 自己的，PikPak 没有这一项，只能靠这里带到别的设备
     SyncedSetting("pinnedFolders", { it.pinnedFoldersFlow }, { prefs, value -> prefs.savePinnedFolders(value) }),
+
+    // ---------------------------------------------------------------- 网盘与传输
+    // 换一个域名相当于换条线路，同一账号在别的设备上也该用同一个
+    SyncedSetting("pikpakDomain", { it.pikpakDomainFlow }, { prefs, value -> if (value.isNotEmpty()) prefs.setPikpakDomain(value) }),
+    // 蜗牛模式：开关与两个限速合成一项，值形如 "true|1024|512"
     SyncedSetting(
-        "playerSeekStepSeconds",
-        { prefs -> prefs.playerSeekStepSecondsFlow.map(Int::toString) },
-        { prefs, value -> value.toIntOrNull()?.let { prefs.setPlayerSeekStepSeconds(it) } },
+        "snailMode",
+        { prefs -> prefs.snailModeFlow.map { m -> "${m.enabled}|${m.downloadKiBps}|${m.uploadKiBps}" } },
+        { prefs, value ->
+            val parts = value.split("|")
+            val enabled = parts.getOrNull(0)?.toBooleanStrictOrNull()
+            if (enabled != null) {
+                prefs.setSnailMode(
+                    SnailMode(
+                        enabled = enabled,
+                        downloadKiBps = parts.getOrNull(1)?.toIntOrNull() ?: SnailMode.DEFAULT_DOWNLOAD_KIBPS,
+                        uploadKiBps = parts.getOrNull(2)?.toIntOrNull() ?: SnailMode.DEFAULT_UPLOAD_KIBPS,
+                    ),
+                )
+            }
+        },
     ),
+    bool("concurrentAcceleration", { it.concurrentAccelerationFlow }) { setConcurrentAccelerationEnabled(it) },
+
+    // ---------------------------------------------------------------- 播放
+    bool("hardwareDecoding", { it.hardwareDecodingFlow }) { setHardwareDecoding(it) },
+    int("playbackMaxHeight", { it.playbackMaxHeightFlow }) { setPlaybackMaxHeight(it) },
+    // 空串表示不限画质（null），所以不用 int() 那个只在非空时写的助手
+    SyncedSetting(
+        "downloadMaxHeight",
+        { prefs -> prefs.downloadMaxHeightFlow.map { it?.toString().orEmpty() } },
+        { prefs, value -> prefs.setDownloadMaxHeight(value.toIntOrNull()) },
+    ),
+    int("playerSeekStepSeconds", { it.playerSeekStepSecondsFlow }) { setPlayerSeekStepSeconds(it) },
     SyncedSetting(
         "playerBoostSpeed",
         { prefs -> prefs.playerBoostSpeedFlow.map(Float::toString) },
         { prefs, value -> value.toFloatOrNull()?.let { prefs.setPlayerBoostSpeed(it) } },
     ),
+
+    // ---------------------------------------------------------------- 海报墙
+    bool("posterAutoPreview", { it.posterAutoPreviewFlow }) { setPosterAutoPreviewEnabled(it) },
+    int("posterPreviewMaxHeight", { it.posterPreviewMaxHeightFlow }) { setPosterPreviewMaxHeight(it) },
+    // 地址是明文，令牌是机密：换设备登录后刮削就能直接用，不必再问一遍
+    SyncedSetting("metaTubeUrl", { it.metaTubeUrlFlow }, { prefs, value -> prefs.setMetaTubeUrl(value) }),
+    SyncedSetting("metaTubeToken", { it.metaTubeTokenFlow }, { prefs, value -> prefs.setMetaTubeToken(value) }, secret = true),
+
+    // ---------------------------------------------------------------- AI 翻译
+    SyncedSetting("translationBaseUrl", { it.translationBaseUrlFlow }, { prefs, value -> prefs.setTranslationBaseUrl(value) }),
+    SyncedSetting("translationModel", { it.translationModelFlow }, { prefs, value -> prefs.setTranslationModel(value) }),
+    SyncedSetting("translationReasoning", { it.translationReasoningFlow }, { prefs, value -> prefs.setTranslationReasoning(value) }),
+    SyncedSetting("translationPrompt", { it.translationPromptFlow }, { prefs, value -> prefs.setTranslationPrompt(value) }),
+    int("translationConcurrency", { it.translationConcurrencyFlow }) { setTranslationConcurrency(it) },
+    SyncedSetting("translationApiKey", { it.translationApiKeyFlow }, { prefs, value -> prefs.setTranslationApiKey(value) }, secret = true),
 )
 
 /**
@@ -97,6 +178,10 @@ class PikoSettingsSync(
     private val scope: CoroutineScope,
     private val enabled: Flow<Boolean>,
     private val settings: List<SyncedSetting> = SyncedSettings,
+    /** 机密项（令牌、Key）进网盘前的加密。为 null 时这些项整轮不参与。 */
+    private val cipher: SyncCipher? = null,
+    /** 取账号密码，用来派生加密密钥。取不到时机密项这一轮不参与。 */
+    private val passwordOf: suspend (account: String) -> String? = { null },
     private val now: () -> Long = { Clock.System.now().toEpochMilliseconds() },
 ) {
     constructor(
@@ -106,7 +191,9 @@ class PikoSettingsSync(
         cacheStore: PikoCacheStore?,
         scope: CoroutineScope,
         enabled: Flow<Boolean>,
-    ) : this(clients, DriveSettingsStore(clients, driveRepo), preferences, cacheStore, scope, enabled)
+        cipher: SyncCipher? = null,
+        passwordOf: suspend (account: String) -> String? = { null },
+    ) : this(clients, DriveSettingsStore(clients, driveRepo), preferences, cacheStore, scope, enabled, SyncedSettings, cipher, passwordOf)
 
     enum class Status { IDLE, SYNCING, SYNCED, FAILED }
 
@@ -118,6 +205,9 @@ class PikoSettingsSync(
     val lastSynced: StateFlow<Long?> = _lastSynced.asStateFlow()
 
     private val lock = Mutex()
+
+    /** 派生出的密钥按 salt 缓存：派生一次要一两百毫秒，同一份盐不必反复算。 */
+    private val keyCache = HashMap<String, CachedKey>()
 
     private val json = Json { ignoreUnknownKeys = true }
 
@@ -154,7 +244,11 @@ class PikoSettingsSync(
 
     private suspend fun sync(account: String) {
         val stamp = now()
-        val local = settings.associate { it.key to it.read(preferences).first() }
+        // 机密项要加密才能进网盘：没有加密器，或这台设备读不出账号密码时，它们这一轮不参与
+        val password = if (settings.any { it.secret }) passwordOf(account) else null
+        val active = settings.filter { !it.secret || !password.isNullOrEmpty() }
+        val secretKeys = active.filter { it.secret }.map { it.key }.toSet()
+        val local = active.associate { it.key to it.read(preferences).first() }
         val known = loadState(account)
         // 本机与上次同步时不同的，是这之后在本机改的，算作此刻改的。这台设备从没同步过的项算作最旧：
         // 新装的设备一身默认值，不能拿它们盖掉另一台设备上调好的设置
@@ -167,7 +261,16 @@ class PikoSettingsSync(
             }
         }
         val remoteText = remote.read(account)
-        val remoteValues = remoteText?.let { json.decodeFromString(Document.serializer(), it).values }.orEmpty()
+        val remoteRaw = remoteText?.let { json.decodeFromString(Document.serializer(), it).values }.orEmpty()
+        // 机密项远端存的是密文：先解成明文再参与比较。解不开的（换过账号密码、文件被改过）当作没有这一项
+        val remoteValues = remoteRaw.mapNotNull { (key, entry) ->
+            if (key in secretKeys) {
+                val plain = password?.let { openSecret(it, entry.value) } ?: return@mapNotNull null
+                key to entry.copy(value = plain)
+            } else {
+                key to entry
+            }
+        }.toMap()
 
         // 远端带着已停用的项时，合并结果与远端不同，下面随即写一份不含它的新文件，旧文件随之删掉
         val merged = (mine.keys + remoteValues.keys - RetiredSettingKeys).associateWith { key ->
@@ -183,21 +286,71 @@ class PikoSettingsSync(
         }
         // 远端更新的写进本机
         val pulled = mutableListOf<String>()
-        for (setting in settings) {
+        for (setting in active) {
             val entry = merged[setting.key] ?: continue
             if (entry.value != local[setting.key]) {
                 setting.write(preferences, entry.value)
                 pulled += setting.key
             }
         }
-        saveState(account, merged.filterKeys { key -> settings.any { it.key == key } })
+        saveState(account, merged.filterKeys { key -> active.any { it.key == key } })
         val pushed = merged != remoteValues
-        if (pushed) remote.write(account, json.encodeToString(Document.serializer(), Document(VERSION, merged)), stamp)
+        if (pushed) {
+            // 机密项落盘前加密：这一轮共用一个 salt，少派生几次密钥
+            val salt = if (secretKeys.isEmpty()) null else cipher?.newSalt()
+            val stored = merged.mapNotNull { (key, entry) ->
+                if (key in secretKeys && salt != null && password != null) {
+                    val sealed = sealSecret(password, entry.value, salt)
+                    when {
+                        sealed != null -> key to entry.copy(value = sealed)
+                        // 加密不了就保持远端原样，别把明文写上去，也别把这台设备刚改的值弄丢
+                        else -> remoteRaw[key]?.let { key to it }
+                    }
+                } else {
+                    key to entry
+                }
+            }.toMap()
+            remote.write(account, json.encodeToString(Document.serializer(), Document(VERSION, stored)), stamp)
+        }
         // 只记项名，不记值：值里有快速访问的文件夹 ID 与主题这类无关排查的内容
         PikoLog.i(TAG, "设置同步：远端${if (remoteText == null) "无文件" else " ${remoteValues.size} 项"}，" +
             "本机改过 ${mine.count { it.value.updatedAt == stamp }} 项，写入本机 ${pulled.size} 项${if (pulled.isEmpty()) "" else " $pulled"}，" +
-            "${if (pushed) "已推送 ${merged.size} 项" else "无需推送"}，历时 ${now() - stamp} ms")
+            "${if (pushed) "已推送 ${merged.size} 项" else "无需推送"}，加密项 ${secretKeys.size}，历时 ${now() - stamp} ms")
     }
+
+    // ---------------------------------------------------------------- 机密项加解密
+
+    @OptIn(ExperimentalEncodingApi::class)
+    private suspend fun sealSecret(password: String, plain: String, salt: ByteArray): String? {
+        val c = cipher ?: return null
+        val k = keyFor(password, salt) ?: return null
+        val sealed = runCatching { c.seal(k, plain.encodeToByteArray()) }.getOrNull() ?: return null
+        return Base64.encode(salt) + ":" + Base64.encode(sealed)
+    }
+
+    @OptIn(ExperimentalEncodingApi::class)
+    private suspend fun openSecret(password: String, stored: String): String? {
+        val c = cipher ?: return null
+        val parts = stored.split(":", limit = 2)
+        if (parts.size != 2) return null
+        val salt = runCatching { Base64.decode(parts[0]) }.getOrNull() ?: return null
+        val sealed = runCatching { Base64.decode(parts[1]) }.getOrNull() ?: return null
+        val k = keyFor(password, salt) ?: return null
+        return c.open(k, sealed)?.decodeToString()
+    }
+
+    @OptIn(ExperimentalEncodingApi::class)
+    private suspend fun keyFor(password: String, salt: ByteArray): ByteArray? {
+        val id = Base64.encode(salt)
+        keyCache[id]?.let { if (it.password == password) return it.key }
+        val c = cipher ?: return null
+        // 派生故意算得慢，一次一二百毫秒：缓存在这里，一轮同步只算一次
+        val k = withContext(Dispatchers.Default) { c.deriveKey(password, salt, SECRET_ITERATIONS) }
+        keyCache[id] = CachedKey(password, k)
+        return k
+    }
+
+    private class CachedKey(val password: String, val key: ByteArray)
 
     private suspend fun loadState(account: String): Map<String, Entry> {
         val text = cacheStore?.read(stateKey(account)) ?: return emptyMap()
@@ -229,6 +382,9 @@ class PikoSettingsSync(
             parentId.isEmpty() && file.isFolder && file.name == FOLDER_NAME
         private const val VERSION = 1
         private const val PUSH_DELAY_MS = 3_000L
+
+        /** 密钥派生轮数，与压缩包密码同步用同一档：慢到值得缓存，快到能接受。 */
+        private const val SECRET_ITERATIONS = 600_000
         private const val TAG = "SettingsSync"
         private val UNSAFE_KEY_CHARS = Regex("""[^A-Za-z0-9._@-]""")
         private val StateSerializer = MapSerializer(String.serializer(), Entry.serializer())

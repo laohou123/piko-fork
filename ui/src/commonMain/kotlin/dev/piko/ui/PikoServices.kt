@@ -156,7 +156,17 @@ class PikoServices(
     val moveHistory = MoveHistory(preferences, driveRepository, backgroundScope)
 
     /** 部分设置同步到网盘的 .piko 文件夹，登录后自己开始，见 PikoSettingsSync。 */
-    val settingsSync = PikoSettingsSync(clientManager, driveRepository, preferences, cacheStore, backgroundScope, preferences.settingsSyncFlow)
+    val settingsSync = PikoSettingsSync(
+        clientManager,
+        driveRepository,
+        preferences,
+        cacheStore,
+        backgroundScope,
+        preferences.settingsSyncFlow,
+        // MetaTube 令牌与翻译 Key 跟着设置走，但要加密：密钥由账号密码派生
+        cipher = syncCipher,
+        passwordOf = clientManager::savedPassword,
+    )
         .also { it.start() }
     private val vaultTreeSync = VaultTreeSync(clientManager, driveRepository, backgroundScope, preferences.settingsSyncFlow)
         .also { it.start() }

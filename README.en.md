@@ -38,6 +38,14 @@ A custom branch of [NihilDigit/piko](https://github.com/NihilDigit/piko). Everyt
 | Detail page | Muted preview of the actual video (Piko's own playback backend), large cover, swipeable screenshot wall, fixed bottom action bar |
 | Incremental rescan | Deleting a video in the drive removes the work after a full rescan; stopping early never deletes anything |
 
+## Settings sync
+
+Everything except the poster-wall index and scraped metadata follows your account: settings are written to the `.piko` folder in your drive and restored on any device after sign-in.
+
+- Appearance, folder handling, drive and transfer, playback, poster-wall preview and AI translation (base URL, model, reasoning effort, prompt, concurrency) are all synced
+- **The MetaTube token and translation API key are synced too, but encrypted first**: the key is derived from your account password (PBKDF2 + AES-GCM), so the sync file alone cannot be read
+- Merged per item with timestamps, so two devices editing different settings both keep theirs; download folder and proxy stay per-device
+
 All images go through MetaTube's image proxy endpoints, so Referer checks, hotlink protection and network reachability of the source site are handled server-side.
 
 ## AI translation
@@ -58,7 +66,7 @@ Any provider that speaks `POST /chat/completions`: DeepSeek, OpenAI, Qwen, proxi
 
 Download from [Releases](../../releases/latest).
 
-- **Android**: `piko-1.1-universal.apk`, Android 8.0+, ~40 MB (three ABIs of libmpv)
+- **Android**: `piko-1.2-universal.apk`, Android 8.0+, ~40 MB (three ABIs of libmpv)
 - **Desktop**: build from source with the commands below
 
 > This branch uses the package name `dev.piko.fork` (the official build is `dev.piko`), with its own signing key, so the two **can be installed side by side** and run independently. Data is not shared: sign-in, settings and the poster-wall index live in separate app sandboxes, and updates stay within this branch.
@@ -83,8 +91,8 @@ export ANDROID_KEYSTORE_PATH=/path/to/release.jks
 export ANDROID_KEYSTORE_PASSWORD='<your-store-password>'
 export ANDROID_KEY_ALIAS='<your-key-alias>'
 export ANDROID_KEY_PASSWORD='<your-key-password>'
-export PIKO_VERSION_NAME=1.1
-export PIKO_VERSION_CODE=10100
+export PIKO_VERSION_NAME=1.2
+export PIKO_VERSION_CODE=10200
 ./gradlew :app:assembleRelease -Ppiko.enableAbiSplits=false
 ```
 
