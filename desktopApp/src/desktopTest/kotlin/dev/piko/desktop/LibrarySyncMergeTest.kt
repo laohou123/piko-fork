@@ -52,6 +52,43 @@ class LibrarySyncMergeTest {
         )
     }
 
+    private suspend fun LibraryStore.rescrape(code: String, title: String, tags: List<String>) {
+        markScraped(
+            code = code, title = title, coverUrl = null, releaseDate = null, durationMinutes = null,
+            summary = null, studio = null, series = null, provider = "metatube", mtProvider = null, mtId = null,
+            previewVideoUrl = null, previewImages = emptyList(), actors = emptyList(), tags = tags,
+        )
+    }
+
+    @Test
+    fun `custom tags survive a rescrape and travel to another device`() = runBlocking {
+        val a = store()
+        a.addWork("ABC-123", "原名", tags = listOf("刮削标签"))
+        a.addCustomTag("ABC-123", "我的标签")
+
+        val tags = a.workDetail("ABC-123")!!.tags
+        assertTrue(tags.any { it.name == "我的标签" && it.custom })
+        assertTrue(tags.any { it.name == "刮削标签" && !it.custom })
+
+        // 重新刮一次：源站标签换了新的，自定义标签不能跟着没
+        a.rescrape("ABC-123", "原名", listOf("新标签"))
+        val after = a.workDetail("ABC-123")!!.tags.map { it.name }
+        assertTrue("我的标签" in after, "自定义标签被重新刮削冲掉了：$after")
+        assertTrue("新标签" in after)
+        assertTrue("刮削标签" !in after)
+
+        // 另一台设备拿到这个标签
+        val b = store()
+        b.addWork("ABC-123", "原名")
+        b.applySyncMarks(a.exportSyncMarks())
+        assertTrue(b.workDetail("ABC-123")!!.tags.any { it.name == "我的标签" })
+
+        // 删掉也同步过去
+        a.removeTag("ABC-123", "我的标签")
+        b.applySyncMarks(a.exportSyncMarks())
+        assertTrue(b.workDetail("ABC-123")!!.tags.none { it.name == "我的标签" })
+    }
+
     @Test
     fun `a new device takes titles and favourites from the other one`() = runBlocking {
         val a = store()

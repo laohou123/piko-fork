@@ -1,0 +1,3 @@
+-- v7→v8：标签加「自定义」标记。
+-- 重新刮削会整批重写某部作品的标签（只删 custom = 0 的），用户在详情页手动加的标签不会被冲掉。
+ALTER TABLE work_tags ADD COLUMN custom INTEGER NOT NULL DEFAULT 0;

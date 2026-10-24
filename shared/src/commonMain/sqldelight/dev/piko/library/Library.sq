@@ -55,6 +55,8 @@ CREATE INDEX index_work_actors_on_actor ON work_actors(actor_name);
 CREATE TABLE work_tags (
     work_code TEXT NOT NULL,
     tag_name TEXT NOT NULL,
+    -- 1 = 用户在详情页手动加的：重新刮削重写标签时不删这些
+    custom INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (work_code, tag_name)
 );
 CREATE INDEX index_work_tags_on_tag ON work_tags(tag_name);
@@ -168,7 +170,8 @@ insertWorkActor:
 INSERT OR REPLACE INTO work_actors (work_code, actor_name) VALUES (?, ?);
 
 insertWorkTag:
-INSERT OR REPLACE INTO work_tags (work_code, tag_name) VALUES (?, ?);
+-- OR IGNORE：用户已经手动加过同名标签时保留它（custom = 1），别被刮削覆盖回去
+INSERT OR IGNORE INTO work_tags (work_code, tag_name) VALUES (?, ?);
 
 deleteWorkActorsFor:
 DELETE FROM work_actors WHERE work_code = ?;
@@ -243,9 +246,20 @@ FROM work_actors a LEFT JOIN favorite_actors f ON f.actor_name = a.actor_name
 WHERE a.work_code = ? ORDER BY a.actor_name;
 
 selectTagsForWork:
-SELECT t.tag_name AS name, CASE WHEN f.tag_name IS NULL THEN 0 ELSE 1 END AS favorite
+SELECT t.tag_name AS name, CASE WHEN f.tag_name IS NULL THEN 0 ELSE 1 END AS favorite, t.custom AS custom
 FROM work_tags t LEFT JOIN favorite_tags f ON f.tag_name = t.tag_name
 WHERE t.work_code = ? ORDER BY t.tag_name;
+
+-- 刮削重写标签：只删源站带来的，用户自己加的不动
+deleteScrapedTagsFor:
+DELETE FROM work_tags WHERE work_code = ? AND custom = 0;
+
+-- 详情页手动加标签，标成自定义
+insertCustomTag:
+INSERT OR REPLACE INTO work_tags (work_code, tag_name, custom) VALUES (?, ?, 1);
+
+deleteWorkTag:
+DELETE FROM work_tags WHERE work_code = ? AND tag_name = ?;
 
 -- 演员与标签带收藏标志：favorite = 1 的排最前（收藏置顶），其余按作品数排
 selectActors:
@@ -311,6 +325,10 @@ INSERT OR IGNORE INTO sync_marks (kind, key, at, title_value, on_flag) VALUES (?
 
 selectSyncMarks:
 SELECT kind, key, at, title_value, on_flag FROM sync_marks;
+
+-- 同步补历史：本机已有的自定义标签
+selectCustomTags:
+SELECT work_code, tag_name FROM work_tags WHERE custom = 1;
 
 -- 同步专用：按远端的记录直接写译名（不走 setWorkTitleZh，免得又刷一次本机时刻）
 applySyncTitleZh:

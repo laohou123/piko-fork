@@ -22,6 +22,9 @@ object SyncKind {
     const val WORK = "work"
     const val ACTOR = "actor"
     const val TAG = "tag"
+
+    /** 详情页手动加的标签。key 是「作品编号|标签名」，因为同一部作品可以有好几个。 */
+    const val CUSTOM_TAG = "custom_tag"
 }
 
 /**
@@ -86,7 +89,12 @@ data class WorkDetail(
 )
 
 /** 详情页里的一个演员或标签，带收藏标志（长按切换）。 */
-data class NamedFavorite(val name: String, val favorite: Boolean)
+data class NamedFavorite(
+    val name: String,
+    val favorite: Boolean,
+    /** 用户在详情页手动加的标签：重新刮削不会冲掉，界面上可以删。 */
+    val custom: Boolean = false,
+)
 
 data class NamedCount(
     val name: String,
@@ -253,7 +261,7 @@ class LibraryStore(
                 provider, mtProvider, mtId, previewVideoUrl, System.currentTimeMillis(), code,
             )
             q.deleteWorkActorsFor(code)
-            q.deleteWorkTagsFor(code)
+            q.deleteScrapedTagsFor(code)
             q.deleteWorkImagesFor(code)
             actors.forEach { q.insertWorkActor(code, it) }
             tags.forEach { q.insertWorkTag(code, it) }
@@ -368,7 +376,7 @@ class LibraryStore(
             ),
             files = files,
             actors = q.selectActorsForWork(code).executeAsList().map { NamedFavorite(it.name, it.favorite == 1L) },
-            tags = q.selectTagsForWork(code).executeAsList().map { NamedFavorite(it.name, it.favorite == 1L) },
+            tags = q.selectTagsForWork(code).executeAsList().map { NamedFavorite(it.name, it.favorite == 1L, it.custom == 1L) },
             studio = w.studio,
             series = w.series,
             summary = w.summary,
@@ -429,6 +437,9 @@ class LibraryStore(
             q.selectFavoriteTagNames().executeAsList().forEach {
                 q.insertSyncMarkIfAbsent(SyncKind.TAG, it, 0L, null, 1L)
             }
+            q.selectCustomTags().executeAsList().forEach {
+                q.insertSyncMarkIfAbsent(SyncKind.CUSTOM_TAG, customTagKey(it.work_code, it.tag_name), 0L, it.tag_name, 1L)
+            }
         }
         q.selectSyncMarks().executeAsList().map {
             SyncMark(it.kind, it.key, it.at, it.title_value, it.on_flag != 0L)
@@ -457,6 +468,11 @@ class LibraryStore(
                         if (mark.on) q.insertFavoriteActor(mark.key, stampOf(mark.at)) else q.deleteFavoriteActor(mark.key)
                     SyncKind.TAG ->
                         if (mark.on) q.insertFavoriteTag(mark.key, stampOf(mark.at)) else q.deleteFavoriteTag(mark.key)
+                    SyncKind.CUSTOM_TAG -> {
+                        val (workCode, tagName) = splitCustomTagKey(mark.key) ?: continue
+                        if (mark.on) q.insertCustomTag(workCode, mark.value?.takeIf { it.isNotBlank() } ?: tagName)
+                        else q.deleteWorkTag(workCode, mark.value?.takeIf { it.isNotBlank() } ?: tagName)
+                    }
                     else -> continue
                 }
                 q.upsertSyncMark(mark.kind, mark.key, mark.at, mark.value, if (mark.on) 1 else 0)
@@ -492,6 +508,37 @@ class LibraryStore(
     suspend fun tags(): List<NamedCount> = withQueries { q ->
         q.selectTags().executeAsList().map { NamedCount(it.name, it.count, it.favorite == 1L) }
     }.orEmpty()
+
+    // ---------------------------------------------------------------- 自定义标签
+
+    /**
+     * 详情页手动给这部作品加一个标签。标成自定义：重新刮削重写标签时不会把它删掉。
+     * 与刮削标签同名时就直接是那个标签（保留自定义标记）。
+     */
+    suspend fun addCustomTag(code: String, name: String) = withQueries { q ->
+        name.trim().takeIf { it.isNotEmpty() }?.let { tag ->
+            q.insertCustomTag(code, tag)
+            q.upsertSyncMark(SyncKind.CUSTOM_TAG, customTagKey(code, tag), System.currentTimeMillis(), tag, 1)
+        }
+        Unit
+    }?.also { _changes.tryEmit(Unit) }
+
+    /** 删掉这部作品上的某个标签（刮削来的也能删，下次刮削才会回来）。 */
+    suspend fun removeTag(code: String, name: String) = withQueries { q ->
+        q.deleteWorkTag(code, name)
+        // 删也算一次改动：别的设备拉到之后一起删掉，不会被补回来
+        q.upsertSyncMark(SyncKind.CUSTOM_TAG, customTagKey(code, name), System.currentTimeMillis(), name, 0)
+        Unit
+    }?.also { _changes.tryEmit(Unit) }
+
+    private fun customTagKey(code: String, name: String): String = "$code|$name"
+
+    /** 拆「作品编号|标签名」；标签名里带竖线时按第一个竖线切，后面的都算标签名。 */
+    private fun splitCustomTagKey(key: String): Pair<String, String>? {
+        val i = key.indexOf('|')
+        if (i <= 0 || i == key.length - 1) return null
+        return key.substring(0, i) to key.substring(i + 1)
+    }
 
     // ---------------------------------------------------------------- 收藏
 

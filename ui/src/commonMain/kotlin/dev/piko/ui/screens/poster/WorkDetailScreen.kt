@@ -1,6 +1,7 @@
 package dev.piko.ui.screens.poster
 
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.clickable
@@ -28,6 +29,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.outlined.AutoAwesome
@@ -119,6 +121,9 @@ fun WorkDetailScreen(
     // 标题：AI 翻译进行中 / 手动编辑框
     var translatingTitle by remember { mutableStateOf(false) }
     var editingTitle by remember { mutableStateOf(false) }
+    // 详情页「标签」那一行末尾的 + ：自定义标签
+    var editingTags by remember { mutableStateOf(false) }
+    var tagDraft by remember { mutableStateOf("") }
 
     // 顶栏按钮与「还没有封面」占位卡片共用：刮这一部，刮完重读详情
     val scrapeThis: () -> Unit = {
@@ -330,26 +335,26 @@ fun WorkDetailScreen(
                                 }
                             }
                         }
-                        if (d.tags.isNotEmpty()) {
-                            SectionLabel("标签")
-                            FlowRow(
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                verticalArrangement = Arrangement.spacedBy(8.dp),
-                            ) {
-                                d.tags.forEach { tag ->
-                                    FavoriteChip(
-                                        name = tag.name,
-                                        favorite = tag.favorite,
-                                        onClick = { onFilterTag(tag.name) },
-                                        onLongClick = {
-                                            scope.launch {
-                                                services.libraryStore?.toggleTagFavorite(tag.name)
-                                                detail = services.libraryStore?.workDetail(code)
-                                            }
-                                        },
-                                    )
-                                }
+                        // 标签这一行始终显示：末尾有一个 +，就算一部片子一个标签都没有也能加
+                        SectionLabel("标签")
+                        FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            d.tags.forEach { tag ->
+                                FavoriteChip(
+                                    name = tag.name,
+                                    favorite = tag.favorite,
+                                    onClick = { onFilterTag(tag.name) },
+                                    onLongClick = {
+                                        scope.launch {
+                                            services.libraryStore?.toggleTagFavorite(tag.name)
+                                            detail = services.libraryStore?.workDetail(code)
+                                        }
+                                    },
+                                )
                             }
+                            AddTagChip(onClick = { tagDraft = ""; editingTags = true })
                         }
                         if (d.actors.isNotEmpty()) {
                             SectionLabel("女优")
@@ -426,6 +431,88 @@ fun WorkDetailScreen(
             },
             dismissButton = {
                 TextButton(onClick = { editingTitle = false }) { Text("取消") }
+            },
+        )
+    }
+
+    // 自定义标签：输入框加已有的自定义标签（可删）
+    if (editingTags) {
+        val customTags = detail?.tags?.filter { it.custom }.orEmpty()
+        PikoDialog(
+            onDismissRequest = { editingTags = false },
+            title = { Text("自定义标签") },
+            text = {
+                Column {
+                    Text(
+                        text = "只加在这部作品上，重新刮削也不会被冲掉。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(top = 8.dp),
+                    ) {
+                        OutlinedTextField(
+                            value = tagDraft,
+                            onValueChange = { tagDraft = it },
+                            singleLine = true,
+                            label = { Text("新标签") },
+                            modifier = Modifier.weight(1f),
+                        )
+                        TextButton(
+                            enabled = tagDraft.isNotBlank(),
+                            onClick = {
+                                val name = tagDraft.trim()
+                                tagDraft = ""
+                                scope.launch {
+                                    services.libraryStore?.addCustomTag(code, name)
+                                    detail = services.libraryStore?.workDetail(code)
+                                }
+                            },
+                            modifier = Modifier.padding(start = 8.dp),
+                        ) { Text("添加") }
+                    }
+                    if (customTags.isNotEmpty()) {
+                        Text(
+                            text = "已加的自定义标签",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 12.dp),
+                        )
+                        customTags.forEach { tag ->
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                            ) {
+                                Text(
+                                    text = tag.name,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                IconButton(
+                                    onClick = {
+                                        scope.launch {
+                                            services.libraryStore?.removeTag(code, tag.name)
+                                            detail = services.libraryStore?.workDetail(code)
+                                        }
+                                    },
+                                    modifier = Modifier.size(32.dp),
+                                ) {
+                                    Icon(
+                                        Icons.Filled.Close,
+                                        contentDescription = "删除标签 ${tag.name}",
+                                        modifier = Modifier.size(16.dp),
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { editingTags = false }) { Text("完成") }
             },
         )
     }
@@ -802,4 +889,33 @@ private fun SectionLabel(text: String) {
         style = MaterialTheme.typography.titleSmall,
         modifier = Modifier.padding(top = 16.dp, bottom = 4.dp),
     )
+}
+
+/** 标签行末尾的「+ 标签」：虚线感的浅色底，不抢已有关注点。 */
+@Composable
+private fun AddTagChip(onClick: () -> Unit) {
+    Surface(
+        onClick = onClick,
+        shape = RoundedCornerShape(8.dp),
+        color = MaterialTheme.colorScheme.surfaceContainerLow,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
+        ) {
+            Icon(
+                Icons.Filled.Add,
+                contentDescription = null,
+                modifier = Modifier.size(14.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                text = "标签",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(start = 3.dp),
+            )
+        }
+    }
 }

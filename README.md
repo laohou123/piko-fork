@@ -37,6 +37,7 @@
 | 刮削 | MetaTube 优先：标题、封面、背景图、截图墙、演员、标签、片商、系列、时长 |
 | 筛选与搜索 | 全部／收藏／演员／标签四个等宽按钮，右上角搜索支持编号、标题、演员、标签 |
 | 收藏 | 作品收藏（海报墙／详情页／播放页），演员与标签长按收藏并置顶 |
+| 自定义标签 | 详情页标签行末尾的「+」可以给自己加标签，重新刮削不会被冲掉，随账号同步 |
 | 详情页 | 顶部用 Piko 自带播放后端播正片中段作预览，横向大封面、截图墙（可全屏左右翻）、底部固定操作栏 |
 | 增量重扫 | 网盘里删掉视频，完整重扫后自动移除对应作品；中途停止不会误删 |
 
@@ -82,7 +83,7 @@
 
 到 [Releases](../../releases/latest) 下载安装包。
 
-- **Android**：`piko-1.3.2-universal.apk`，Android 8.0+，约 40 MB（含三 ABI 的 libmpv）
+- **Android**：`piko-1.4.0-universal.apk`，Android 8.0+，约 40 MB（含三 ABI 的 libmpv）
 - **桌面端**：Windows／macOS／Linux 构建方式见下方「从源码构建」
 
 > 本分支的包名是 `dev.piko.fork`，官方版是 `dev.piko`，两者签名也不同，因此**可以同时安装、各自独立运行**。
@@ -109,8 +110,8 @@ export ANDROID_KEYSTORE_PATH=/path/to/release.jks
 export ANDROID_KEYSTORE_PASSWORD='<your-store-password>'
 export ANDROID_KEY_ALIAS='<your-key-alias>'
 export ANDROID_KEY_PASSWORD='<your-key-password>'
-export PIKO_VERSION_NAME=1.3.2
-export PIKO_VERSION_CODE=10302
+export PIKO_VERSION_NAME=1.4.0
+export PIKO_VERSION_CODE=10400
 ./gradlew :app:assembleRelease -Ppiko.enableAbiSplits=false
 ```
 
