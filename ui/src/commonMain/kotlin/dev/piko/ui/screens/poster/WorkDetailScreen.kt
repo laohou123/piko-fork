@@ -218,38 +218,21 @@ fun WorkDetailScreen(
                         )
                     }
                     Column(modifier = Modifier.padding(horizontal = 16.dp)) {
+                        // 编号（认不出番号时这一串就是文件名，可能很长）与两个按钮同一行。
+                        // 文字占满剩余宽度、最多两行；提示单独一行放在下面——
+                        // 以前提示跟编号挤在同一个 Row 里，编号一长提示就被压成一个字宽，逐字换行成一列，
+                        // 把这一块撑得老高，整页看着就乱了。
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
                             modifier = Modifier.padding(top = 12.dp),
                         ) {
                             Text(
-                                text = d.work.code,
+                                text = d.work.code.substringBeforeLast('.', d.work.code),
                                 style = MaterialTheme.typography.labelLarge,
                                 color = MaterialTheme.colorScheme.primary,
-                            )
-                            if (!d.work.scraped) {
-                                Text(
-                                    text = "元数据还没刮到，可回列表点「补刮」",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.error,
-                                    modifier = Modifier.padding(start = 8.dp),
-                                )
-                            }
-                        }
-                        // 标题行：译名（没有则原文）+ 翻译 / 修改两个按钮
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier.padding(top = 4.dp),
-                        ) {
-                            // 标题只显示一个名字（有译名就是译名，没有就是原文），
-                            // 两个按钮紧贴标题末尾，不再靠 weight 把图标推到屏幕右边
-                            Text(
-                                // 没刮到的作品，code 就是文件名：去掉扩展名再显示，长名字最多两行
-                                text = d.work.displayTitle ?: d.work.code.substringBeforeLast('.', d.work.code),
-                                style = MaterialTheme.typography.titleMedium,
                                 maxLines = 2,
                                 overflow = TextOverflow.Ellipsis,
-                                modifier = Modifier.weight(1f, fill = false),
+                                modifier = Modifier.weight(1f),
                             )
                             IconButton(
                                 enabled = !translatingTitle,
@@ -284,6 +267,24 @@ fun WorkDetailScreen(
                                     modifier = Modifier.size(18.dp),
                                 )
                             }
+                        }
+                        if (!d.work.scraped) {
+                            Text(
+                                text = "元数据还没刮到，可点右上角「刮削这部」重试",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error,
+                                modifier = Modifier.padding(top = 2.dp),
+                            )
+                        }
+                        // 有标题（刮到的原名或译名）才占一行：没有的时候上面那串就是唯一的名字，再显示一遍是重复
+                        d.work.displayTitle?.let { title ->
+                            Text(
+                                text = title,
+                                style = MaterialTheme.typography.titleMedium,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.padding(top = 6.dp),
+                            )
                         }
                         // 信息网格：发行日期 / 时长 / 片商 / 系列
                         val info = buildList {
