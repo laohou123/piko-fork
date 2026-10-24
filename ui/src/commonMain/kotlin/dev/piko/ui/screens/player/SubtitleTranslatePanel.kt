@@ -190,11 +190,13 @@ internal fun SubtitleTranslatePanel(
 }
 
 @Composable
-private fun HintLine(text: String, isError: Boolean = false) {
+private fun HintLine(text: String, isError: Boolean = false, maxLines: Int = Int.MAX_VALUE) {
     Text(
         text = text,
         style = MaterialTheme.typography.bodySmall,
         color = if (isError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+        maxLines = maxLines,
+        overflow = TextOverflow.Ellipsis,
         modifier = Modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 6.dp),
     )
 }

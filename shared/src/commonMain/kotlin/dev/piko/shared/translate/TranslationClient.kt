@@ -147,8 +147,12 @@ class TranslationClient(
         val parsed = runCatching { json.decodeFromString(ChatResponse.serializer(), body) }.getOrNull()
         val content = parsed?.choices?.firstOrNull()?.message?.content
         if (content.isNullOrBlank()) {
-            // 有的中转站把错误也塞在 200 里，这里把原始响应前一段带上方便排查
-            throw TranslationException("翻译接口没有返回内容：${body.take(160)}", retryable = true)
+            // 有的中转站把错误塞在 200 里：原文进日志，界面上说清这是服务端的问题
+            PikoLog.w(TAG, "翻译接口返回空内容：${body.take(2_000)}")
+            throw TranslationException(
+                "翻译接口返回了空内容（服务端问题，不是网络断了）\n原始响应：${body.trim().take(200)}",
+                retryable = true,
+            )
         }
         content
     }
@@ -161,6 +165,9 @@ class TranslationClient(
     }
 
     private fun describeStatus(status: HttpStatusCode, body: String): String {
+        // 完整响应先进日志：服务商给的错误往往只有一两个字的码（例如 "wb6"），
+        // 界面里再截断就更没线索了，日志里留着原文，排查时翻得到
+        PikoLog.w(TAG, "翻译接口返回 ${status.value}：${body.take(2_000)}")
         val detail = runCatching {
             json.parseToJsonElement(body).let { element ->
                 (element as? kotlinx.serialization.json.JsonObject)
@@ -169,13 +176,17 @@ class TranslationClient(
                     ?.get("message")
                     ?.toString()?.trim('"')
             }
-        }.getOrNull() ?: body.take(120)
-        return when (status.value) {
-            401, 403 -> "翻译接口拒绝访问（${status.value}），检查 API Key：$detail"
-            404 -> "翻译接口地址不对（404），检查 Base URL：$detail"
+        }.getOrNull()?.takeIf { it.isNotBlank() } ?: body.trim().take(200)
+        // 第一行说人话（是哪一类问题），第二行放服务端原话，方便对照文档
+        val head = when (status.value) {
+            401, 403 -> "翻译接口拒绝访问（${status.value}），检查 API Key 与账户余额"
+            404 -> "翻译接口地址不对（404），检查 Base URL"
             429 -> "翻译接口限流（429），稍后会自动重试"
-            else -> "翻译接口出错（${status.value}）：$detail"
+            400 -> "翻译接口不接受这次请求（400），多半是模型名或内容被拒"
+            413 -> "请求内容太长（413），可减少并发后重试"
+            else -> "翻译接口出错（${status.value}）"
         }
+        return if (detail.isBlank()) head else "$head\n服务端说明：$detail"
     }
 
     private companion object {
