@@ -60,10 +60,17 @@
 
 模型自己填，不绑定厂商：DeepSeek、OpenAI、通义、任意中转站、本地 Ollama／LM Studio，只要兼容 `POST /chat/completions`。
 
+**字幕搜索**（详情页 → 字幕）
+
+- 没有中文字幕时，列表里照样列出「中文（简体）」这一行，右边是**翻译**而不是下载
+- 点一下 App 照站点自己的做法翻一份（跳过序号与时间轴，按 500 字一批）并把译文传回站点存档，过几分钟重新搜索就能下载
+- 站点用的是 Google 免费翻译接口：本机连不上时会改挂到站点队列，并说明原因
+
 **字幕翻译**（播放页 → 字幕面板 → AI 翻译字幕）
 
 - 译文命名 `<编号>.zh.srt`，传回视频所在目录并当场挂载，换设备也能直接用
 - 管线四层保护：按字数分批且**不切断单条字幕**、**行数对齐校验**（对不上就逐条重翻）、并发 + 指数退避重试、第二轮串行补漏
+- 出错时提示分两行：第一行说哪一类问题（Key／地址／限流／模型名／余额／空响应），第二行附服务端原话与接口地址，点一下即可复制
 - 部分行失败时保留原文，不会出现空洞
 
 **片名翻译**
@@ -83,7 +90,7 @@
 
 到 [Releases](../../releases/latest) 下载安装包。
 
-- **Android**：`piko-1.3.8-universal.apk`，Android 8.0+，约 40 MB（含三 ABI 的 libmpv）
+- **Android**：`piko-1.3.9-universal.apk`，Android 8.0+，约 40 MB（含三 ABI 的 libmpv）
 - **桌面端**：Windows／macOS／Linux 构建方式见下方「从源码构建」
 
 > 本分支的包名是 `dev.piko.fork`，官方版是 `dev.piko`，两者签名也不同，因此**可以同时安装、各自独立运行**。
@@ -110,8 +117,8 @@ export ANDROID_KEYSTORE_PATH=/path/to/release.jks
 export ANDROID_KEYSTORE_PASSWORD='<your-store-password>'
 export ANDROID_KEY_ALIAS='<your-key-alias>'
 export ANDROID_KEY_PASSWORD='<your-key-password>'
-export PIKO_VERSION_NAME=1.3.8
-export PIKO_VERSION_CODE=10308
+export PIKO_VERSION_NAME=1.3.9
+export PIKO_VERSION_CODE=10309
 ./gradlew :app:assembleRelease -Ppiko.enableAbiSplits=false
 ```
 

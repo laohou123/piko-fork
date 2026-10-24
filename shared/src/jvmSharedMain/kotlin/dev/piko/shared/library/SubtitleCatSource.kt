@@ -5,13 +5,20 @@ import dev.piko.shared.log.PikoLog
 import io.ktor.client.HttpClient
 import io.ktor.client.request.get
 import io.ktor.client.request.header
+import io.ktor.client.request.post
+import io.ktor.client.request.setBody
 import io.ktor.client.statement.HttpResponse
 import io.ktor.client.statement.bodyAsBytes
+import io.ktor.client.statement.bodyAsText
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.encodeURLPathPart
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import org.jsoup.Jsoup
+import java.net.URLEncoder
 import java.nio.charset.Charset
 import java.nio.charset.CodingErrorAction
 import java.nio.charset.StandardCharsets
@@ -78,7 +85,10 @@ class SubtitleCatSource(
 
         val candidates = mutableListOf<SubtitleCandidate>()
         val seen = mutableSetOf<String>()
-        val translatable = mutableListOf<String>()
+        // 站点把「能翻但还没人翻」的语言也列出来（一百多个），全列出来会刷屏，
+        // 所以只有中文进列表当一行，其余的只报个总数
+        val translatable = mutableListOf<SubtitleCandidate>()
+        var otherTranslatable = 0
 
         for (block in doc.select("div.sub-single")) {
             val code = block.selectFirst("img.flag")?.attr("alt")?.trim()?.takeIf { LANG_CODE.matches(it) }.orEmpty()
@@ -102,15 +112,27 @@ class SubtitleCatSource(
                     candidates.add(
                         SubtitleCandidate(
                             language = language,
-                            label = label.ifEmpty { language },
+                            label = friendlyLabel(language, label),
                             path = path,
                         ),
                     )
                 }
                 continue
             }
-            // 没有下载链接：这个语言站点上还没有，只是能翻译
-            if (code.isNotEmpty() && label.isNotEmpty()) translatable.add(label)
+            // 没有下载链接：站点上还没有这个语言，页面上给的是 Translate 按钮。
+            // 按钮里带着翻译要用的三样东西——目标语言码、原始字幕名、字幕所在目录。
+            if (code.isEmpty()) continue
+            val origin = translateOrigin(block)
+            if (origin == null) { otherTranslatable++; continue }
+            val originPath = normalizeSubsPath("${origin.folder.trimEnd('/')}/${origin.file}")
+            if (originPath == null) { otherTranslatable++; continue }
+            val entry = SubtitleCandidate(
+                language = code,
+                label = friendlyLabel(code, label),
+                path = originPath,
+                translatable = true,
+            )
+            if (code.startsWith("zh")) translatable.add(entry) else otherTranslatable++
         }
 
         // 原始字幕摆在详情页旁边，规律固定，拼出来放最前面
@@ -120,9 +142,31 @@ class SubtitleCatSource(
         }
 
         val name = doc.selectFirst("title")?.text()?.trim().orEmpty()
-        PikoLog.i(TAG, "详情 $clean：${candidates.size} 个可下")
-        return SubtitleDetail(name = name, candidates = candidates, translatable = translatable)
+        // 中文可翻译的排在可下载的后头：先给现成的，没有再让它翻
+        val all = candidates + translatable
+        PikoLog.i(TAG, "详情 $clean：${candidates.size} 个可下，中文可翻 ${translatable.size} 个，其它可翻 $otherTranslatable 种")
+        return SubtitleDetail(name = name, candidates = all, translatableCount = otherTranslatable)
     }
+
+    /** 站点上写的是英文语言名，中文那几条换成中文说法，看着顺一点。 */
+    private fun friendlyLabel(code: String, siteLabel: String): String {
+        if (!code.startsWith("zh")) return siteLabel.ifEmpty { code }
+        return when (code) {
+            "zh-CN", "zh-Hans", "zh" -> "中文（简体）"
+            "zh-TW", "zh-HK", "zh-Hant" -> "中文（繁体）"
+            else -> "中文"
+        }
+    }
+
+    /** 从 Translate 按钮的 onclick 里取「语言码、原始字幕名、目录」三样。 */
+    private fun translateOrigin(block: org.jsoup.nodes.Element): TranslateOrigin? {
+        val onclick = block.selectFirst("button[onclick*=translate_from_server_folder]")
+            ?.attr("onclick").orEmpty()
+        val args = TRANSLATE_CALL.find(onclick) ?: return null
+        return TranslateOrigin(file = args.groupValues[2], folder = args.groupValues[3])
+    }
+
+    private class TranslateOrigin(val file: String, val folder: String)
 
     override suspend fun download(path: String): ByteArray? {
         val clean = normalizeSubsPath(path) ?: return null
@@ -133,6 +177,164 @@ class SubtitleCatSource(
         val raw = getBytes(clean) ?: return null
         return decodeSubtitleText(raw)
     }
+
+    override suspend fun requestTranslation(candidate: SubtitleCandidate): String? {
+        if (!candidate.translatable) return "这一条已经能直接下载了"
+        val origPath = normalizeSubsPath(candidate.path) ?: return "拿不到原始字幕的路径"
+        val raw = download(origPath) ?: return "站点上找不到原始字幕，没法翻译"
+        val text = raw.toString(Charsets.UTF_8)
+        if (text.isBlank()) return "原始字幕是空的，没法翻译"
+
+        val target = candidate.language
+        val fileName = origPath.substringAfterLast('/').replace(ORIG_SUFFIX, ".srt")
+        PikoLog.i(TAG, "请求翻译 $origPath → $target")
+
+        val result = translateByBatches(text, target)
+        if (result == null) {
+            // 站点网页用的就是 Google 的免费接口：本机访问不到，就照它那样翻不出来。
+            // 退一步把任务挂到站点的共享队列上——那边有别的访客的浏览器能翻
+            return if (enqueueSharedTranslation(text, target)) {
+                "本机连不上站点用的翻译接口，已把这一条挂到站点队列，过几分钟重新搜索看看"
+            } else {
+                "翻不了：站点用的免费翻译接口（translate.googleapis.com）本机连不上，可到网站上点 Translate"
+            }
+        }
+        val error = uploadTranslation(fileName, result.first, target, result.second)
+        return error ?: "已把译好的字幕传回站点，过几分钟重新搜索就能下载"
+    }
+
+    /**
+     * 照站点网页的做法翻一份字幕：跳过序号与时间轴，其余按 500 字一批送去翻译。
+     * 返回「译文全文 + 源语言」，翻译接口连不上时给 null。
+     */
+    private suspend fun translateByBatches(text: String, target: String): Pair<String, String>? {
+        val lines = text.split('\n')
+        val out = lines.toMutableList()
+        val batches = mutableListOf<List<Int>>()
+        var current = mutableListOf<Int>()
+        var chars = 0
+        for (i in lines.indices) {
+            val line = lines[i]
+            // 序号行与时间轴不翻：翻了反而对不上格式
+            if (line.isBlank() || STRUCTURAL_LINE.matches(line)) continue
+            if (chars + line.length + 1 >= BATCH_CHARS && current.isNotEmpty()) {
+                batches.add(current)
+                current = mutableListOf()
+                chars = 0
+            }
+            current.add(i)
+            chars += line.length + 1
+        }
+        if (current.isNotEmpty()) batches.add(current)
+        if (batches.isEmpty()) return null
+
+        var sourceLanguage = ""
+        for (batch in batches) {
+            val input = batch.joinToString("\n") { lines[it].sanitize() }
+            val translated = googleTranslate(input, target)
+            if (translated == null) {
+                PikoLog.w(TAG, "翻译接口不可用，中止这一轮")
+                return null
+            }
+            sourceLanguage = translated.second.ifEmpty { sourceLanguage }
+            val parts = translated.first.split('\n')
+            if (parts.size == batch.size) {
+                batch.forEachIndexed { k, index -> out[index] = parts[k] }
+            } else {
+                // 行数对不上就逐行翻，宁可多请求几次也不能让字幕错位
+                for (index in batch) {
+                    val one = googleTranslate(lines[index].sanitize(), target) ?: return null
+                    out[index] = one.first
+                }
+            }
+        }
+        return out.joinToString("\n") to sourceLanguage
+    }
+
+    /** 站点网页就是这么调的：client=gtx 的免费接口。返回「译文 + 源语言」。 */
+    private suspend fun googleTranslate(text: String, target: String): Pair<String, String>? {
+        if (text.isBlank()) return "" to ""
+        val url = GOOGLE_TRANSLATE +
+            "?client=gtx&sl=auto&tl=${URLEncoder.encode(target, "UTF-8")}" +
+            "&dt=t&q=${URLEncoder.encode(text, "UTF-8")}"
+        return runSuspendCatching {
+            val response: HttpResponse = http.get(url) { header("User-Agent", USER_AGENT) }
+            if (response.status != HttpStatusCode.OK) {
+                PikoLog.w(TAG, "翻译接口 HTTP ${response.status.value}")
+                null
+            } else {
+                val body = response.bodyAsText()
+                val root = Json.parseToJsonElement(body) as? JsonArray
+                val segments = root?.getOrNull(0) as? JsonArray
+                val value = segments?.joinToString("") { (it as? JsonArray)?.getOrNull(0).textOrEmpty() }
+                val from = root?.getOrNull(2).textOrEmpty()
+                if (value.isNullOrEmpty()) null else value to from
+            }
+        }.getOrElse { error ->
+            PikoLog.w(TAG, "翻译请求失败：${error.message}")
+            null
+        }
+    }
+
+    private fun JsonElement?.textOrEmpty(): String =
+        (this as? kotlinx.serialization.json.JsonPrimitive)?.content ?: ""
+
+    /** 把译文传回站点存档：传完之后这个语言就跟其它语言一样能搜到、能下载。 */
+    private suspend fun uploadTranslation(
+        fileName: String,
+        content: String,
+        language: String,
+        origLanguage: String,
+    ): String? {
+        val body = listOf(
+            "filename" to fileName,
+            "content" to content,
+            "language" to language,
+            "orig_language" to origLanguage,
+            "private_id" to "0",
+        ).joinToString("&") { (key, value) ->
+            "${URLEncoder.encode(key, "UTF-8")}=${URLEncoder.encode(value, "UTF-8")}"
+        }
+        awaitTurn()
+        return runSuspendCatching {
+            val response: HttpResponse = http.post(base + "/upload_subtitles.php") {
+                header("User-Agent", USER_AGENT)
+                header("Content-Type", "application/x-www-form-urlencoded")
+                setBody(body)
+            }
+            val text = response.bodyAsText()
+            if (response.status != HttpStatusCode.OK || text.contains("error", ignoreCase = true)) {
+                PikoLog.w(TAG, "上传译文失败 ${response.status.value}：$text")
+                "传回站点失败（${response.status.value}）"
+            } else {
+                null
+            }
+        }.getOrElse { error ->
+            PikoLog.w(TAG, "上传译文异常：${error.message}")
+            "传回站点失败：${error.message}"
+        }
+    }
+
+    /** 本机翻不动时的退路：挂到站点的共享队列，让别人（或网站自己）去翻。 */
+    private suspend fun enqueueSharedTranslation(text: String, target: String): Boolean {
+        val body = listOf(
+            "content" to text.take(SHARED_LIMIT),
+            "to_language" to target,
+        ).joinToString("&") { (key, value) ->
+            "${URLEncoder.encode(key, "UTF-8")}=${URLEncoder.encode(value, "UTF-8")}"
+        }
+        awaitTurn()
+        return runSuspendCatching {
+            val response: HttpResponse = http.post(base + "/request_shared_translation.php") {
+                header("User-Agent", USER_AGENT)
+                header("Content-Type", "application/x-www-form-urlencoded")
+                setBody(body)
+            }
+            response.status == HttpStatusCode.OK && !response.bodyAsText().contains("error", ignoreCase = true)
+        }.getOrElse { false }
+    }
+
+    private fun String.sanitize(): String = replace(FONT_OPEN, "").replace(FONT_CLOSE, "").replace("&", "and")
 
     // ---------------------------------------------------------------- 网络层
 
@@ -305,6 +507,19 @@ class SubtitleCatSource(
         private const val USER_AGENT =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
         private const val ACCEPT = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+
+        /** 详情页 Translate 按钮：translate_from_server_folder('语言码', '原名-orig.srt', '/subs/1234/') */
+        private val TRANSLATE_CALL =
+            Regex("""translate_from_server_folder\(\s*'([^']*)'\s*,\s*'([^']*)'\s*,\s*'([^']*)'""")
+        private val ORIG_SUFFIX = Regex("-orig\\.srt$", RegexOption.IGNORE_CASE)
+        /** 序号行与时间轴：原样保留，不送去翻译。 */
+        private val STRUCTURAL_LINE = Regex("""^[0-9 \r]*$|^[0-9,: ]*-->[0-9,: \r]*$""")
+        private val FONT_OPEN = Regex("<font[^>]*>", RegexOption.IGNORE_CASE)
+        private val FONT_CLOSE = Regex("</font>", RegexOption.IGNORE_CASE)
+        private const val GOOGLE_TRANSLATE = "https://translate.googleapis.com/translate_a/single"
+        /** 与站点网页一致：一批 500 字，太少请求多、太多接口拒。 */
+        private const val BATCH_CHARS = 500
+        private const val SHARED_LIMIT = 4_000
 
         /** 语言代码形如 en、zh-CN。 */
         private val LANG_CODE = Regex("^[A-Za-z][A-Za-z0-9-]{0,11}$")

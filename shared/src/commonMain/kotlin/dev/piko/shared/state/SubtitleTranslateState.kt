@@ -95,7 +95,7 @@ class SubtitleTranslateState(
                 stage = Stage.TRANSLATING
                 val translated = translator.translate(source) { p -> progress = p }
                     .getOrElse { e ->
-                        error = readableTranslationError(e)
+                        error = atStage(readableTranslationError(e))
                         return@launch
                     }
 
@@ -112,7 +112,7 @@ class SubtitleTranslateState(
                     return@launch
                 }
                 when (val outcome = uploads.enqueue(UploadSelection(files = listOf(uri)), folder.first, folder.second)) {
-                    is UploadEnqueueResult.Rejected -> error = outcome.reason
+                    is UploadEnqueueResult.Rejected -> error = atStage(outcome.reason)
                     is UploadEnqueueResult.Accepted -> {
                         val fileId = awaitUpload(fileName)
                         if (fileId != null) {
@@ -120,7 +120,7 @@ class SubtitleTranslateState(
                             browser.reload()
                             onUploaded(fileId, fileName)
                         } else {
-                            error = "译文上传失败或超时，可在「从网盘选择字幕」里看看是否已传上去"
+                            error = atStage("译文上传失败或超时，可在「从网盘选择字幕」里看看是否已传上去")
                         }
                     }
                 }
@@ -128,7 +128,7 @@ class SubtitleTranslateState(
                 throw e
             } catch (e: Throwable) {
                 PikoLog.w(TAG, "翻译字幕失败", e)
-                error = readableTranslationError(e)
+                error = atStage(readableTranslationError(e))
             } finally {
                 stage = Stage.IDLE
                 translatingId = null
@@ -158,11 +158,38 @@ class SubtitleTranslateState(
         }
     }
 
-    /** 出错时的可见提示：有话就照说，没话就把异常类型带上（类型名已排除混淆，是可读的）。 */
+    /**
+     * 给错误加上阶段。
+     *
+     * 界面上统一是「翻译失败：……」，不标阶段的话，网盘上传那一步的错也会被当成翻译接口的错，
+     * 照着错误的方向查半天。标明「翻译阶段 / 上传阶段」一眼就能分清楚。
+     */
+    private fun atStage(message: String): String = when (stage) {
+        Stage.TRANSLATING -> "翻译阶段：$message"
+        Stage.UPLOADING -> "上传阶段：$message"
+        Stage.DOWNLOADING -> "下载阶段：$message"
+        Stage.IDLE -> message
+    }
+
+    /**
+     * 出错时的可见提示。
+     *
+     * 光把 message 拿出来不够：有的错误 message 只是一两个字的码（服务端短码、或混淆后的类名），
+     * 单独看根本查不出来源。所以类型名也带上，并顺着 cause 链往上列几层——
+     * 「XxxException：o86 ← IOException：timeout」这种形式，一眼看得出卡在哪一步。
+     */
     private fun readableTranslationError(e: Throwable): String {
-        val message = e.message?.trim().orEmpty()
-        if (message.isNotBlank()) return message
-        return "翻译失败（${e::class.simpleName ?: "未知异常"}）"
+        val parts = mutableListOf<String>()
+        var cursor: Throwable? = e
+        var depth = 0
+        while (cursor != null && depth < 4) {
+            val name = cursor::class.simpleName ?: "异常"
+            val message = cursor.message?.trim().orEmpty()
+            parts += if (message.isEmpty()) name else "$name：$message"
+            cursor = cursor.cause
+            depth++
+        }
+        return parts.joinToString(" ← ")
     }
 
     private suspend fun awaitUpload(fileName: String): String? {

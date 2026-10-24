@@ -156,6 +156,34 @@ class SubtitleSearchState(
         }
     }
 
+    /**
+     * 站点上还没有这个语言（页面给的是 Translate 按钮），请站点把它翻出来。
+     * 翻好之后传回站点存档，用户过几分钟重新搜索就能下载——所以这里只报告结果，不接着下载。
+     */
+    fun requestTranslation(candidate: SubtitleCandidate) {
+        if (!candidate.translatable || savingPath != null) return
+        scope.launch {
+            savingPath = candidate.path
+            error = null
+            result = null
+            try {
+                val failure = source.requestTranslation(candidate)
+                if (failure == null) {
+                    result = "已把译好的「${candidate.label}」传回站点，过几分钟重新搜索就能下载"
+                } else {
+                    error = failure
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                PikoLog.w(TAG, "请求站点翻译失败", e)
+                error = e.message ?: "请求翻译失败"
+            } finally {
+                savingPath = null
+            }
+        }
+    }
+
     fun consumeResult() {
         result = null
     }

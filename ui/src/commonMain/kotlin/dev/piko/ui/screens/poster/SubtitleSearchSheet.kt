@@ -179,7 +179,12 @@ private fun DetailList(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clickable(enabled = state.savingPath == null) {
-                        state.download(candidate, code, targetFolderId, targetFolderName)
+                        if (candidate.translatable) {
+                            // 站点上还没有这个语言：请站点翻一份，过几分钟再搜就能下载
+                            state.requestTranslation(candidate)
+                        } else {
+                            state.download(candidate, code, targetFolderId, targetFolderName)
+                        }
                     }
                     .padding(horizontal = 4.dp, vertical = 12.dp),
             ) {
@@ -200,17 +205,21 @@ private fun DetailList(
                     CircularProgressIndicator(modifier = Modifier.size(20.dp))
                 } else {
                     Text(
-                        text = if (candidate.original) "原始" else "下载",
+                        text = when {
+                            candidate.translatable -> "翻译"
+                            candidate.original -> "原始"
+                            else -> "下载"
+                        },
                         style = MaterialTheme.typography.labelLarge,
                         color = MaterialTheme.colorScheme.primary,
                     )
                 }
             }
         }
-        if (detail.translatable.isNotEmpty()) {
+        if (detail.candidates.none { it.translatable } && detail.translatableCount > 0) {
             item {
                 Text(
-                    text = "站点还支持翻译成：${detail.translatable.joinToString("、")}（需去网站请求）",
+                    text = "站点还支持翻译成 ${detail.translatableCount} 种语言，可到网站上请求",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(vertical = 12.dp),

@@ -118,10 +118,28 @@ class TranslationClient(
             }
             lastError = error
         }
-        throw lastError ?: TranslationException("翻译请求失败：地址不可用")
+        throw lastError ?: TranslationException("翻译请求失败：地址不可用（${endpointsToTry().firstOrNull()}）")
     }
 
-    private suspend fun runPOST(endpoint: String, payload: String): Result<String> = runSuspendCatching {
+    private suspend fun runPOST(endpoint: String, payload: String): Result<String> {
+        val result = runPOST0(endpoint, payload)
+        val cause = result.exceptionOrNull()
+        // 网络层/解析层的异常原样往上抛，界面上常常只剩一串看不懂的短码。
+        // 这里补上请求地址与异常类型，并挂进 cause 链，排查时一眼看得出卡在哪一步
+        return if (cause != null && cause !is TranslationException) {
+            Result.failure(
+                TranslationException(
+                    message = "请求翻译接口失败（$endpoint）：${cause::class.simpleName} ${cause.message}",
+                    retryable = true,
+                    cause = cause,
+                ),
+            )
+        } else {
+            result
+        }
+    }
+
+    private suspend fun runPOST0(endpoint: String, payload: String): Result<String> = runSuspendCatching {
         // 超时当失败返回。用 withTimeoutOrNull 而不是 withTimeout：后者抛 CancellationException，
         // 会被上层当成「调用方自己被取消」，一路静默中止整批翻译
         val response: HttpResponse? = withTimeoutOrNull(timeoutMillis) {
@@ -138,7 +156,7 @@ class TranslationClient(
             val rejectedReasoning = response.status.value == 400 &&
                 body.contains("reasoning", ignoreCase = true)
             throw TranslationException(
-                message = describeStatus(response.status, body),
+                message = describeStatus(response.status, body, endpoint),
                 retryable = response.status.value == 429 || response.status.value >= 500,
                 notFound = response.status == HttpStatusCode.NotFound,
                 reasoningRejected = rejectedReasoning,
@@ -150,7 +168,7 @@ class TranslationClient(
             // 有的中转站把错误塞在 200 里：原文进日志，界面上说清这是服务端的问题
             PikoLog.w(TAG, "翻译接口返回空内容：${body.take(2_000)}")
             throw TranslationException(
-                "翻译接口返回了空内容（服务端问题，不是网络断了）\n原始响应：${body.trim().take(200)}",
+                "翻译接口返回了空内容（服务端问题，不是网络断了）\n接口地址：$endpoint\n原始响应：${body.trim().take(200)}",
                 retryable = true,
             )
         }
@@ -164,7 +182,7 @@ class TranslationClient(
         else -> listOf("$base/chat/completions", "$base/v1/chat/completions")
     }
 
-    private fun describeStatus(status: HttpStatusCode, body: String): String {
+    private fun describeStatus(status: HttpStatusCode, body: String, endpoint: String): String {
         // 完整响应先进日志：服务商给的错误往往只有一两个字的码（例如 "wb6"），
         // 界面里再截断就更没线索了，日志里留着原文，排查时翻得到
         PikoLog.w(TAG, "翻译接口返回 ${status.value}：${body.take(2_000)}")
@@ -193,7 +211,7 @@ class TranslationClient(
         }
         // 服务端原话整段给出：错误只有一两个字的码时（如 "o86"），只取 error.message 会漏掉上下文
         val raw = body.trim().take(500)
-        return "$head\n服务端响应：$raw"
+        return "$head\n接口地址：$endpoint\n服务端响应：$raw"
     }
 
     private companion object {
@@ -222,7 +240,8 @@ class TranslationException(
     val notFound: Boolean = false,
     /** 400 且响应里提到 reasoning：说明接口不认这个参数，去掉重试即可。 */
     val reasoningRejected: Boolean = false,
-) : Exception(message)
+    cause: Throwable? = null,
+) : Exception(message, cause)
 
 @Serializable
 private data class ChatMessage(val role: String, val content: String)

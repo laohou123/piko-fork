@@ -13,6 +13,15 @@ interface SubtitleSource {
 
     /** 下载一个字幕文件，返回 UTF-8 字节（站点上有少量非 UTF-8 的老上传，实现里转码）。 */
     suspend fun download(path: String): ByteArray?
+
+    /**
+     * 请站点把某个语言翻出来：[candidate] 必须是 [SubtitleCandidate.translatable] 的条目。
+     *
+     * 站点自己不翻——它的网页是拿原始字幕在浏览器里调免费翻译，再把译文传回站点存档。
+     * 这里照做同一套动作，传回去之后这个语言就跟其它语言一样能搜到、能下载了。
+     * 翻译与上传都要等站点处理，返回 null 表示成功，否则是失败原因。
+     */
+    suspend fun requestTranslation(candidate: SubtitleCandidate): String? = "这个字幕源不支持请求翻译"
 }
 
 /** 搜索结果里的一行。 */
@@ -23,7 +32,7 @@ data class SubtitleHit(
     val sizeKb: Int = 0,
 )
 
-/** 详情页里一个可下载的字幕文件。 */
+/** 详情页里一个字幕条目。 */
 data class SubtitleCandidate(
     /** 语言标签，如 zh-CN、ja、orig（原始语言）。 */
     val language: String,
@@ -33,11 +42,16 @@ data class SubtitleCandidate(
     val path: String,
     /** 是不是详情页推导出的原始字幕（-orig.srt）。 */
     val original: Boolean = false,
+    /**
+     * 站点上还没有这个语言的文件，只能请求翻译。
+     * 此时 [path] 是原始字幕的路径——翻译就是从它出发，翻完再传回站点。
+     */
+    val translatable: Boolean = false,
 )
 
 data class SubtitleDetail(
     val name: String,
     val candidates: List<SubtitleCandidate>,
-    /** 站点还支持、但还没人上传的语言（提示用户可以去网站请求翻译）。 */
-    val translatable: List<String> = emptyList(),
+    /** 站点还支持、但还没人上传的语言有多少种（中文已经单独列成一行，这里只报数）。 */
+    val translatableCount: Int = 0,
 )
