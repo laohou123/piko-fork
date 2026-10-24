@@ -92,6 +92,13 @@ Release 正文由 `release.yml` 按 `.github/release-notes.md` 生成：`## 下�
 现象或行为变化，不写文件名、类型名与提交标题，读者看不到的重构不写。`## 修复` 只列已发布版本里存在的问题：
 本次新增的功能在发布前出过又修掉的问题，读者从未遇到，不列。写之前先读上一个版本的正文，保持一致。
 
+## 本分支的发布渠道
+
+成品只发 GitHub Release：源码推 `main`，`piko-<版本>-{universal,arm64-v8a,armeabi-v7a,x86_64}.apk` 挂到对应 tag 的
+Release 上，App 内的检查更新从这里取（按 ABI 挑包，见 `AppUpdater.pickApk`）。
+
+**不再往 FTP 传包**：2026-10 期间用过一段时间，现在已停用，交付时不要再上传。
+
 ## 架构
 
 四个模块：`shared`（状态与业务，commonMain + android/desktop 两个 target）、`ui`（共享界面，
