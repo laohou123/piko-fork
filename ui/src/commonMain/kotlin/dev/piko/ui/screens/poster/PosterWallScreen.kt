@@ -153,7 +153,13 @@ fun PosterWallScreen(
                 title = "海报墙",
                 onBackClick = onBackClick,
                 actions = listOf(
-                    iconBarItem(Icons.Outlined.Search, "搜索影片", onClick = { state.setSearchOpen(true) }, priority = 2),
+                    // 再点一次收起：之前只会打开，想把搜索框收起来只能去点框里的 X
+                    iconBarItem(
+                        Icons.Outlined.Search,
+                        if (state.searchActive) "收起搜索" else "搜索影片",
+                        onClick = { state.setSearchOpen(!state.searchActive) },
+                        priority = 2,
+                    ),
                     iconBarItem(Icons.Outlined.FolderOpen, "扫描目录", onClick = { showScrapeDialog = true }, priority = 1),
                     iconBarItem(Icons.Outlined.AutoAwesome, "补刮元数据", priority = 1, enabled = !state.enriching, onClick = { state.enrich() }),
                     iconBarItem(Icons.Outlined.Refresh, "重新扫描", priority = 0, enabled = state.phase != PosterWallState.Phase.SCANNING, onClick = { state.startScan() }),
@@ -420,20 +426,18 @@ private fun FilterRow(
                 )
             },
         )
-        // 已选中某个演员时再点一次是「取消筛选」（回全部），不再弹列表；
-        // 没选中时才设好类型并弹列表。选中态看 filterName 而不是只看类型，
-        // 否则弹了列表又直接关掉会留下一个高亮却没筛选的假状态。
+        // 每次点击都展开列表：已经按某个演员筛过时再点，是"换一个"而不是取消筛选；
+        // 取消筛选走「全部」。所以只在类型不对时才改 filter（改类型会把名字清掉，
+        // 已选中时保持现状直接弹列表）。
         FixedFilterChip(
             modifier = Modifier.weight(1f),
             selected = state.filter == PosterWallState.Filter.ACTOR && state.filterName != null,
             label = state.filterName?.takeIf { state.filter == PosterWallState.Filter.ACTOR } ?: "演员",
             onClick = {
-                if (state.filter == PosterWallState.Filter.ACTOR && state.filterName != null) {
-                    state.selectFilter(PosterWallState.Filter.ALL)
-                } else {
+                if (state.filter != PosterWallState.Filter.ACTOR) {
                     state.selectFilter(PosterWallState.Filter.ACTOR)
-                    onOpenFilterSheet()
                 }
+                onOpenFilterSheet()
             },
         )
         FixedFilterChip(
@@ -441,12 +445,10 @@ private fun FilterRow(
             selected = state.filter == PosterWallState.Filter.TAG && state.filterName != null,
             label = state.filterName?.takeIf { state.filter == PosterWallState.Filter.TAG } ?: "标签",
             onClick = {
-                if (state.filter == PosterWallState.Filter.TAG && state.filterName != null) {
-                    state.selectFilter(PosterWallState.Filter.ALL)
-                } else {
+                if (state.filter != PosterWallState.Filter.TAG) {
                     state.selectFilter(PosterWallState.Filter.TAG)
-                    onOpenFilterSheet()
                 }
+                onOpenFilterSheet()
             },
         )
     }
@@ -517,9 +519,18 @@ private fun SearchBar(
         runCatching { focusRequester.requestFocus() }
     }
     // 光标跟着输入框走而不是留在开头：搜索框收起再展开、或从详情页返回时组件重建，
-    // 值还在而内部的光标位置丢了，直接敲字会插到已有文字的最前面
-    var field by remember(query) {
+    // 值还在而内部的光标位置丢了，直接敲字会插到已有文字的最前面。
+    //
+    // 但 remember 的 key 不能是 query：输入会改 query，key 一变就把 field 整个重建，
+    // 光标被重置到末尾——表现就是"在中间删一个字，光标自己跳到后面"。
+    // 外部改 query（清空、点标签搜索）时由下面的 LaunchedEffect 同步，输入时两者本就一致。
+    var field by remember {
         mutableStateOf(TextFieldValue(query, selection = TextRange(query.length)))
+    }
+    LaunchedEffect(query) {
+        if (query != field.text) {
+            field = TextFieldValue(query, selection = TextRange(query.length))
+        }
     }
     OutlinedTextField(
         value = field,
@@ -528,8 +539,25 @@ private fun SearchBar(
         placeholder = { Text("搜索番号、标题、女优或标签") },
         leadingIcon = { Icon(Icons.Outlined.Search, contentDescription = null) },
         trailingIcon = {
-            IconButton(onClick = onClose) {
-                Icon(Icons.Filled.Close, contentDescription = "关闭搜索")
+            // 一个按钮两种用途：有字时先清空（搜索框留着继续输入），空着时才收起搜索框。
+            // 早先一律收起，想清空只能一个字一个字删。
+            val empty = field.text.isEmpty()
+            IconButton(
+                onClick = {
+                    if (empty) {
+                        onClose()
+                    } else {
+                        field = TextFieldValue("")
+                        onQueryChange("")
+                        // 清完把焦点还给输入框，接着打字不用再点一下
+                        runCatching { focusRequester.requestFocus() }
+                    }
+                },
+            ) {
+                Icon(
+                    Icons.Filled.Close,
+                    contentDescription = if (empty) "关闭搜索" else "清空搜索",
+                )
             }
         },
         modifier = Modifier
