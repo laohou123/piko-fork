@@ -707,13 +707,17 @@ private fun WorkPreview(
 private const val PreviewFallbackStartMillis = 30_000L
 
 /**
- * 预览起点：用番号哈希取 20%~45% 的时长位置。
+ * 预览起点：用番号哈希取 35%~45% 的时长位置。
  * 同一部片每次都落在同一处（稳定），不同片各不相同，像随手抓了一段正片。
+ *
+ * 区间比最早的 20%~45% 收窄且后移：中段靠前的部分不少片还在铺垫（对话、黑场、慢镜头），
+ * 后半段更有画面，挑片时看一眼更容易判断。
  */
 internal fun previewStartFor(code: String, durationMillis: Long): Long {
     if (durationMillis <= 0L) return PreviewFallbackStartMillis
     val bucket = ((code.hashCode().toLong() and 0x7FFFFFFFL) % 26L)   // 0..25
-    val fraction = 0.20 + bucket / 100.0                              // 0.20..0.45
+    // 26 个等分把 0.10 的区间切完：bucket=0 → 0.35，bucket=25 → 0.45
+    val fraction = 0.35 + bucket * 0.10 / 25.0
     return (durationMillis * fraction).toLong()
 }
 

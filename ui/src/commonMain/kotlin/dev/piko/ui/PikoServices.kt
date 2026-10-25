@@ -30,6 +30,7 @@ import dev.piko.shared.translate.TranslationGateway
 import dev.piko.shared.library.MetaTubeScraper
 import dev.piko.shared.library.SubtitleFileSaver
 import dev.piko.shared.library.SubtitleSource
+import dev.piko.shared.library.SubtitleSourceOption
 import dev.piko.shared.media.PikoMediaRepository
 import dev.piko.shared.state.ArchiveBrowser
 import dev.piko.shared.state.ArchiveExtractSession
@@ -89,8 +90,11 @@ class PikoServices(
      * 为 null 时海报墙只有扫描与列表，不能刮元数据、不能搜字幕。
      */
     scrapeHttpClientFactory: (() -> HttpClient)? = null,
-    /** 用 [scrapeHttpClientFactory] 的客户端建字幕源（SubtitleCat，jvmSharedMain 实现，各端入口传入）。 */
-    subtitleSourceFactory: ((HttpClient) -> SubtitleSource)? = null,
+    /**
+     * 用 [scrapeHttpClientFactory] 的客户端建字幕源列表（jvmSharedMain 里实现，各端入口传入）。
+     * 列表顺序就是面板里「字幕源」下拉的顺序，第一项是默认源。
+     */
+    subtitleSourceFactory: ((HttpClient) -> List<SubtitleSourceOption>)? = null,
     /**
      * 翻译用的 HTTP 客户端。单独一个是因为刮削/字幕客户端压了 30 秒超时，
      * 而一次翻 550 字可能要几十秒，用同一个会被自己的超时切断。
@@ -200,9 +204,13 @@ class PikoServices(
     val libraryScraper: LibraryScraper? = libraryStore?.let {
         scrapeHttpClientFactory?.let { http -> MetaTubeScraper(platformPreferences, http) }
     }
-    val subtitleSource: SubtitleSource? = scrapeHttpClientFactory?.let { http ->
+    /** 可搜的字幕源，面板上的「字幕源」下拉按这个列表铺；空列表表示这台机器上没有可用的源。 */
+    val subtitleSources: List<SubtitleSourceOption> = scrapeHttpClientFactory?.let { http ->
         subtitleSourceFactory?.invoke(http())
-    }
+    }.orEmpty()
+
+    /** 默认源（列表第一个）。旧调用点只认一个源时用它。 */
+    val subtitleSource: SubtitleSource? = subtitleSources.firstOrNull()?.source
     val subtitleSaver: SubtitleFileSaver? = subtitleSaver
 
     /**

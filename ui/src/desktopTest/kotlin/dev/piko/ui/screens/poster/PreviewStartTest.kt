@@ -5,7 +5,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 /**
- * 预览起点的规则：按番号哈希落在时长的 20%~45% 之间。
+ * 预览起点的规则：按番号哈希落在时长的 35%~45% 之间。
  *
  * 这条规则换过一次——最早固定从第 30 秒起播，结果所有片都停在同一个位置，
  * 有些片那里还是黑场。钉住三点：同一部片稳定、不同片散开、永远落在中段。
@@ -23,7 +23,7 @@ class PreviewStartTest {
     fun positionFallsInTheMiddleOfTheVideo() {
         listOf("SSIS-001", "IPX-192", "FC2-1234567", "ABC-123", "MIDE-999").forEach { code ->
             val fraction = previewStartFor(code, twoHours).toDouble() / twoHours
-            assertTrue(fraction in 0.20..0.45, "$code 落在 $fraction，超出 20%~45%")
+            assertTrue(fraction in 0.35..0.45, "$code 落在 $fraction，超出 35%~45%")
         }
     }
 

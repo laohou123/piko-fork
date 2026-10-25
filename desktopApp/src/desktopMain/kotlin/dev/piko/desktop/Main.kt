@@ -54,6 +54,8 @@ import dev.piko.download.DownloadStatus
 import dev.piko.download.DownloadTask
 import dev.piko.shared.data.FilePikoCacheStore
 import dev.piko.shared.library.SubtitleCatSource
+import dev.piko.shared.library.SubtitleSourceOption
+import dev.piko.shared.library.XunleiSubtitleSource
 import dev.piko.shared.sync.JvmSyncCipher
 import dev.piko.shared.scrape.MetaTubeService
 import io.ktor.client.HttpClient
@@ -584,7 +586,13 @@ private fun createServices(settings: DesktopSettingsStore, preferences: DesktopP
                 }
             }
         },
-        subtitleSourceFactory = { http -> SubtitleCatSource(http) },
+        // 字幕源按顺序排：第一个是面板默认选中的那个
+        subtitleSourceFactory = { http ->
+            listOf(
+                SubtitleSourceOption("subtitlecat", "SubtitleCat", SubtitleCatSource(http)),
+                SubtitleSourceOption("xunlei", "迅雷字幕", XunleiSubtitleSource(http)),
+            )
+        },
         translationHttpClientFactory = {
             // 翻译一次要几十秒，超时按分钟级给；真正的单批上限在 TranslationClient 里控
             HttpClient(OkHttp) {

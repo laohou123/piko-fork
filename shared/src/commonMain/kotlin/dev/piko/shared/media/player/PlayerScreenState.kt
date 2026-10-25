@@ -153,6 +153,20 @@ class PlayerScreenState(
 
     val audioTracks: List<MediaTrack> get() = backend.audioTracks
     val subtitleTracks: List<MediaTrack> get() = backend.subtitleTracks
+
+    /**
+     * 已经挂到播放器上的网盘字幕文件（标题 + 文件 id）。
+     *
+     * 「音轨与字幕」面板拿它给字幕行配一个删除按钮：面板里列的是 mpv 的轨道，
+     * 没有文件 id，靠标题对回这里的文件。
+     *
+     * 两类都算：与视频同名、开播时自动挂上的（[autoSubtitleFiles]，标题是「简」这类语言标签），
+     * 以及用户手动挂/刚下载的（[manualSubtitles]，标题是文件名）。本机字幕没有 fileId，不进来。
+     */
+    val driveSubtitleFiles: List<DriveSubtitleFile>
+        get() = (autoSubtitleFiles + manualSubtitles.mapNotNull { subtitle ->
+            subtitle.fileId?.let { DriveSubtitleFile(title = subtitle.title, fileId = it) }
+        }).distinctBy { it.fileId }
     val selectedAudioTrackId: String? get() = backend.selectedAudioTrackId
     val selectedSubtitleTrackId: String? get() = backend.selectedSubtitleTrackId
 
@@ -166,8 +180,13 @@ class PlayerScreenState(
 
     private var subtitleStreams: List<AutoCloseable> = emptyList()
 
-    // 用户手动挂上的字幕，只属于当前文件。换清晰度、重连、换到本地副本都要重开文件，每次 open 时一并带上
-    private var manualSubtitles: List<ManualSubtitle> = emptyList()
+    // 用户手动挂上的字幕，只属于当前文件。换清晰度、重连、换到本地副本都要重开文件，每次 open 时一并带上。
+    // 用 Compose state 而不是普通字段：面板里的删除按钮依赖 driveSubtitleFiles 跟着它变，
+    // 删完那一行要立刻消失
+    private var manualSubtitles by mutableStateOf<List<ManualSubtitle>>(emptyList())
+
+    /** 与视频同名、开播时自动挂上的字幕文件，见 [openSubtitles]；同样要能在面板里删掉。 */
+    private var autoSubtitleFiles by mutableStateOf<List<DriveSubtitleFile>>(emptyList())
 
     // 刚手动挂上、还没出现在轨道列表里的那条，出现后按用户亲手选择记下，见 init
     private var pendingManualTitle: String? = null
@@ -291,17 +310,26 @@ class PlayerScreenState(
     fun addDriveSubtitle(subtitleFileId: String, name: String) {
         val videoFileId = fileId
         scope.launch {
-            // 字幕是刚传上去的：网盘那边可能还没把文件放进目录、取不到下载链接。
-            // 一次打不开就等一会儿再试，别直接报「无法打开字幕文件」让用户手动挂
+            // 字幕是刚传上去的：网盘那边可能还没算好内容哈希（gcid），取流会直接失败。
+            // 一次打不开就等一会儿再试，别直接报「无法打开字幕文件」让用户手动挂。
+            //
+            // 用 for + break 而不是 repeat + return@repeat：后者只是跳过本轮，成功后仍会把
+            // 剩下几次全跑完，白白多发几个请求、多等几秒，字幕才挂上。
+            //
+            // 间隔逐次放宽：多数情况 1~2 秒就能取到流，头几次密一点体感更快；
+            // 真遇上服务端算 hash 慢（几十秒），后面放宽到 10 秒，总窗口约一分钟。
             var stream: ProxyStream? = null
-            repeat(SUBTITLE_OPEN_ATTEMPTS) { attempt ->
+            for (index in SUBTITLE_RETRY_DELAYS_MS.indices) {
                 stream = repository.prepareSubtitle(subtitleFileId)
-                if (stream != null) return@repeat
-                if (attempt < SUBTITLE_OPEN_ATTEMPTS - 1) delay(SUBTITLE_OPEN_RETRY_MS)
+                if (stream != null) break
+                // 第一次失败先不打扰；第二次还不行说明要等网盘，给一句进度，别让用户以为卡住
+                if (index == 1) _messages.tryEmit("字幕已上传，正在等待网盘就绪…")
+                if (index == SUBTITLE_RETRY_DELAYS_MS.lastIndex) break
+                delay(SUBTITLE_RETRY_DELAYS_MS[index])
             }
             if (stream == null) {
                 PikoLog.w(TAG, "字幕传上去了但打不开：$subtitleFileId")
-                _messages.tryEmit("字幕暂时打不开，可在「从网盘选择字幕」里手动挂")
+                _messages.tryEmit("字幕暂时打不开，可稍等几秒再进「网盘字幕」手动挂")
                 return@launch
             }
             // 取流期间换了集，这条字幕不属于新文件
@@ -315,8 +343,34 @@ class PlayerScreenState(
         }
     }
 
-    private fun attachManualSubtitle(subtitle: ExternalSubtitle) {
-        // 日志只留扩展名，文件名不进导出的日志
+    /**
+     * 删掉一条已挂的网盘字幕：[fileId] 来自 [driveSubtitleFiles]。
+     *
+     * 顺序有讲究——先卸轨道、再删文件：反过来会有一小段时间画面还在用已经取不到的流。
+     * 自动挂上的（[autoSubtitleFiles]）与手动挂的都走这一条。
+     * 网盘的删除是进回收站，删错了能捞回来。
+     */
+    fun deleteDriveSubtitle(fileId: String) {
+        val title = autoSubtitleFiles.firstOrNull { it.fileId == fileId }?.title
+            ?: manualSubtitles.firstOrNull { it.fileId == fileId }?.title
+            ?: return
+        scope.launch {
+            // 面板里的轨道靠标题对回文件；同名字幕挂过两次时按最后一条卸，与后挂的覆盖前面的行为一致
+            backend.subtitleTracks.lastOrNull { it.isExternal && it.title == title }?.let { track ->
+                backend.removeSubtitle(track.id)
+            }
+            autoSubtitleFiles = autoSubtitleFiles.filterNot { it.fileId == fileId }
+            manualSubtitles = manualSubtitles.filterNot { it.fileId == fileId }
+            repository.deleteFiles(listOf(fileId))
+                .onSuccess { _messages.tryEmit("已删除字幕 $title") }
+                .onFailure { error ->
+                    PikoLog.w(TAG, "删除字幕文件失败", error)
+                    _messages.tryEmit("删除字幕失败：${error.message ?: "未知错误"}")
+                }
+        }
+    }
+
+    private fun attachManualSubtitle(subtitle: ExternalSubtitle) {        // 日志只留扩展名，文件名不进导出的日志
         PikoLog.i(TAG, "手动挂字幕，格式 ${subtitle.title.substringAfterLast('.', "未知")}，${logFile(fileId, title)}")
         pendingManualTitle = subtitle.title
         backend.addSubtitle(subtitle)
@@ -769,10 +823,15 @@ class PlayerScreenState(
             subtitleStreams = subtitleStreams + stream
             return stream.url
         }
+        // 顺手记下这些文件：轨道行的标题就是 ref.language（「简」这类），面板据此配删除按钮
+        val auto = mutableListOf<DriveSubtitleFile>()
         val subtitles = refs.mapNotNull { ref ->
             val stream = repository.prepareSubtitle(ref.fileId) ?: return@mapNotNull null
-            ExternalSubtitle(url = register(stream), title = ref.language ?: "外挂字幕", language = ref.language?.let(::subtitleLanguageCode))
+            val title = ref.language ?: "外挂字幕"
+            auto += DriveSubtitleFile(title = title, fileId = ref.fileId)
+            ExternalSubtitle(url = register(stream), title = title, language = ref.language?.let(::subtitleLanguageCode))
         }
+        autoSubtitleFiles = auto
         val manual = manualSubtitles.mapNotNull { subtitle ->
             val url = subtitle.localPath
                 ?: subtitle.fileId?.let { id -> repository.prepareSubtitle(id)?.let(::register) }
@@ -806,8 +865,11 @@ class PlayerScreenState(
         const val PLAYLIST_WAIT_MILLIS = 3_000L
 
         /** 刚传上去的字幕，网盘可能还没放进目录、取不到链接：多试几次再放弃。 */
-        const val SUBTITLE_OPEN_ATTEMPTS = 4
-        const val SUBTITLE_OPEN_RETRY_MS = 1_500L
+        /**
+         * 刚上传的字幕要等网盘算完 gcid 才能取流，快则一两秒，慢则几十秒。
+         * 每项是「这次失败后等多久」，最坏约一分钟；末尾 10 秒是给服务端留的余量。
+         */
+        val SUBTITLE_RETRY_DELAYS_MS = longArrayOf(1_000, 2_000, 3_000, 5_000, 8_000, 10_000, 10_000, 10_000, 10_000)
 
         // 开播前等云端续播位置的上限。它与取流并行，通常早已回来；网络差时不为它拖住开播
         const val CLOUD_RESUME_WAIT_MILLIS = 1_500L
@@ -824,6 +886,12 @@ class PlayerScreenState(
 }
 
 /** 手动挂上的一条字幕：本机的记路径，网盘的记 ID，每次打开文件时重新开代理会话。 */
+/**
+ * 播放器里已挂上的网盘字幕文件。[title] 与 mpv 报的轨道标题一致，界面靠它把
+ * 「音轨与字幕」里的那一行对回文件；[fileId] 用于删除。
+ */
+data class DriveSubtitleFile(val title: String, val fileId: String)
+
 private class ManualSubtitle(val title: String, val localPath: String?, val fileId: String?)
 
 /** 解析器给的字幕语言（「简」「繁日」）换成 mpv 按 slang 匹配用的代码。 */

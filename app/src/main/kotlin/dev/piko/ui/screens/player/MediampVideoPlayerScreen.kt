@@ -29,7 +29,6 @@ import androidx.activity.result.contract.ActivityResultContracts
 import dev.piko.shared.media.player.isPlayerSubtitleName
 import dev.piko.shared.naming.av.matchAvFile
 import dev.piko.ui.LocalPikoServices
-import dev.piko.ui.screens.poster.SubtitleSearchSheet
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
@@ -190,7 +189,6 @@ fun MediampVideoPlayerScreen(
     // 本地播放没有网盘目录，给不了入口
     val services = LocalPikoServices.current
     val currentVideoFolderId = siblingVideos.find { it.id == state.fileId }?.parentId
-    var showSubtitleSearch by remember { mutableStateOf(false) }
     // 作品收藏（与海报墙收藏夹同一份数据）：按文件名认番号，认不出就不给入口
     val currentWorkCode = remember(state.fileId, state.title) {
         matchAvFile(state.title)?.code
@@ -514,12 +512,26 @@ fun MediampVideoPlayerScreen(
                 onPickLocalSubtitle = pickLocalSubtitle.takeIf { state.canAddSubtitle },
                 onPickDriveSubtitle = { file: FileStat -> state.addDriveSubtitle(file.id, file.name) }
                     .takeIf { state.canAddSubtitle },
-                onSearchSubtitle = { showSubtitleSearch = true }
-                    .takeIf { state.canAddSubtitle && currentVideoFolderId != null },
+                // 字幕搜索就地开在播放器面板里（与 AI 翻译同款），不再弹外层面板
+                subtitleSearchTarget = currentVideoFolderId?.let { folderId ->
+                    SubtitleSearchTarget(
+                        code = currentWorkCode ?: state.title.substringBeforeLast('.'),
+                        folderId = folderId,
+                        folderName = "视频所在目录",
+                    )
+                }.takeIf { state.canAddSubtitle },
+                onSearchedSubtitle = if (state.canAddSubtitle) {
+                    { fileId: String, name: String -> state.addDriveSubtitle(fileId, name) }
+                } else {
+                    null
+                },
                 // AI 翻译字幕：要番号（译文名）与翻译配置都齐了才给入口
                 subtitleTranslateCode = currentWorkCode
                     .takeIf { services.translation != null && state.canAddSubtitle },
                 onTranslatedSubtitle = { fileId, name -> state.addDriveSubtitle(fileId, name) },
+                // 「音轨与字幕」里的网盘字幕行带删除：先卸轨道再删文件，见 state.deleteDriveSubtitle
+                driveSubtitleFiles = state.driveSubtitleFiles,
+                onDeleteDriveSubtitle = state::deleteDriveSubtitle,
                 isFavorite = favorite,
                 onFavoriteClick = currentWorkCode?.let { code ->
                     {
@@ -530,21 +542,6 @@ fun MediampVideoPlayerScreen(
                 },
             )
         }
-    }
-
-    // 在线字幕搜索：下载到当前视频所在的网盘目录（SubtitleSearchSheet 内部走上传队列）
-    if (showSubtitleSearch && currentVideoFolderId != null) {
-        SubtitleSearchSheet(
-            code = currentWorkCode ?: state.title.substringBeforeLast('.'),
-            targetFolderId = currentVideoFolderId,
-            targetFolderName = "视频所在目录",
-            onDismissRequest = { showSubtitleSearch = false },
-            // 传完立刻挂上，不用退出重进
-            onUploaded = { fileId, fileName ->
-                state.addDriveSubtitle(fileId, fileName)
-                showSubtitleSearch = false
-            },
-        )
     }
 }
 

@@ -47,10 +47,10 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.outlined.Cloud
+import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.FileOpen
 import androidx.compose.material.icons.outlined.Movie
 import androidx.compose.material.icons.outlined.Search
@@ -105,11 +105,25 @@ import dev.piko.ui.components.ActionIconRow
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.rememberUpdatedState
 import kotlinx.coroutines.delay
+import dev.piko.shared.media.player.DriveSubtitleFile
 import dev.piko.shared.media.player.PlaybackStatsSection
 import androidx.compose.foundation.text.selection.SelectionContainer
 import kotlin.math.roundToInt
 
-internal enum class PlayerSheet { Episodes, Settings, Tracks, DriveSubtitles, TranslateSubtitle, Stats }
+internal enum class PlayerSheet {
+    Episodes, Settings, Tracks, DriveSubtitles, TranslateSubtitle, SearchSubtitle, Stats
+}
+
+/**
+ * 在播放器里搜字幕需要知道的三样：拿什么词搜、字幕下到哪个目录、目录叫什么。
+ * 三者齐全才给出「搜索字幕」入口，缺一个就退回调用方的外部面板。
+ * 对 app 模块可见（PlayerControlsOverlay 的参数），所以是 public 而没标 internal。
+ */
+data class SubtitleSearchTarget(
+    val code: String,
+    val folderId: String,
+    val folderName: String,
+)
 
 /**
  * 播放器的面板容器：横屏是贴右侧的浮动 side sheet，竖屏是 bottom sheet。
@@ -142,7 +156,8 @@ internal fun PlayerSheetHost(
             // 选集与网盘字幕固定占七成高：按内容定高时几十项会顶满全屏，几项时又只露一条，
             // 字幕目录里进出一层面板还会跟着跳。其余面板内容少，按内容定高
             val fixedHeight = sheet == PlayerSheet.Episodes ||
-                sheet == PlayerSheet.DriveSubtitles || sheet == PlayerSheet.TranslateSubtitle
+                sheet == PlayerSheet.DriveSubtitles || sheet == PlayerSheet.TranslateSubtitle ||
+                sheet == PlayerSheet.SearchSubtitle
             val height = if (fixedHeight) Modifier.fillMaxHeight(EPISODE_SHEET_HEIGHT_FRACTION) else Modifier
             Column(height.wheelStaysInSheet()) {
                 Text(
@@ -163,6 +178,7 @@ private val PlayerSheet.title: String
         PlayerSheet.Tracks -> "音轨与字幕"
         PlayerSheet.DriveSubtitles -> "网盘字幕（右侧图标可删除）"
         PlayerSheet.TranslateSubtitle -> "AI 翻译字幕"
+        PlayerSheet.SearchSubtitle -> "搜索字幕"
         PlayerSheet.Stats -> "详细信息"
     }
 
@@ -800,6 +816,10 @@ internal fun TracksPanel(
     onSearchSubtitle: (() -> Unit)? = null,
     /** 打开 AI 翻译面板；没配置翻译模型时为 null，不显示这一项。 */
     onTranslateSubtitle: (() -> Unit)? = null,
+    /** 已挂上的网盘字幕文件（标题 + 文件 id），标题与轨道一致，用来给字幕行配删除按钮。 */
+    driveSubtitleFiles: List<DriveSubtitleFile> = emptyList(),
+    /** 删除一条网盘字幕文件；为 null 时字幕行不给删除按钮。 */
+    onDeleteSubtitle: ((fileId: String) -> Unit)? = null,
 ) {
     Column(
         modifier = modifier
@@ -821,11 +841,20 @@ internal fun TracksPanel(
         }
         TrackSection("字幕") {
             TrackRow(label = "关闭", selected = selectedSubtitleTrackId == null, onClick = { onSelectSubtitle(null) })
+            // 取成局部 val：下面的 lambda 会延后执行，参数的智能转换在 lambda 里不成立
+            val delete = onDeleteSubtitle
             subtitleTracks.forEachIndexed { index, track ->
+                // 只有网盘来的外挂字幕有文件可删；本机字幕与容器内轨道没有 fileId
+                val file = driveSubtitleFiles.firstOrNull { it.title == track.title }
                 TrackRow(
                     label = trackDisplayName(track, index),
                     selected = track.id == selectedSubtitleTrackId,
                     onClick = { onSelectSubtitle(track) },
+                    trailing = if (file != null && delete != null) {
+                        { SubtitleDeleteButton(onClick = { delete(file.fileId) }) }
+                    } else {
+                        null
+                    },
                 )
             }
             if (onSearchSubtitle != null) {
@@ -845,6 +874,35 @@ internal fun TracksPanel(
                 PickerRow(icon = Icons.Outlined.Cloud, label = "网盘字幕（选择 / 删除）…", onClick = onPickDriveSubtitle)
             }
         }
+    }
+}
+
+/**
+ * 字幕行的删除按钮：只有图标，不带底圈。
+ *
+ * 早先带 32dp 的浅红圆圈、又用 IconButton 承载——Material3 会给 IconButton 一个 48dp 的
+ * 最小触控区，而行高也是 48dp，几行字幕叠在一起时几个圆圈几乎贴到一起。这里改成
+ * 固定 30dp 的点击区、18dp 的图标，行与行之间才留得出空隙。
+ */
+@Composable
+internal fun SubtitleDeleteButton(
+    onClick: () -> Unit,
+    contentDescription: String = "删除字幕",
+    modifier: Modifier = Modifier,
+) {
+    Box(
+        modifier = modifier
+            .size(30.dp)
+            .clip(CircleShape)
+            .clickable(role = Role.Button, onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(
+            Icons.Outlined.Delete,
+            contentDescription = contentDescription,
+            tint = MaterialTheme.colorScheme.error,
+            modifier = Modifier.size(18.dp),
+        )
     }
 }
 
@@ -898,7 +956,13 @@ private fun TrackSection(title: String, content: @Composable ColumnScope.() -> U
 }
 
 @Composable
-private fun TrackRow(label: String, selected: Boolean, onClick: () -> Unit) {
+private fun TrackRow(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+    /** 行尾附加动作（如删除）。按钮自己处理点击，不会连带选中这一轨。 */
+    trailing: (@Composable () -> Unit)? = null,
+) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -917,13 +981,9 @@ private fun TrackRow(label: String, selected: Boolean, onClick: () -> Unit) {
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f),
         )
-        if (selected) {
-            Icon(
-                imageVector = Icons.Filled.Check,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.onSecondaryContainer,
-                modifier = Modifier.padding(start = 12.dp).size(20.dp),
-            )
+        if (trailing != null) {
+            Spacer(Modifier.width(8.dp))
+            trailing()
         }
     }
 }

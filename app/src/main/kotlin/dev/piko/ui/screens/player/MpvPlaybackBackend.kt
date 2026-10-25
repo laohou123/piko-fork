@@ -365,6 +365,12 @@ internal class MpvPlaybackBackend(
         onMpv { mpv.command(mpvSubtitleSelectCommand(subtitle)) }
     }
 
+    override fun removeSubtitle(trackId: String) {
+        if (released) return
+        // sub-remove 只认外挂字幕的 sid；容器内的轨道会被 mpv 拒绝，这里不必区分
+        onMpv { mpv.command(arrayOf("sub-remove", trackId)) }
+    }
+
     override val supportsRotation: Boolean = true
 
     // video-rotate 会加进 video-params/rotate，画面比例经那里的观察自动换过来，这里不必另算

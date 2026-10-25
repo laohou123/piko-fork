@@ -30,7 +30,33 @@ data class SubtitleHit(
     val pagePath: String,
     val languages: Int = 0,
     val sizeKb: Int = 0,
-)
+    /**
+     * 字幕对应的片长（毫秒），0 表示源站没给。
+     *
+     * 只有会直出文件的源（迅雷）带这个值：同一部片常有多条时长不同的字幕，
+     * 列表里显示出来，用户能挑和正片对得上的那条。
+     */
+    val durationMillis: Long = 0,
+) {
+    /** 给人看的片长（"1:56:18"）；源站没给时是 null，界面据此决定要不要显示。 */
+    val durationLabel: String? get() = if (durationMillis > 0) formatDurationLabel(durationMillis) else null
+}
+
+/**
+ * 毫秒 → "1:56:18" 或 "23:41"。片长只用来对照正片，不需要年月日那种格式。
+ * 放在 commonMain 是因为界面（ui 模块）也要用，而源实现各在自己的源集里。
+ */
+fun formatDurationLabel(millis: Long): String {
+    val totalSeconds = millis / 1000
+    val hours = totalSeconds / 3600
+    val minutes = (totalSeconds % 3600) / 60
+    val seconds = totalSeconds % 60
+    return if (hours > 0) {
+        "$hours:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}"
+    } else {
+        "$minutes:${seconds.toString().padStart(2, '0')}"
+    }
+}
 
 /** 详情页里一个字幕条目。 */
 data class SubtitleCandidate(
