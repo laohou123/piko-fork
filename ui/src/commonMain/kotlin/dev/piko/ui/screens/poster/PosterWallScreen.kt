@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -33,6 +34,7 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.outlined.AutoAwesome
@@ -84,11 +86,16 @@ import dev.piko.shared.library.WorkRow
 import dev.piko.shared.state.PosterWallState
 import dev.piko.shared.naming.av.matchAvFile
 import dev.piko.ui.LocalPikoServices
+import dev.piko.ui.components.BarItem
+import dev.piko.ui.components.IslandHeaderSpace
+import dev.piko.ui.components.IslandPage
+import dev.piko.ui.components.IslandTitle
 import dev.piko.ui.components.PikoDialog
 import dev.piko.ui.components.PikoEmptyState
 import dev.piko.ui.components.PikoScaffold
 import dev.piko.ui.components.PikoSheet
 import dev.piko.ui.components.PikoTopBar
+import dev.piko.ui.components.TooltipIconButton
 import dev.piko.ui.components.iconBarItem
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
@@ -146,24 +153,30 @@ fun PosterWallScreen(
         state.messages.collect { snackbarHostState.showSnackbar(it, withDismissAction = true) }
     }
 
+    // 顶栏动作提到外面：手机用 PikoTopBar 展示，宽窗口（外框模式）的岛页眉也用同一份
+    val topBarActions = listOf(
+        // 再点一次收起：之前只会打开，想把搜索框收起来只能去点框里的 X
+        iconBarItem(
+            Icons.Outlined.Search,
+            if (state.searchActive) "收起搜索" else "搜索影片",
+            onClick = { state.setSearchOpen(!state.searchActive) },
+            priority = 2,
+        ),
+        iconBarItem(Icons.Outlined.FolderOpen, "扫描目录", onClick = { showScrapeDialog = true }, priority = 1),
+        iconBarItem(Icons.Outlined.AutoAwesome, "补刮元数据", priority = 1, enabled = !state.enriching, onClick = { state.enrich() }),
+        iconBarItem(Icons.Outlined.Refresh, "重新扫描", priority = 0, enabled = state.phase != PosterWallState.Phase.SCANNING, onClick = { state.startScan() }),
+    )
+
     PikoScaffold(
         modifier = modifier,
+        // 宽度够（平板/桌面）时走岛式页眉：与任务、网盘页同一副骨架，顶部那一行有自己的底色，
+        // 不是直接铺在窗口底色上（那样与下面的内容同色，看着像没有顶栏）
+        island = IslandPage(header = { PosterIslandHeader(state, onBackClick, topBarActions) }),
         topBar = {
             PikoTopBar(
                 title = "海报墙",
                 onBackClick = onBackClick,
-                actions = listOf(
-                    // 再点一次收起：之前只会打开，想把搜索框收起来只能去点框里的 X
-                    iconBarItem(
-                        Icons.Outlined.Search,
-                        if (state.searchActive) "收起搜索" else "搜索影片",
-                        onClick = { state.setSearchOpen(!state.searchActive) },
-                        priority = 2,
-                    ),
-                    iconBarItem(Icons.Outlined.FolderOpen, "扫描目录", onClick = { showScrapeDialog = true }, priority = 1),
-                    iconBarItem(Icons.Outlined.AutoAwesome, "补刮元数据", priority = 1, enabled = !state.enriching, onClick = { state.enrich() }),
-                    iconBarItem(Icons.Outlined.Refresh, "重新扫描", priority = 0, enabled = state.phase != PosterWallState.Phase.SCANNING, onClick = { state.startScan() }),
-                ),
+                actions = topBarActions,
             )
         },
         snackbarHost = { SnackbarHost(snackbarHostState) },
@@ -394,6 +407,24 @@ private fun stopText(stop: ScanStop): String = when (stop) {
     ScanStop.FILE_LIMIT -> "文件太多，只扫了一部分"
     ScanStop.TIMEOUT -> "扫描超时，只扫了一部分"
     ScanStop.CANCELLED -> "已停止"
+}
+
+/**
+ * 宽窗口下的岛式页眉：页名 + 右侧动作，底色由岛（[dev.piko.ui.components.IslandPage]）统一画。
+ * 与任务页的 TaskIslandHeader 同构，动作与手机顶栏共用同一份 [actions]。
+ */
+@Composable
+private fun RowScope.PosterIslandHeader(
+    state: PosterWallState,
+    onBackClick: (() -> Unit)?,
+    actions: List<BarItem>,
+) {
+    if (onBackClick != null) {
+        TooltipIconButton(Icons.AutoMirrored.Outlined.ArrowBack, "返回", onBackClick)
+    }
+    IslandTitle("海报墙")
+    IslandHeaderSpace()
+    actions.forEach { it.content() }
 }
 
 /** 筛选行：全部 / 收藏 / 演员 / 标签，四个按钮等宽平分整行。 */
