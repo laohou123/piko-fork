@@ -31,6 +31,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.outlined.AddPhotoAlternate
 import androidx.compose.material.icons.outlined.AutoAwesome
 import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.StarOutline
@@ -102,6 +103,7 @@ fun WorkDetailScreen(
     modifier: Modifier = Modifier,
 ) {
     val services = LocalPikoServices.current
+    val platform = LocalPikoPlatform.current
     val scope = rememberCoroutineScope()
     // 设置里可以关掉自动预览：关掉后顶部只显示封面，不占网盘连接
     val autoPreview by services.preferences.posterAutoPreviewFlow.collectAsState(initial = true)
@@ -140,6 +142,16 @@ fun WorkDetailScreen(
         }
     }
 
+    // 刮不到的作品（多半是国内源上就没这部）：让用户自己传一张封面。
+    // 只写 cover_url，不动 scraped_at，所以它在列表里仍然算「未刮削」。
+    val pickCover: () -> Unit = platform.coverPicker.rememberLauncher { path ->
+        scope.launch {
+            services.libraryStore?.setWorkCover(code, path)
+            detail = services.libraryStore?.workDetail(code)
+            services.posterWall?.refreshList()
+        }
+    }
+
     LaunchedEffect(code) {
         loading = true
         detail = services.libraryStore?.workDetail(code)
@@ -153,16 +165,30 @@ fun WorkDetailScreen(
             PikoTopBar(
                 title = detail?.work?.displayTitle ?: code,
                 onBackClick = onBackClick,
-                actions = listOf(
+                actions = buildList {
+                    // 刮不到的作品：占位卡片被换掉之后（已经有图了），这里是再换一次封面的入口。
+                    // 还没图时卡片上就有一个同样的按钮，顶栏不重复放。
+                    if (detail?.work?.scraped == false && detail?.work?.coverUrl != null) {
+                        add(
+                            iconBarItem(
+                                Icons.Outlined.AddPhotoAlternate,
+                                "上传封面",
+                                priority = 1,
+                                onClick = pickCover,
+                            ),
+                        )
+                    }
                     // 收藏移到底栏后，这里改成「只刮这一部」：MetaTube 重刮一次当前作品
-                    iconBarItem(
-                        Icons.Outlined.AutoAwesome,
-                        if (scraping) "正在刮削…" else "刮削这部",
-                        priority = 1,
-                        enabled = !scraping,
-                        onClick = scrapeThis,
-                    ),
-                ),
+                    add(
+                        iconBarItem(
+                            Icons.Outlined.AutoAwesome,
+                            if (scraping) "正在刮削…" else "刮削这部",
+                            priority = 1,
+                            enabled = !scraping,
+                            onClick = scrapeThis,
+                        ),
+                    )
+                },
             )
         },
         // 固定底栏：播放 / 字幕 / 收藏（参考图），不随内容滚动
@@ -221,8 +247,7 @@ fun WorkDetailScreen(
                         )
                     } else {
                         MissingCoverHeader(
-                            scraping = scraping,
-                            onScrape = scrapeThis,
+                            onUpload = pickCover,
                             modifier = Modifier.fillMaxWidth().aspectRatio(CoverAspectRatio),
                         )
                     }
@@ -707,17 +732,17 @@ private fun WorkPreview(
 private const val PreviewFallbackStartMillis = 30_000L
 
 /**
- * 预览起点：用番号哈希取 35%~45% 的时长位置。
+ * 预览起点：用番号哈希取 25%~35% 的时长位置。
  * 同一部片每次都落在同一处（稳定），不同片各不相同，像随手抓了一段正片。
  *
- * 区间比最早的 20%~45% 收窄且后移：中段靠前的部分不少片还在铺垫（对话、黑场、慢镜头），
- * 后半段更有画面，挑片时看一眼更容易判断。
+ * 区间从 35%~45% 往前挪了一档：越往后越可能撞上正片后半的剧情段落（多是对话与室内镜头），
+ * 1/4 到 1/3 这段通常已经过了铺垫、画面还热闹，挑片时一眼能看明白是什么片。
  */
 internal fun previewStartFor(code: String, durationMillis: Long): Long {
     if (durationMillis <= 0L) return PreviewFallbackStartMillis
     val bucket = ((code.hashCode().toLong() and 0x7FFFFFFFL) % 26L)   // 0..25
-    // 26 个等分把 0.10 的区间切完：bucket=0 → 0.35，bucket=25 → 0.45
-    val fraction = 0.35 + bucket * 0.10 / 25.0
+    // 26 个等分把 0.10 的区间切完：bucket=0 → 0.25，bucket=25 → 0.35
+    val fraction = 0.25 + bucket * 0.10 / 25.0
     return (durationMillis * fraction).toLong()
 }
 
@@ -774,12 +799,14 @@ private fun DetailActionBar(
 
 /**
  * 既没刮到封面、也没刮到元数据时的顶部占位：
- * 一块底色加一句说明与「刮削这部」，比一块黑底播放器（失败后只剩黑与转圈）清楚，页面也不会看着像坏了。
+ * 一块底色加一句说明与「上传封面」，比一块黑底播放器（失败后只剩黑与转圈）清楚，页面也不会看着像坏了。
+ *
+ * 这里的按钮是**上传封面**而不是「刮削这部」：会走到这一屏的，基本都是刮削源里根本没有的片，
+ * 再点一次刮削多半还是空手而归；用户手里有图，让他直接补一张更实在。刮削入口仍在顶栏。
  */
 @Composable
 private fun MissingCoverHeader(
-    scraping: Boolean,
-    onScrape: () -> Unit,
+    onUpload: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Box(
@@ -799,13 +826,18 @@ private fun MissingCoverHeader(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(top = 8.dp),
             )
+            Text(
+                text = "刮削源里没有这部，可以自己传一张封面",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 2.dp),
+            )
             FilledTonalButton(
-                onClick = onScrape,
-                enabled = !scraping,
+                onClick = onUpload,
                 modifier = Modifier.padding(top = 12.dp),
             ) {
-                Icon(Icons.Outlined.AutoAwesome, contentDescription = null, modifier = Modifier.size(18.dp))
-                Text(if (scraping) "正在刮削…" else "刮削这部", modifier = Modifier.padding(start = 6.dp))
+                Icon(Icons.Outlined.AddPhotoAlternate, contentDescription = null, modifier = Modifier.size(18.dp))
+                Text("上传封面", modifier = Modifier.padding(start = 6.dp))
             }
         }
     }

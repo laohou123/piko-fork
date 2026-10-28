@@ -1081,6 +1081,9 @@ fun PikoMainScaffold(
                             PosterWallScreen(
                                 onOpenWork = { code -> backStack.add(Screen.WorkDetail(code)) },
                                 onBackClick = null,
+                                // 只有这一页压在栈顶时，返回键才先收它的搜索框；
+                                // 上面还压着详情等页面时，返回归那些页面
+                                handleBackForSearch = backStack.size <= 1,
                             )
                         }
                     }

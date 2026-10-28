@@ -14,6 +14,7 @@ import androidx.compose.ui.unit.dp
 import coil3.compose.LocalPlatformContext
 import coil3.compose.SubcomposeAsyncImage
 import coil3.request.ImageRequest
+import dev.piko.ui.platform.LocalPikoPlatform
 
 /**
  * 海报墙的封面图：番号占位（没刮到 / 加载中 / 加载失败）与封面二态。
@@ -38,7 +39,14 @@ internal fun CoverImage(
         return
     }
     val context = LocalPlatformContext.current
-    val request = ImageRequest.Builder(context).data(url).build()
+    // 手动上传的封面是本机文件（Android 复制在私有目录，桌面端是原路径）：
+    // 交给平台换成它认得的模型（File / content: 字符串），只有 http(s) 才当网络地址
+    val model: Any = if (url.startsWith("http", ignoreCase = true)) {
+        url
+    } else {
+        LocalPikoPlatform.current.localFiles.thumbnailModel(url) ?: url
+    }
+    val request = ImageRequest.Builder(context).data(model).build()
     SubcomposeAsyncImage(
         model = request,
         contentDescription = null,

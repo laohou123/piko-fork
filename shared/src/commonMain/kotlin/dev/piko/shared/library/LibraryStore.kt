@@ -271,12 +271,19 @@ class LibraryStore(
         Unit
     }
 
+    /** 手动换封面：只改 cover_url，不动 scraped_at 与其它元数据。 */
+    suspend fun setWorkCover(code: String, coverUrl: String) = withQueries { q ->
+        q.updateWorkCover(coverUrl, code)
+    }
+
     suspend fun works(
         actor: String?,
         tag: String?,
         favoriteOnly: Boolean = false,
         /** 搜索词：番号、标题、演员、标签任一处包含就留下；空白表示不过滤。 */
         query: String? = null,
+        /** true 只留已刮到元数据的，false 只留没刮到的，null 不按刮削状态过滤。 */
+        scraped: Boolean? = null,
     ): List<WorkRow> = withQueries { q ->
         val counts = q.selectFileCounts().executeAsList().associate { it.work_code to (it.count to it.total) }
         // 卡片左下角的女优名：一次批量取出，不逐行查
@@ -297,7 +304,11 @@ class LibraryStore(
                 .map { it.toRow(counts, actors) }
             else -> q.selectAllWorks().executeAsList()
                 .map { it.toRow(counts, actors) }
-        }.applyQuery()
+        }.applyQuery().let { rows ->
+            // 刮削状态在内存里过滤：它本来就是从 scraped_at 推出来的一个布尔，
+            // 为它再写两条同构 SQL 不值当，几百条的量也不差这一步
+            if (scraped == null) rows else rows.filter { it.scraped == scraped }
+        }
     }.orEmpty()
 
     /** 列表查询的同构投影：五个字段一张表里取，文件数与总体积走 selectFileCounts，女优名走 selectFirstActors。 */

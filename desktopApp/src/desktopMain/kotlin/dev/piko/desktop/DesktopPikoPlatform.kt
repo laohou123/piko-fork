@@ -41,6 +41,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import dev.piko.ui.platform.PreviewBackend
 import dev.piko.ui.platform.ShortcutModifier
+import dev.piko.ui.platform.CoverPicker
 import dev.piko.ui.platform.UploadPicker
 import dev.piko.ui.platform.VideoPreviewSupport
 import dev.piko.ui.adaptive.FormFactor
@@ -70,6 +71,9 @@ private class StoredToggle(private val settings: DesktopSettingsStore, private v
         state.value = enabled
     }
 }
+
+/** 选封面时允许的图片后缀（只用来收窄文件对话框的显示，不做校验）。 */
+private val ImageExtensions = setOf("jpg", "jpeg", "png", "webp", "bmp", "gif", "heic", "avif")
 
 /** 共享界面在 Windows 上的平台能力。 */
 class DesktopPikoPlatform(
@@ -204,6 +208,29 @@ class DesktopPikoPlatform(
                 val owner = activeWindow()
                 scope.launch {
                     pickFolder(owner, settings.downloadDirectory, "选择下载位置")?.let { onPicked(it.absolutePath) }
+                }
+            }
+        }
+    }
+
+    /**
+     * 选封面：桌面端直接用手选中的那个文件路径。
+     * 用户把图拖进自己的目录就是为了留着它，抄一份进应用数据反而会在他删掉原图后"复活"一张旧封面。
+     */
+    override val coverPicker: CoverPicker = object : CoverPicker {
+        @Composable
+        override fun rememberLauncher(onPicked: (String) -> Unit): () -> Unit {
+            val scope = rememberCoroutineScope()
+            return {
+                val owner = activeWindow()
+                scope.launch {
+                    val files = AwtDialogs.chooseFiles(
+                        owner,
+                        "选择封面图片",
+                        multiple = false,
+                        filter = { name -> name.substringAfterLast('.', "").lowercase() in ImageExtensions },
+                    )
+                    files.firstOrNull()?.let { onPicked(it.absolutePath) }
                 }
             }
         }

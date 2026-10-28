@@ -48,8 +48,11 @@ class PosterWallState(
 ) {
     enum class Phase { IDLE, SCANNING, DONE, FAILED }
 
-    /** 全部 / 收藏 / 按演员 / 按标签。[filterName] 是选中的演员或标签名。 */
-    enum class Filter { ALL, FAVORITE, ACTOR, TAG }
+    /**
+     * 全部 / 收藏 / 按演员 / 按标签 / 只看已刮削 / 只看未刮削。
+     * [filterName] 只在 ACTOR 与 TAG 下有意义。
+     */
+    enum class Filter { ALL, FAVORITE, ACTOR, TAG, SCRAPED, UNSCRAPED }
 
     var phase by mutableStateOf(Phase.IDLE)
         private set
@@ -431,6 +434,14 @@ class PosterWallState(
         scope.launch { refresh() }
     }
 
+    /**
+     * 统计行里点「已刮削 / 未刮削」：已经筛着这一批了再点就回到全部，否则切过去。
+     * 入口只有一行小字，做成开关比"再找一个地方点全部"顺手。
+     */
+    fun toggleScrapeFilter(target: Filter) {
+        selectFilter(if (filter == target) Filter.ALL else target)
+    }
+
     /** 搜索框输入：每敲一次重查一遍（数据量是几百条，直接查不卡）。 */
     // 不叫 setQuery：var query 的属性 setter 会生成同 JVM 签名的方法，撞名
     fun updateQuery(value: String) {
@@ -445,6 +456,11 @@ class PosterWallState(
             tag = filterName.takeIf { filter == Filter.TAG },
             favoriteOnly = filter == Filter.FAVORITE,
             query = query,
+            scraped = when (filter) {
+                Filter.SCRAPED -> true
+                Filter.UNSCRAPED -> false
+                else -> null
+            },
         )
         actors = store.actors()
         tags = store.tags()

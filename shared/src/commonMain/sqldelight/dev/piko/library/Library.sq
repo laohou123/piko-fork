@@ -183,6 +183,11 @@ markWorkScraped:
 UPDATE works SET title = ?, cover_url = ?, release_date = ?, duration = ?, summary = ?, studio = ?, series = ?, provider = ?, mt_provider = ?, mt_id = ?, preview_video_url = ?, scraped_at = ?
 WHERE code = ?;
 
+-- 手动上传的封面（本机图片路径）：只换图，scraped_at 与其它元数据都不动，
+-- 所以它在列表里仍然算「未刮削」，下次补刮还能再试一次。
+updateWorkCover:
+UPDATE works SET cover_url = ? WHERE code = ?;
+
 selectAllWorks:
 SELECT code, title, title_zh, cover_url, release_date, duration, scraped_at FROM works
 -- 有发行日期的按日期倒序在前；没有的（待刮削、未识别番号）统一压到最后

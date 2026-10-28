@@ -50,6 +50,8 @@ import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
+import androidx.compose.ui.backhandler.BackHandler
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.material3.IconButton
@@ -78,6 +80,7 @@ import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.piko.shared.data.ScanStop
@@ -112,6 +115,11 @@ import kotlinx.coroutines.launch
 fun PosterWallScreen(
     onOpenWork: (String) -> Unit,
     onBackClick: (() -> Unit)?,
+    /**
+     * 返回键先收搜索框：只有海报墙自己就是当前页时才接（主标签页），
+     * 从详情页压进来的那一页返回应该回上一页，不能在这里被截走。
+     */
+    handleBackForSearch: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
     val services = LocalPikoServices.current
@@ -125,6 +133,10 @@ fun PosterWallScreen(
         initialFirstVisibleItemIndex = state.scrollIndex,
         initialFirstVisibleItemScrollOffset = state.scrollOffset,
     )
+
+    // 搜索框展开时按返回：收起它，顺带把搜索词清掉（setSearchOpen(false) 里一并做）。
+    // 之前这一页没有任何 BackHandler，搜索到一半按返回是直接退出 App。
+    BackHandler(enabled = handleBackForSearch && state.searchActive) { state.setSearchOpen(false) }
 
     // 滚动时把位置写回 state。值没变就不写；写的是两个 Int，不触发重组
     LaunchedEffect(gridState) {
@@ -224,6 +236,8 @@ fun PosterWallScreen(
                         title = when {
                             state.rootFolder == null -> "先选一个目录"
                             state.filter == PosterWallState.Filter.FAVORITE -> "还没有收藏"
+                            state.filter == PosterWallState.Filter.SCRAPED -> "还没有已刮削的作品"
+                            state.filter == PosterWallState.Filter.UNSCRAPED -> "全部作品都已刮到"
                             state.query.isNotBlank() -> "没搜到「${state.query}」"
                             state.workCount == 0L -> "这个目录里还没有番号片"
                             else -> "没有符合条件的作品"
@@ -231,6 +245,8 @@ fun PosterWallScreen(
                         description = when {
                             state.rootFolder == null -> "点右上角「扫描目录」选一个网盘目录，海报墙会按番号把视频收成一部一部"
                             state.filter == PosterWallState.Filter.FAVORITE -> "长按演员或标签、或在详情页点心形按钮即可收藏"
+                            state.filter == PosterWallState.Filter.SCRAPED -> "点右上角「补刮元数据」，刮到元数据的作品会出现在这里"
+                            state.filter == PosterWallState.Filter.UNSCRAPED -> "没有待刮削的作品，点右上角「重新扫描」看看有没有新片"
                             state.query.isNotBlank() -> "换个关键词试试：番号、标题、女优、标签都能搜"
                             else -> "换个筛选条件，或扫别的目录看看"
                         },
@@ -307,6 +323,35 @@ fun PosterWallScreen(
     }
 }
 
+/** 统计行里的一个数字：点一下按它筛选，已经选中的就交给 [PosterWallState.toggleScrapeFilter] 回到全部。 */
+@Composable
+private fun StatFilter(
+    text: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+) {
+    Text(
+        text = text,
+        style = MaterialTheme.typography.bodySmall,
+        fontWeight = if (selected) FontWeight.SemiBold else null,
+        color = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier
+            .clip(RoundedCornerShape(6.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 4.dp, vertical = 2.dp),
+    )
+}
+
+/** 统计项之间的分隔点，与文字同色同字号，不会抢视线。 */
+@Composable
+private fun StatSeparator() {
+    Text(
+        text = "·",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+}
+
 /** 扫描目录与进度都收在这一张卡片里：目录只展示（改它去右上角「刮削源与目录」）。 */
 @Composable
 private fun ScanHeader(
@@ -334,13 +379,30 @@ private fun ScanHeader(
                 )
             }
             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 4.dp)) {
-                Text(
-                    text = "全部 ${state.workCount} 部 · 已刮削 ${state.scrapedCount} · " +
-                        "未刮削 ${(state.workCount - state.scrapedCount).coerceAtLeast(0)}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                // 三个数字都能点：「已刮削 / 未刮削」点一下就只看那一批（这也是「补刮」时最常看的两拨），
+                // 已经选中的再点一次回到全部。选中的用主色加粗，一眼看出列表正被它过滤。
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier.weight(1f),
-                )
+                ) {
+                    StatFilter(
+                        text = "全部 ${state.workCount} 部",
+                        selected = state.filter == PosterWallState.Filter.ALL,
+                        onClick = { state.selectFilter(PosterWallState.Filter.ALL) },
+                    )
+                    StatSeparator()
+                    StatFilter(
+                        text = "已刮削 ${state.scrapedCount}",
+                        selected = state.filter == PosterWallState.Filter.SCRAPED,
+                        onClick = { state.toggleScrapeFilter(PosterWallState.Filter.SCRAPED) },
+                    )
+                    StatSeparator()
+                    StatFilter(
+                        text = "未刮削 ${(state.workCount - state.scrapedCount).coerceAtLeast(0)}",
+                        selected = state.filter == PosterWallState.Filter.UNSCRAPED,
+                        onClick = { state.toggleScrapeFilter(PosterWallState.Filter.UNSCRAPED) },
+                    )
+                }
                 when (state.phase) {
                     PosterWallState.Phase.SCANNING -> {
                         TextButton(onClick = onStopScan) { Text("停止") }

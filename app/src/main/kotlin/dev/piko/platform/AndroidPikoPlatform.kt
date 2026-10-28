@@ -22,6 +22,7 @@ import androidx.compose.material3.ColorScheme
 import androidx.compose.material3.dynamicDarkColorScheme
 import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
@@ -48,6 +49,7 @@ import dev.piko.ui.platform.LinkAssociation
 import dev.piko.ui.platform.LocalFileActions
 import dev.piko.ui.platform.PikoPlatform
 import dev.piko.ui.platform.PreviewBackend
+import dev.piko.ui.platform.CoverPicker
 import dev.piko.ui.platform.UploadPicker
 import dev.piko.ui.platform.VideoPreviewSupport
 import dev.piko.ui.adaptive.FormFactor
@@ -61,6 +63,7 @@ import java.io.File
 import android.os.StatFs
 import dev.piko.ui.platform.DiskSpace
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
@@ -121,6 +124,8 @@ class AndroidPikoPlatform(
     override val downloadLocation: DownloadLocationPicker = AndroidDownloadLocation()
 
     override val uploadPicker: UploadPicker = AndroidUploadPicker()
+
+    override val coverPicker: CoverPicker = AndroidCoverPicker()
 
     override val videoPreview: VideoPreviewSupport = MpvPreviewSupport()
 
@@ -435,6 +440,37 @@ class AndroidPikoPlatform(
         private fun persistReadPermission(uri: Uri) {
             runCatching { context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
         }
+    }
+
+    /**
+     * 选封面：SAF 挑一张图片，**复制进应用私有目录**再把路径交出去。
+     *
+     * 不把 content: URI 存进库：那类授权在清数据、换设备、相册应用重装之后就失效了，
+     * 而封面是要长期显示的。复制一份几十 KB 的图，代价比「过一阵封面变白」小得多。
+     */
+    private inner class AndroidCoverPicker : CoverPicker {
+        @Composable
+        override fun rememberLauncher(onPicked: (String) -> Unit): () -> Unit {
+            val scope = rememberCoroutineScope()
+            val launcher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+                if (uri == null) return@rememberLauncherForActivityResult
+                scope.launch {
+                    val saved = withContext(Dispatchers.IO) { copyIntoCoverDir(uri) }
+                    if (saved != null) onPicked(saved)
+                }
+            }
+            return { launcher.launch(arrayOf("image/*")) }
+        }
+
+        /** 复制到 filesDir/covers，成功返回绝对路径。用时间戳命名，换封面时不必先删旧文件。 */
+        private fun copyIntoCoverDir(uri: Uri): String? = runCatching {
+            val dir = File(context.filesDir, "covers").apply { mkdirs() }
+            val target = File(dir, "cover-${System.currentTimeMillis()}.img")
+            val input = context.contentResolver.openInputStream(uri)
+                ?: return@runCatching null
+            input.use { source -> target.outputStream().use { source.copyTo(it) } }
+            target.absolutePath
+        }.getOrNull()
     }
 
     /** 片段预览用段落模式的 libmpv：缓存小；画面走 TextureView，能随面板圆角裁切。 */
