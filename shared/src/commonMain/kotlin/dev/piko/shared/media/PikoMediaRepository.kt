@@ -9,6 +9,7 @@ import dev.piko.shared.data.VaultEntry
 import dev.piko.shared.log.logFailure
 import dev.piko.shared.log.logFile
 import dev.piko.shared.log.logRangeAttempt
+import io.github.nihildigit.pikpak.batchDelete
 import io.github.nihildigit.pikpak.leaseDetail
 import dev.piko.shared.media.proxy.PikPakByteSource
 import dev.piko.shared.media.proxy.PikoMediaProxy
@@ -229,6 +230,17 @@ class PikoMediaRepository(
                 val detail = detailOf(client, fileId)
                 detail.downloadUrl?.takeIf { it.isNotBlank() } ?: error(tr("未获取到下载链接", "Download link unavailable", "ダウンロードリンクを取得できません", "다운로드 링크를 가져올 수 없습니다", "無法取得下載連結"))
             }
+        }
+
+    /**
+     * 删除网盘文件（进回收站，可恢复）。
+     *
+     * 播放器「音轨与字幕」里的网盘字幕删除走这里：字幕文件是普通网盘文件，
+     * 删掉之后下次进播放器就不会再出现在外挂字幕列表里。
+     */
+    suspend fun deleteFiles(ids: List<String>): Result<Unit> =
+        withContext(Dispatchers.Default) {
+            runSuspendCatching { client.batchDelete(ids) }
         }
 
     /**

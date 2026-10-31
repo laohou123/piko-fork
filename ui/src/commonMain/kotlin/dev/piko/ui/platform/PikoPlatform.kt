@@ -98,10 +98,12 @@ interface PikoPlatform {
 
     val uploadPicker: UploadPicker
 
+    /** 选一张本机图片给作品当封面。 */
+    val coverPicker: CoverPicker
+
     /** 只读挂载选择器，返回设备路径或持久化 SAF URI 与展示名。 */
     @Composable
     fun rememberLocalFolderLauncher(onPicked: (String, String) -> Unit): (() -> Unit)? = null
-
     /** 为 null 表示该平台没法把视频交给其他播放器，「用外部播放器打开」随之隐藏。 */
     val externalPlayer: ExternalVideoPlayer?
 
@@ -209,6 +211,17 @@ interface UploadPicker {
 
     @Composable
     fun rememberFolderLauncher(onPicked: (String) -> Unit): () -> Unit
+}
+
+/**
+ * 选一张本机图片当作品封面。回调给的是能直接写进 `works.cover_url` 的地址：
+ * 一律是应用自己存下来的一份文件路径（Android 选完就复制进私有目录），
+ * 不直接引用系统相册里的 URI——那边授权可能随时失效，封面就碎了。
+ */
+interface CoverPicker {
+    /** 选中后以封面的存储路径回调；取消时不回调。做成 Composable 的理由同 [DownloadLocationPicker.rememberLauncher]。 */
+    @Composable
+    fun rememberLauncher(onPicked: (String) -> Unit): () -> Unit
 }
 
 /**

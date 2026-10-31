@@ -1,0 +1,14 @@
+CREATE TABLE favorite_works (
+    code TEXT NOT NULL PRIMARY KEY,
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE favorite_actors (
+    actor_name TEXT NOT NULL PRIMARY KEY,
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE favorite_tags (
+    tag_name TEXT NOT NULL PRIMARY KEY,
+    created_at INTEGER NOT NULL
+);

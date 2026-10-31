@@ -35,6 +35,60 @@ class AndroidRegexGuardTest {
         assertTrue(offenders.isEmpty(), "这些正则用了 \\d/\\D，Android 上连全角、数学字体的数字也算，改写 [0-9]：$offenders")
     }
 
+    @Test
+    fun `regex literals have no bare braces`() {
+        val offenders = androidSources().flatMap { file ->
+            PATTERN_LITERAL.findAll(file.readText()).mapNotNull { m ->
+                val literal = m.groupValues[1].ifEmpty { m.groupValues[2] }
+                // Kotlin 的 ${...} 模板会被拼进正则里，先把它们摘掉再判
+                val pattern = literal.replace(KOTLIN_TEMPLATE, "")
+                if (hasBareBrace(pattern)) {
+                    "${file.relativeTo(root).invariantSeparatorsPath} → $pattern"
+                } else {
+                    null
+                }
+            }.toList()
+        }
+        assertTrue(
+            offenders.isEmpty(),
+            "这些正则含未转义的 { 或 }：Java 的 Pattern 容忍，Android 底下是 ICU，直接抛 PatternSyntaxException；" +
+                "写在顶层 val / companion 里更会让整个类初始化失败（翻译一进来就 ExceptionInInitializerError）：$offenders",
+        )
+    }
+
+    /** 逐字符扫一遍正则：跟踪转义与字符类，找出不是量词、又没转义的花括号。 */
+    private fun hasBareBrace(pattern: String): Boolean {
+        var inClass = false
+        var i = 0
+        while (i < pattern.length) {
+            when (pattern[i]) {
+                '\\' -> {
+                    // \p{L} 这类属性类自带花括号，是合法的，别当成裸括号
+                    val next = pattern.getOrNull(i + 1)
+                    if (next == 'p' || next == 'P') {
+                        val property = PROPERTY_CLASS.find(pattern, i)
+                        if (property != null && property.range.first == i) {
+                            i = property.range.last + 1
+                            continue
+                        }
+                    }
+                    i += 2
+                }
+                '[' -> { inClass = true; i += 1 }
+                ']' -> { inClass = false; i += 1 }
+                '}' -> { if (!inClass) return true; i += 1 }
+                '{' -> {
+                    if (inClass) { i += 1; continue }
+                    val quantifier = QUANTIFIER.find(pattern, i)
+                    if (quantifier == null || quantifier.range.first != i) return true
+                    i = quantifier.range.last + 1
+                }
+                else -> i += 1
+            }
+        }
+        return false
+    }
+
     private val root = File("..").canonicalFile
 
     private fun androidSources(): List<File> {
@@ -51,5 +105,16 @@ class AndroidRegexGuardTest {
         // 源码里的反斜杠在原始字符串中是一个，在普通字符串中是两个，两种都算
         val JAVA_ONLY_PROPERTY = Regex("""\\{1,2}[pP]\{(?:Is|In)[A-Z]""")
         val DIGIT_CLASS = Regex("""\\{1,2}[dD]""")
+
+        /** 抓 `Regex("...")` 与 `Regex("""...""")` 里的字面量，两个分组分别对应两种引号。 */
+        val PATTERN_LITERAL = Regex(
+            """Regex\(\s*(?:"{3}(.*?)"{3}|"((?:[^"\\]|\\.)*)")""",
+            RegexOption.DOT_MATCHES_ALL,
+        )
+        val KOTLIN_TEMPLATE = Regex("""\$\{[^}]*\}""")
+        /** 合法量词：{2}、{2,}、{1,4}。 */
+        val QUANTIFIER = Regex("""\{[0-9]+(?:,[0-9]*)?\}""")
+        /** 合法属性类：\p{L}、\P{Lu} 等，自带花括号但不算裸括号。 */
+        val PROPERTY_CLASS = Regex("""\\ [pP]\{[^}]*\}""".replace(" ", ""))
     }
 }

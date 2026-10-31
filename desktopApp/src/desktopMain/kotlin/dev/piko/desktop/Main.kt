@@ -63,10 +63,14 @@ import dev.piko.desktop.winrt.WindowsLinkAssociation
 import dev.piko.download.DownloadStatus
 import dev.piko.download.DownloadTask
 import dev.piko.shared.data.FilePikoCacheStore
+import dev.piko.shared.library.SubtitleCatSource
+import dev.piko.shared.library.SubtitleSourceOption
+import dev.piko.shared.library.XunleiSubtitleSource
 import dev.piko.shared.sync.JvmSyncCipher
 import dev.piko.shared.scrape.MetaTubeService
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.okhttp.OkHttp
+import io.ktor.client.plugins.HttpTimeout
 import dev.piko.shared.data.PikoClientManager
 import dev.piko.shared.state.InstantSheetState
 import dev.piko.shared.state.TorrentMagnet
@@ -621,6 +625,48 @@ private fun createServices(settings: DesktopSettingsStore, preferences: DesktopP
                 }
             }
         },
+        // 海报墙与刮削字幕：索引库按账号各一个 SQLite，刮削/字幕源共用一个客户端工厂。
+        // 带超时：源站不通时快速失败回 null，补刮计数为「没找到」，而不是无限期挂住
+        libraryDriverFactory = DesktopLibraryDriverFactory(),
+        scrapeHttpClientFactory = {
+            HttpClient(OkHttp) {
+                install(HttpTimeout) {
+                    requestTimeoutMillis = 30_000
+                    connectTimeoutMillis = 15_000
+                    socketTimeoutMillis = 30_000
+                }
+            }
+        },
+        // 字幕源按顺序排：第一个是面板默认选中的那个
+        subtitleSourceFactory = { http ->
+            listOf(
+                SubtitleSourceOption("subtitlecat", "SubtitleCat", SubtitleCatSource(http)),
+                SubtitleSourceOption("xunlei", "迅雷字幕", XunleiSubtitleSource(http)),
+            )
+        },
+        translationHttpClientFactory = {
+            // 翻译一次要几十秒，超时按分钟级给；真正的单批上限在 TranslationClient 里控
+            HttpClient(OkHttp) {
+                install(HttpTimeout) {
+                    requestTimeoutMillis = 120_000
+                    connectTimeoutMillis = 15_000
+                    socketTimeoutMillis = 120_000
+                }
+                engine {
+                    config {
+                        // OkHttp 默认对同一域名只放 5 个并发请求：翻译并发调到 6 以上时，
+                        // 多出来的请求会在客户端排队，看起来就是「设了高并发还是慢」
+                        dispatcher(
+                            okhttp3.Dispatcher().apply {
+                                maxRequests = 64
+                                maxRequestsPerHost = 32
+                            },
+                        )
+                    }
+                }
+            }
+        },
+        subtitleSaver = DesktopSubtitleFileSaver(),
     )
 }
 

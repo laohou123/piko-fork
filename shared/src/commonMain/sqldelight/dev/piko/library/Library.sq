@@ -1,0 +1,401 @@
+-- 海报墙索引：一个番号一部作品，作品下有视频文件、演员与标签。
+-- 按账号各一个数据库文件，库的创建见 LibraryStore。
+-- 不用外键：删一部作品时各表各自清，驱动层不必开 foreign_keys。
+
+CREATE TABLE works (
+    code TEXT NOT NULL PRIMARY KEY,
+    -- 刮削源给的原始标题（多为日文），翻译与手改都不动它
+    title TEXT,
+    -- 显示用的中文标题：AI 翻译或手动修改写这里，空则由 title 兜底
+    title_zh TEXT,
+    cover_url TEXT,
+    release_date TEXT,
+    -- 时长（分钟）；MetaTube 的 runtime，没有时为 null
+    duration INTEGER,
+    summary TEXT,
+    studio TEXT,
+    series TEXT,
+    provider TEXT,
+    -- MetaTube 的数据源名与影片 ID：换 MetaTube 域名后靠这两个重拼图片地址，
+    -- 不用重新刮削。直抓站的源不写这两列。
+    mt_provider TEXT,
+    mt_id TEXT,
+    -- 预览片地址（几十秒样片），详情页顶部自动播放；没有时顶部显示封面
+    preview_video_url TEXT,
+    -- 刮削完成的时刻（毫秒）；0 表示扫到了文件但还没刮到元数据
+    scraped_at INTEGER NOT NULL DEFAULT 0
+);
+
+-- 详情页截图墙：position = 0 是封面，其后是片段截图（MetaTube 的 preview_images）
+CREATE TABLE work_images (
+    work_code TEXT NOT NULL,
+    url TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    PRIMARY KEY (work_code, position)
+);
+CREATE INDEX index_work_images_on_work_code ON work_images(work_code);
+
+CREATE TABLE work_files (
+    file_id TEXT NOT NULL PRIMARY KEY,
+    work_code TEXT NOT NULL,
+    name TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    folder_id TEXT NOT NULL,
+    part TEXT
+);
+CREATE INDEX index_work_files_on_work_code ON work_files(work_code);
+
+CREATE TABLE work_actors (
+    work_code TEXT NOT NULL,
+    actor_name TEXT NOT NULL,
+    PRIMARY KEY (work_code, actor_name)
+);
+CREATE INDEX index_work_actors_on_actor ON work_actors(actor_name);
+
+CREATE TABLE work_tags (
+    work_code TEXT NOT NULL,
+    tag_name TEXT NOT NULL,
+    -- 1 = 用户在详情页手动加的：重新刮削重写标签时不删这些
+    custom INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (work_code, tag_name)
+);
+CREATE INDEX index_work_tags_on_tag ON work_tags(tag_name);
+
+-- 只有一行（id = 0）：扫描哪个目录、上次扫描的时间与作品数
+CREATE TABLE scan_state (
+    id INTEGER NOT NULL PRIMARY KEY CHECK (id = 0),
+    root_folder_id TEXT,
+    root_folder_name TEXT,
+    last_scan_at INTEGER,
+    work_count INTEGER NOT NULL DEFAULT 0,
+    scanning INTEGER NOT NULL DEFAULT 0
+);
+
+-- 海报墙的目录设置随作品数一起记在 scan_state 里；刮削源固定在设置里的 MetaTube，
+-- 库里不再单独存站点地址（JavBus 直抓这一版已删除）。
+
+-- 收藏：作品、演员、标签各一张表。created_at 只用于收藏作品按收藏时间倒序，
+-- 演员与标签按置顶需要排序即可（查询里 favorite 标志排最前）。
+CREATE TABLE favorite_works (
+    code TEXT NOT NULL PRIMARY KEY,
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE favorite_actors (
+    actor_name TEXT NOT NULL PRIMARY KEY,
+    created_at INTEGER NOT NULL
+);
+
+CREATE TABLE favorite_tags (
+    tag_name TEXT NOT NULL PRIMARY KEY,
+    created_at INTEGER NOT NULL
+);
+
+-- 译名与收藏的变更记录，同步到网盘时靠它比新旧（谁后改谁赢）。
+-- kind：title / work / actor / tag；key 是作品编号或演员/标签名；
+-- value 只有译名用，收藏存 NULL；on_flag 1 表示收藏/有译名，0 表示取消收藏/清空译名。
+-- 升级前的老数据没有记录，第一次导出时补一条 at = 0 的，见 LibraryStore.exportSyncMarks。
+CREATE TABLE sync_marks (
+    kind TEXT NOT NULL,
+    key TEXT NOT NULL,
+    at INTEGER NOT NULL,
+    title_value TEXT,
+    on_flag INTEGER NOT NULL,
+    PRIMARY KEY (kind, key)
+);
+
+insertWork:
+INSERT OR REPLACE INTO works (code, title, cover_url, release_date, duration, summary, studio, series, provider, mt_provider, mt_id, preview_video_url, scraped_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+insertWorkFile:
+INSERT OR REPLACE INTO work_files (file_id, work_code, name, size, folder_id, part)
+VALUES (?, ?, ?, ?, ?, ?);
+
+deleteWorkFiles:
+DELETE FROM work_files WHERE work_code = ?;
+
+deleteWork:
+DELETE FROM works WHERE code = ?;
+
+clearWorkFiles:
+DELETE FROM work_files;
+
+clearWorkActors:
+DELETE FROM work_actors;
+
+clearWorkTags:
+DELETE FROM work_tags;
+
+clearWorks:
+DELETE FROM works;
+
+-- 扫描时不整库清空：只补没有的作品、删掉这一轮不再存在的，已有作品的
+-- 刮削结果与译名因此能留下来（以前每次重扫都会把元数据冲成空）
+insertWorkIfAbsent:
+INSERT OR IGNORE INTO works (code) VALUES (?);
+
+-- 注意：不要用 NOT IN 一次传上千个番号。Android 的 SQLite 变量上限是 999，
+-- 超了就是「too many SQL variables」，整个扫描事务回滚、列表还是旧的。
+-- 调用方查出现有番号做差集，再按每批 ≤500 调这个语句。
+deleteWorksIn:
+DELETE FROM works WHERE code IN ?;
+
+-- 作品没了，它的演员/标签/截图也别留着占地方。注意只删孤儿：
+-- 还在的作品的关联数据必须保住（重扫不清它们，见 saveScan）
+deleteOrphanActors:
+DELETE FROM work_actors WHERE work_code NOT IN (SELECT code FROM works);
+
+deleteOrphanTags:
+DELETE FROM work_tags WHERE work_code NOT IN (SELECT code FROM works);
+
+deleteOrphanImages:
+DELETE FROM work_images WHERE work_code NOT IN (SELECT code FROM works);
+
+-- 作品被删（网盘里删了文件又重扫）后，收藏夹里的那条记录也该走
+deleteOrphanFavoriteWorks:
+DELETE FROM favorite_works WHERE code NOT IN (SELECT code FROM works);
+
+allWorkCodes:
+SELECT code FROM works;
+
+-- 待刮削的番号：从没刮过的（scraped_at = 0），加上刮到了但封面为空的。
+-- 后者是「刮削源不通/页面改版导致封面没解析出来」的自愈通道：网络恢复或用户换了
+-- 域名之后，下一轮 enrich（启动进海报墙、换源、扫描后都会跑）自动把这些补上，
+-- 不会永远停在占位图上。markScraped 照常写 scraped_at，靠 cover_url 判空再纳入。
+codesNeedingScrape:
+SELECT code FROM works WHERE scraped_at = 0 OR cover_url IS NULL OR cover_url = '';
+
+insertWorkActor:
+INSERT OR REPLACE INTO work_actors (work_code, actor_name) VALUES (?, ?);
+
+insertWorkTag:
+-- OR IGNORE：用户已经手动加过同名标签时保留它（custom = 1），别被刮削覆盖回去
+INSERT OR IGNORE INTO work_tags (work_code, tag_name) VALUES (?, ?);
+
+deleteWorkActorsFor:
+DELETE FROM work_actors WHERE work_code = ?;
+
+deleteWorkTagsFor:
+DELETE FROM work_tags WHERE work_code = ?;
+
+markWorkScraped:
+UPDATE works SET title = ?, cover_url = ?, release_date = ?, duration = ?, summary = ?, studio = ?, series = ?, provider = ?, mt_provider = ?, mt_id = ?, preview_video_url = ?, scraped_at = ?
+WHERE code = ?;
+
+-- 手动上传的封面（本机图片路径）：只换图，scraped_at 与其它元数据都不动，
+-- 所以它在列表里仍然算「未刮削」，下次补刮还能再试一次。
+updateWorkCover:
+UPDATE works SET cover_url = ? WHERE code = ?;
+
+selectAllWorks:
+SELECT code, title, title_zh, cover_url, release_date, duration, scraped_at FROM works
+-- 有发行日期的按日期倒序在前；没有的（待刮削、未识别番号）统一压到最后
+ORDER BY (release_date IS NULL) ASC, release_date DESC, code DESC;
+
+selectFavoriteWorks:
+SELECT w.code, w.title, w.title_zh, w.cover_url, w.release_date, w.duration, w.scraped_at
+FROM works w JOIN favorite_works f ON f.code = w.code
+ORDER BY f.created_at DESC, w.release_date DESC, w.code DESC;
+
+selectWorksByActor:
+SELECT w.code, w.title, w.title_zh, w.cover_url, w.release_date, w.duration, w.scraped_at
+FROM works w JOIN work_actors a ON a.work_code = w.code
+WHERE a.actor_name = ?
+ORDER BY w.release_date DESC, w.code DESC;
+
+selectWorksByTag:
+SELECT w.code, w.title, w.title_zh, w.cover_url, w.release_date, w.duration, w.scraped_at
+FROM works w JOIN work_tags t ON t.work_code = w.code
+WHERE t.tag_name = ?
+ORDER BY w.release_date DESC, w.code DESC;
+
+selectWork:
+SELECT code, title, title_zh, cover_url, release_date, duration, summary, studio, series, provider, mt_provider, mt_id, preview_video_url, scraped_at FROM works WHERE code = ?;
+
+-- 详情页截图墙：position = 0 是封面，其后是片段截图
+selectImagesForWork:
+SELECT url FROM work_images WHERE work_code = ? ORDER BY position;
+
+insertWorkImage:
+INSERT OR REPLACE INTO work_images (work_code, url, position) VALUES (?, ?, ?);
+
+deleteWorkImagesFor:
+DELETE FROM work_images WHERE work_code = ?;
+
+clearWorkImages:
+DELETE FROM work_images;
+
+-- 换 MetaTube 域名后重拼图片地址（封面与截图都带同一个 base 前缀），不用重新刮削
+rebuildCoverUrls:
+UPDATE works SET cover_url = replace(cover_url, :oldBase, :newBase) WHERE cover_url LIKE :oldBase || '%';
+
+rebuildImageUrls:
+UPDATE work_images SET url = replace(url, :oldBase, :newBase) WHERE url LIKE :oldBase || '%';
+
+-- 重建预览片地址同理：库里存的是拼好的完整地址
+rebuildPreviewVideoUrls:
+UPDATE works SET preview_video_url = replace(preview_video_url, :oldBase, :newBase) WHERE preview_video_url LIKE :oldBase || '%';
+
+-- 从任意一条封面地址反推旧的 MetaTube 地址（换域名后重拼用）
+selectSampleCoverUrl:
+SELECT cover_url FROM works WHERE cover_url IS NOT NULL AND cover_url != '' LIMIT 1;
+
+selectFilesForWork:
+SELECT file_id, name, size, folder_id, part FROM work_files WHERE work_code = ? ORDER BY name;
+
+-- 详情页的演员与标签：带上收藏标志，长按可收藏/取消收藏
+selectActorsForWork:
+SELECT a.actor_name AS name, CASE WHEN f.actor_name IS NULL THEN 0 ELSE 1 END AS favorite
+FROM work_actors a LEFT JOIN favorite_actors f ON f.actor_name = a.actor_name
+WHERE a.work_code = ? ORDER BY a.actor_name;
+
+selectTagsForWork:
+SELECT t.tag_name AS name, CASE WHEN f.tag_name IS NULL THEN 0 ELSE 1 END AS favorite, t.custom AS custom
+FROM work_tags t LEFT JOIN favorite_tags f ON f.tag_name = t.tag_name
+WHERE t.work_code = ? ORDER BY t.tag_name;
+
+-- 刮削重写标签：只删源站带来的，用户自己加的不动
+deleteScrapedTagsFor:
+DELETE FROM work_tags WHERE work_code = ? AND custom = 0;
+
+-- 详情页手动加标签，标成自定义
+insertCustomTag:
+INSERT OR REPLACE INTO work_tags (work_code, tag_name, custom) VALUES (?, ?, 1);
+
+deleteWorkTag:
+DELETE FROM work_tags WHERE work_code = ? AND tag_name = ?;
+
+-- 演员与标签带收藏标志：favorite = 1 的排最前（收藏置顶），其余按作品数排
+selectActors:
+SELECT a.actor_name AS name, COUNT(*) AS count,
+       CASE WHEN f.actor_name IS NULL THEN 0 ELSE 1 END AS favorite
+FROM work_actors a LEFT JOIN favorite_actors f ON f.actor_name = a.actor_name
+GROUP BY a.actor_name ORDER BY favorite DESC, count DESC, name;
+
+selectTags:
+SELECT t.tag_name AS name, COUNT(*) AS count,
+       CASE WHEN f.tag_name IS NULL THEN 0 ELSE 1 END AS favorite
+FROM work_tags t LEFT JOIN favorite_tags f ON f.tag_name = t.tag_name
+GROUP BY t.tag_name ORDER BY favorite DESC, count DESC, name;
+
+selectFileCounts:
+SELECT work_code, COUNT(*) AS count, SUM(size) AS total FROM work_files GROUP BY work_code;
+
+-- 搜索：番号、标题、译名、演员、标签任一处命中就算。返回匹配的番号集合，列表查询再按它过滤
+searchCodes:
+SELECT code FROM works WHERE code LIKE :pattern OR title LIKE :pattern OR title_zh LIKE :pattern
+UNION
+SELECT work_code FROM work_actors WHERE actor_name LIKE :pattern
+UNION
+SELECT work_code FROM work_tags WHERE tag_name LIKE :pattern;
+
+-- 列表卡片左下角显示的女优名：每部作品取一个（按名字排序的第一个）
+selectFirstActors:
+SELECT work_code, MIN(actor_name) AS actor FROM work_actors GROUP BY work_code;
+
+selectWorkCount:
+SELECT COUNT(*) FROM works;
+
+-- 已刮到元数据的作品数（未识别与刮削失败的都不算）
+selectScrapedCount:
+SELECT COUNT(*) FROM works WHERE scraped_at > 0;
+
+-- 译名：AI 翻译与手动修改都写这一列。传空串表示恢复原标题
+setWorkTitleZh:
+UPDATE works SET title_zh = ? WHERE code = ?;
+
+-- 还需要翻标题的作品：有原文、还没译名。未识别番号的（title 为空）不参与
+selectCodesNeedingTitleTranslation:
+SELECT code FROM works
+WHERE title IS NOT NULL AND trim(title) <> '' AND (title_zh IS NULL OR trim(title_zh) = '')
+ORDER BY (release_date IS NULL) ASC, release_date DESC, code DESC;
+
+-- 译名同步到网盘：整份导出（code → 中文标题），只带已有译名的
+selectTitleTranslations:
+SELECT code, title_zh FROM works WHERE title_zh IS NOT NULL AND trim(title_zh) <> '';
+
+-- 从网盘拉下来的译名只补空：本机已经有的（可能是这台设备上刚改的）不动
+fillWorkTitleZh:
+UPDATE works SET title_zh = ? WHERE code = ? AND (title_zh IS NULL OR trim(title_zh) = '');
+
+-- ---------------------------------------------------------------- 同步记录
+
+upsertSyncMark:
+INSERT OR REPLACE INTO sync_marks (kind, key, at, title_value, on_flag) VALUES (?, ?, ?, ?, ?);
+
+-- 补历史记录：已经有记录的不动（INSERT OR IGNORE），时刻按调用方给的 0 算作最旧
+insertSyncMarkIfAbsent:
+INSERT OR IGNORE INTO sync_marks (kind, key, at, title_value, on_flag) VALUES (?, ?, ?, ?, ?);
+
+selectSyncMarks:
+SELECT kind, key, at, title_value, on_flag FROM sync_marks;
+
+-- 同步补历史：本机已有的自定义标签
+selectCustomTags:
+SELECT work_code, tag_name FROM work_tags WHERE custom = 1;
+
+-- 详情页加标签时的候选：用过一次的自定义标签，下次直接点
+selectCustomTagNames:
+SELECT DISTINCT tag_name FROM work_tags WHERE custom = 1 ORDER BY tag_name;
+
+-- 同步专用：按远端的记录直接写译名（不走 setWorkTitleZh，免得又刷一次本机时刻）
+applySyncTitleZh:
+UPDATE works SET title_zh = ? WHERE code = ?;
+
+selectSyncMarkOne:
+SELECT at FROM sync_marks WHERE kind = ? AND key = ?;
+
+-- 新设备先拉到了译名、后来才扫描：扫描把作品插进库时译名还是空的，这里按记录补上。
+-- 只补空的，本机翻好的不会被盖掉。
+backfillTitleZhFromMarks:
+UPDATE works SET title_zh = (
+    SELECT title_value FROM sync_marks
+    WHERE sync_marks.kind = 'title' AND sync_marks.key = works.code AND sync_marks.on_flag = 1
+)
+WHERE (title_zh IS NULL OR trim(title_zh) = '')
+  AND EXISTS (
+    SELECT 1 FROM sync_marks
+    WHERE sync_marks.kind = 'title' AND sync_marks.key = works.code
+      AND sync_marks.on_flag = 1 AND sync_marks.title_value IS NOT NULL
+);
+
+-- 批量翻译时一次取走，省得逐条查
+selectTitlePairs:
+SELECT code, title FROM works
+WHERE title IS NOT NULL AND trim(title) <> '' AND (title_zh IS NULL OR trim(title_zh) = '');
+
+selectScanState:
+SELECT root_folder_id, root_folder_name, last_scan_at, work_count, scanning FROM scan_state WHERE id = 0;
+
+setScanState:
+INSERT OR REPLACE INTO scan_state (id, root_folder_id, root_folder_name, last_scan_at, work_count, scanning)
+VALUES (0, ?, ?, ?, ?, ?);
+
+-- 收藏：作品/演员/标签的增删查。删除用 IF EXISTS 语义（DELETE 本身幂等）
+insertFavoriteWork:
+INSERT OR REPLACE INTO favorite_works (code, created_at) VALUES (?, ?);
+
+deleteFavoriteWork:
+DELETE FROM favorite_works WHERE code = ?;
+
+selectFavoriteWorkCodes:
+SELECT code FROM favorite_works;
+
+insertFavoriteActor:
+INSERT OR REPLACE INTO favorite_actors (actor_name, created_at) VALUES (?, ?);
+
+deleteFavoriteActor:
+DELETE FROM favorite_actors WHERE actor_name = ?;
+
+selectFavoriteActorNames:
+SELECT actor_name FROM favorite_actors;
+
+insertFavoriteTag:
+INSERT OR REPLACE INTO favorite_tags (tag_name, created_at) VALUES (?, ?);
+
+deleteFavoriteTag:
+DELETE FROM favorite_tags WHERE tag_name = ?;
+
+selectFavoriteTagNames:
+SELECT tag_name FROM favorite_tags;

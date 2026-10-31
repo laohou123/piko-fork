@@ -1,6 +1,8 @@
 package dev.piko.ui
 
 import dev.piko.shared.sync.ArchivePasswordSync
+import dev.piko.shared.sync.DriveSettingsStore
+import dev.piko.shared.sync.LibrarySync
 import dev.piko.shared.sync.PikoSettingsSync
 import dev.piko.shared.sync.SyncCipher
 import dev.piko.shared.sync.SourceLedgerSync
@@ -21,6 +23,14 @@ import dev.piko.shared.data.PikoClientManager
 import dev.piko.shared.data.PreviewTempFolder
 import dev.piko.shared.data.TaskRepository
 import dev.piko.shared.download.PikoDownloadCoordinator
+import dev.piko.shared.library.LibraryDriverFactory
+import dev.piko.shared.library.LibraryScraper
+import dev.piko.shared.library.LibraryStore
+import dev.piko.shared.translate.TranslationGateway
+import dev.piko.shared.library.MetaTubeScraper
+import dev.piko.shared.library.SubtitleFileSaver
+import dev.piko.shared.library.SubtitleSource
+import dev.piko.shared.library.SubtitleSourceOption
 import dev.piko.shared.media.PikoMediaRepository
 import dev.piko.shared.state.ArchiveBrowser
 import dev.piko.shared.state.ArchiveExtractSession
@@ -31,6 +41,8 @@ import dev.piko.shared.state.DuplicateSession
 import dev.piko.shared.state.InstantSaveRecords
 import dev.piko.shared.state.InstantSession
 import dev.piko.shared.state.InstantSheetState
+import dev.piko.shared.state.PosterWallState
+import dev.piko.shared.state.SubtitleSearchState
 import dev.piko.shared.state.launchOnAccountLeave
 import dev.piko.shared.upload.PikoUploadCoordinator
 import dev.piko.shared.upload.PikoUploadSources
@@ -38,6 +50,7 @@ import dev.piko.shared.net.PikPakDomainSelector
 import dev.piko.shared.log.PikoLog
 import dev.piko.shared.log.logFailure
 import dev.piko.shared.scrape.MetaTubeService
+import io.ktor.client.HttpClient
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -47,6 +60,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
 
@@ -66,6 +80,28 @@ class PikoServices(
     syncCipher: SyncCipher? = null,
     /** 用户自己部署的 MetaTube，两端传入；为 null 时设置里没有刮削一组（截图环境）。 */
     val metaTube: MetaTubeService? = null,
+    /**
+     * 海报墙索引库的驱动工厂：每个账号一个 SQLite 文件，Android 与桌面在各自入口实现
+     * （见 [LibraryDriverFactory]）。为 null 时整个海报墙不可用（截图环境）。
+     */
+    libraryDriverFactory: LibraryDriverFactory? = null,
+    /**
+     * 海报墙刮削源与字幕源共用的 HTTP 客户端工厂（引擎在各端入口建，原因同 MetaTube）。
+     * 为 null 时海报墙只有扫描与列表，不能刮元数据、不能搜字幕。
+     */
+    scrapeHttpClientFactory: (() -> HttpClient)? = null,
+    /**
+     * 用 [scrapeHttpClientFactory] 的客户端建字幕源列表（jvmSharedMain 里实现，各端入口传入）。
+     * 列表顺序就是面板里「字幕源」下拉的顺序，第一项是默认源。
+     */
+    subtitleSourceFactory: ((HttpClient) -> List<SubtitleSourceOption>)? = null,
+    /**
+     * 翻译用的 HTTP 客户端。单独一个是因为刮削/字幕客户端压了 30 秒超时，
+     * 而一次翻 550 字可能要几十秒，用同一个会被自己的超时切断。
+     */
+    translationHttpClientFactory: (() -> HttpClient)? = null,
+    /** 抓到的字幕写本机、交出上传 uri 的实现（Android 走 FileProvider，桌面写文件）。 */
+    subtitleSaver: SubtitleFileSaver? = null,
     localFileAccess: (((String) -> Unit) -> dev.piko.shared.data.LocalFileAccess)? = null,
 ) {
     private val appNoticesChannel = Channel<String>(Channel.BUFFERED)
@@ -139,7 +175,17 @@ class PikoServices(
     val moveHistory = MoveHistory(preferences, driveRepository, backgroundScope)
 
     /** 部分设置同步到网盘的 .piko 文件夹，登录后自己开始，见 PikoSettingsSync。 */
-    val settingsSync = PikoSettingsSync(clientManager, driveRepository, preferences, cacheStore, backgroundScope, preferences.settingsSyncFlow)
+    val settingsSync = PikoSettingsSync(
+        clientManager,
+        driveRepository,
+        preferences,
+        cacheStore,
+        backgroundScope,
+        preferences.settingsSyncFlow,
+        // MetaTube 令牌与翻译 Key 跟着设置走，但要加密：密钥由账号密码派生
+        cipher = syncCipher,
+        passwordOf = clientManager::savedPassword,
+    )
         .also { it.start() }
     private val vaultTreeSync = VaultTreeSync(clientManager, driveRepository, backgroundScope, preferences.settingsSyncFlow)
         .also { it.start() }
@@ -159,6 +205,67 @@ class PikoServices(
     val domainSelector = PikPakDomainSelector(clientManager, preferences, backgroundScope).also { it.start() }
 
     val uploadManager = PikoUploadCoordinator(clientManager, preferences, uploadSources, driveRepository, backgroundScope)
+
+    // 海报墙：索引库（按账号一个 SQLite 文件）+ 刮削源（MetaTube）+ 字幕源。
+    // 刮削源的地址与令牌复用设置里的 MetaTube 配置，用户只配一次。
+    val libraryStore: LibraryStore? = libraryDriverFactory?.let { factory ->
+        // 每次现取当前账号：换号后读写的是新账号的库，provider 在每回操作时被调用
+        LibraryStore(factory) { clientManager.currentClient.value?.account }
+    }
+    /**
+     * 刮削走 MetaTube：图片与元数据都经服务端代理，客户端不直连源站
+     * （JavBus 直抓那条路已删除——反爬与图片防盗链都绕不过去）。
+     */
+    val libraryScraper: LibraryScraper? = libraryStore?.let {
+        scrapeHttpClientFactory?.let { http -> MetaTubeScraper(platformPreferences, http) }
+    }
+    /** 可搜的字幕源，面板上的「字幕源」下拉按这个列表铺；空列表表示这台机器上没有可用的源。 */
+    val subtitleSources: List<SubtitleSourceOption> = scrapeHttpClientFactory?.let { http ->
+        subtitleSourceFactory?.invoke(http())
+    }.orEmpty()
+
+    /** 默认源（列表第一个）。旧调用点只认一个源时用它。 */
+    val subtitleSource: SubtitleSource? = subtitleSources.firstOrNull()?.source
+    val subtitleSaver: SubtitleFileSaver? = subtitleSaver
+
+    /**
+     * AI 翻译：片名与字幕共用一套配置（地址 / Key / 模型），每次调用现读偏好，
+     * 用户改完设置立即生效。没配齐时 [TranslationGateway.isConfigured] 为 false。
+     */
+    /** 翻译用的 HTTP 客户端；字幕翻译面板读本机代理流也用它。 */
+    val translationHttp: HttpClient? = translationHttpClientFactory?.invoke()
+
+    val translation: TranslationGateway? = translationHttp?.let { http ->
+        TranslationGateway(platformPreferences) { http }
+    }
+
+    /** 海报墙页的进程级状态：扫描与补刮不随离开页面而停。 */
+    val posterWall: PosterWallState? = libraryStore?.let { store ->
+        PosterWallState(
+            clients = clientManager,
+            store = store,
+            scraper = libraryScraper,
+            metaTubeBase = { platformPreferences.metaTubeUrlFlow.first().trim() },
+            translation = translation,
+            scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate),
+        )
+    }
+
+    /**
+     * 译名与收藏（作品/演员/标签）随账号同步到网盘 `.piko/library-*.json`。
+     * 单独一份：它们是库数据，体积随作品数长，不该跟着改设置一起重传。
+     */
+    val librarySync: LibrarySync? = libraryStore?.let { store ->
+        LibrarySync(
+            clients = clientManager,
+            remote = DriveSettingsStore(clientManager, driveRepository, "library-"),
+            store = store,
+            scope = backgroundScope,
+            enabled = preferences.settingsSyncFlow,
+            // 别的设备改了译名或收藏：让海报墙重读一遍，不用退出去再进来
+            onApplied = { posterWall?.refreshList() },
+        ).also { it.start() }
+    }
 
     val instantSaveRecords = InstantSaveRecords(clientManager, cacheStore, backgroundScope)
     val receivingActivity by lazy { dev.piko.shared.presentation.ReceivingActivity(instantSaveRecords, uploadManager, instantMagnetRepository.offlineSubmissions, archiveExtractSession, offlinePacks, backgroundScope) }
@@ -293,8 +400,23 @@ class PikoServices(
         }
         backgroundScope.launch {
             val cleanedAccounts = mutableSetOf<String>()
+            // 海报墙索引按账号各一份。启动时登录态是异步恢复的，PosterWallState.init
+            // 往往跑在账号就绪之前——那时库还打不开，列表为空、目录显示「未选择」。
+            // 这里在账号第一次就绪时补一次重载，换号与重新登录同样走这条路
+            var loadedPosterAccount: String? = null
             clientManager.currentClient.collectLatest { client ->
-                if (client == null) return@collectLatest
+                if (client == null) {
+                    // 登出：海报墙不能留着上一个账号的作品与目录
+                    if (loadedPosterAccount != null) {
+                        loadedPosterAccount = null
+                        posterWall?.onAccountChanged()
+                    }
+                    return@collectLatest
+                }
+                if (client.account != loadedPosterAccount) {
+                    loadedPosterAccount = client.account
+                    posterWall?.onAccountChanged()
+                }
                 // 上次进程被杀时面板来不及清 Piko-Temp，登录后补上。每个账号只清一次：断线重连
                 // 也会换一个新的 client，那时面板可能正开着，预览的文件还要用
                 if (cleanedAccounts.add(client.account)) previewTempFolder.clear(client).logFailure(TAG, "登录后清理 Piko-Temp 失败")

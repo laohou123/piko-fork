@@ -142,7 +142,7 @@ internal fun AboutSection(snackbarHostState: SnackbarHostState, modifier: Modifi
     }
 }
 
-private const val REPOSITORY_URL = "https://github.com/NihilDigit/piko"
+private const val REPOSITORY_URL = "https://github.com/laohou123/piko-fork"
 
 // 更新与公告发在这个频道里，应用内不另做公告栏
 private const val CHANNEL_URL = "https://t.me/piko_dev"

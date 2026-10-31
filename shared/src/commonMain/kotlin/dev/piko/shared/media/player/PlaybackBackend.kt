@@ -81,6 +81,14 @@ interface PlaybackBackend {
      */
     fun addSubtitle(subtitle: ExternalSubtitle) = Unit
 
+    /**
+     * 卸下一条外挂字幕。[trackId] 来自 [subtitleTracks]，只有 [MediaTrack.isExternal]
+     * 的轨道能卸（容器内自带的字幕属于文件本身，不归这里管）。
+     *
+     * 用于「字幕文件被删掉」之后：不卸的话画面还在用那份已经取不到的流。
+     */
+    fun removeSubtitle(trackId: String) = Unit
+
     /** 为 false 时控件不给旋转入口。 */
     val supportsRotation: Boolean get() = false
 

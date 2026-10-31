@@ -262,8 +262,9 @@ class GithubReleaseClient(
          * 它也取不到 Release 附件。
          */
         val LATEST_RELEASE_SOURCES = listOf(
-            "https://api.github.com/repos/NihilDigit/piko/releases/latest",
-            "${GITHUB_PREFIX}NihilDigit/piko/releases/latest/download/$RELEASE_MANIFEST",
+            // 指向上游的定制分支：不要跟着 NihilDigit/piko 走，否则会把海报墙版覆盖成原版
+            "https://api.github.com/repos/laohou123/piko-fork/releases/latest",
+            "${GITHUB_PREFIX}laohou123/piko-fork/releases/latest/download/$RELEASE_MANIFEST",
         )
 
         /** release.yml 为每个版本附上的 Release 信息，与 GitHub API 的 releases/latest 同形。 */

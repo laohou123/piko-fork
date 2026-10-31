@@ -309,4 +309,71 @@ interface PikoUserPreferences {
     /** MetaTube 的访问令牌（服务端的 TOKEN）。机密，由平台加密存放，不进设置同步。空串表示没填。 */
     val metaTubeTokenFlow: Flow<String>
     suspend fun setMetaTubeToken(token: String)
+
+    /**
+     * 作品详情页顶部是否自动播放预览片（播这部片自己的画面），默认开。
+     * 关掉后顶部只显示封面，点底部「播放」才进播放器——省流量、省网盘连接。
+     */
+    val posterAutoPreviewFlow: Flow<Boolean>
+    suspend fun setPosterAutoPreviewEnabled(enabled: Boolean)
+
+    /**
+     * 详情页预览片最高用多少画面高度（1080/720/480），0 表示自动（原画）。
+     * 预览只是看一眼画面，降档能明显省流量与解码开销。
+     */
+    val posterPreviewMaxHeightFlow: Flow<Int>
+    suspend fun setPosterPreviewMaxHeight(height: Int)
+
+    /**
+     * AI 翻译用的接口地址，OpenAI 兼容（`/chat/completions`），如 `https://api.deepseek.com/v1`。
+     * 空串表示没配，界面上翻译入口置灰。每台设备各自的：本地模型与中转站的地址不通用。
+     *
+     * 1.3.11 起改由「档案」承载（见 [translationProfilesFlow]）：地址、Key、模型合成一套档案，
+     * 这套旧字段只留作升级迁移的源，之后不再单独使用。
+     */
+    val translationBaseUrlFlow: Flow<String>
+    suspend fun setTranslationBaseUrl(url: String)
+
+    /** 翻译用的 API Key。机密，由平台加密存放，不进设置同步。空串表示没填。迁移源，见上。 */
+    val translationApiKeyFlow: Flow<String>
+    suspend fun setTranslationApiKey(key: String)
+
+    /** 模型名，如 `deepseek-chat`、`gpt-4o-mini`。空串表示没填。迁移源，见上。 */
+    val translationModelFlow: Flow<String>
+    suspend fun setTranslationModel(model: String)
+
+    /**
+     * AI 翻译档案列表的 JSON（含密钥，平台层加密落盘）。空串表示没配过。
+     * 升级时由旧三件套迁来第一个档案，见 `TranslationProfileStore`。
+     */
+    val translationProfilesFlow: Flow<String>
+    suspend fun setTranslationProfiles(json: String)
+
+    /** 当前激活的档案 id；空串表示用列表里第一个。 */
+    val translationActiveProfileFlow: Flow<String>
+    suspend fun setTranslationActiveProfile(id: String)
+
+    /**
+     * 推理强度：空串表示关（不传参数，最快），或 `low` / `medium` / `high`。
+     * 只对认这个参数的服务生效；不认的会在第一次被拒后自动去掉。
+     */
+    val translationReasoningFlow: Flow<String>
+    suspend fun setTranslationReasoning(level: String)
+
+    /**
+     * 字幕翻译的自定义提示词。空串表示用内置默认（中日文影视字幕那一套）。
+     * 片名翻译不受这里影响——两者要的规矩不一样。
+     */
+    val translationPromptFlow: Flow<String>
+    suspend fun setTranslationPrompt(prompt: String)
+
+    /**
+     * 同时发出的翻译请求数。0 表示默认（[DEFAULT_TRANSLATION_CONCURRENCY]）。
+     * 调高换速度，代价是更容易被服务商限流（429）——限流本身有退避重试，不会失败，只是会变慢。
+     */
+    val translationConcurrencyFlow: Flow<Int>
+    suspend fun setTranslationConcurrency(count: Int)
 }
+
+/** 没选过并发时的默认值：比早期的 3/4 翻倍，又不至于把免费额度打到限流。 */
+const val DEFAULT_TRANSLATION_CONCURRENCY = 6

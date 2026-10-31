@@ -54,6 +54,8 @@ androidxTestExtJunit = "1.2.1"
 # 只取它按平台 jar 里的 libzstd 原生库捆进 Windows 安装包，解码经 FFM 直调 C API（desktopApp 的 update/ZstdPatch.kt）。
 # 1.0.0 走不了补丁靠的就是这个库，升级换掉它后 1.0.0 可能重新对得上补丁，届时发版构建失败，见 desktopApp/build.gradle.kts 的 checkRetired
 zstdJni = "1.5.7-20"
+sqldelight = "2.0.2"
+jsoup = "1.18.3"
 
 [libraries]
 cmp-components-resources = { module = "org.jetbrains.compose.components:components-resources", version.ref = "composeMultiplatform" }
@@ -126,6 +128,12 @@ androidx-test-ext-junit = { module = "androidx.test.ext:junit", version.ref = "a
 androidx-compose-ui-test-junit4 = { module = "androidx.compose.ui:ui-test-junit4" }
 androidx-compose-ui-test-manifest = { module = "androidx.compose.ui:ui-test-manifest" }
 
+sqldelight-runtime = { module = "app.cash.sqldelight:runtime", version.ref = "sqldelight" }
+sqldelight-coroutines-extensions = { module = "app.cash.sqldelight:coroutines-extensions", version.ref = "sqldelight" }
+sqldelight-android-driver = { module = "app.cash.sqldelight:android-driver", version.ref = "sqldelight" }
+sqldelight-sqlite-driver = { module = "app.cash.sqldelight:sqlite-driver", version.ref = "sqldelight" }
+jsoup = { module = "org.jsoup:jsoup", version.ref = "jsoup" }
+
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
 android-kotlin-multiplatform-library = { id = "com.android.kotlin.multiplatform.library", version.ref = "agp" }
@@ -134,3 +142,4 @@ kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", versi
 kotlin-multiplatform = { id = "org.jetbrains.kotlin.multiplatform", version.ref = "kotlin" }
 compose = { id = "org.jetbrains.compose", version.ref = "composeGradlePlugin" }
 ksp = { id = "com.google.devtools.ksp", version.ref = "ksp" }
+sqldelight = { id = "app.cash.sqldelight", version.ref = "sqldelight" }

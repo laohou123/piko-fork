@@ -1,0 +1,17 @@
+-- v4→v5：刮削源从 JavBus 直抓换成 MetaTube。
+-- works 记 MetaTube 的数据源名与影片 ID（换 MetaTube 域名后靠它重拼图片地址），
+-- 另存预览片地址；截图墙独立一张表，position = 0 是封面。
+ALTER TABLE works ADD COLUMN mt_provider TEXT;
+ALTER TABLE works ADD COLUMN mt_id TEXT;
+ALTER TABLE works ADD COLUMN preview_video_url TEXT;
+
+CREATE TABLE work_images (
+    work_code TEXT NOT NULL,
+    url TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    PRIMARY KEY (work_code, position)
+);
+CREATE INDEX index_work_images_on_work_code ON work_images(work_code);
+
+-- 旧的刮削源设置（JavBus 域名）在 MetaTube 方案里没有意义了
+DROP TABLE IF EXISTS poster_settings;

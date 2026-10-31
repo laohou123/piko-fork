@@ -46,7 +46,9 @@ android {
     }
 
     defaultConfig {
-        applicationId = "dev.piko"
+        // 与上游官方版（dev.piko）区分开：包名不同才能同时装着，签名也各自独立。
+        // namespace 仍是 dev.piko，代码里的包结构不变
+        applicationId = "dev.piko.fork"
         minSdk = 26
         targetSdk = 37
         versionCode = appVersionCode.get()
@@ -125,6 +127,9 @@ dependencies {
 
     // 播放后端：预编译的 libmpv 与 FFmpeg（含 arm64/armv7/x86_64）
     implementation(libs.libmpv.android)
+
+    // 海报墙索引库的驱动（每账号一个 SQLite 文件，见 AndroidLibraryDriverFactory）
+    implementation(libs.sqldelight.android.driver)
 
     // AndroidX & Lifecycle
     implementation(libs.androidx.core.ktx)

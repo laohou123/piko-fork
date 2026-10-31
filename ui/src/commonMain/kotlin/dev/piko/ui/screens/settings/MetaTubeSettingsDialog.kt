@@ -49,7 +49,13 @@ internal fun MetaTubeSettingsDialog(
     SettingsInputDialog(
         icon = Icons.Outlined.TravelExplore,
         title = "MetaTube",
-        description = tr("按番号命名时从自建的 MetaTube 服务获取片名。地址留空即不使用。", "Get titles from your MetaTube server when naming by catalog code. Leave the URL empty to disable.", "作品番号で命名するときに、自分のMetaTubeサーバーから作品名を取得します。アドレスを空にすると無効になります。", "품번으로 이름 지정 시 자체 MetaTube 서버에서 제목을 가져옵니다. 주소를 비워 두면 사용하지 않습니다.", "按番號命名時從自建的 MetaTube 服務取得片名。位址留空即不使用。"),
+        description = tr(
+            "海报墙的封面、截图与元数据都从这里取；按番号命名时也用它查片名。地址留空则海报墙没有封面。",
+            "Poster wall covers, screenshots, and metadata all come from here, and titles are fetched from it when renaming by code. Leave the URL empty and the poster wall will have no covers.",
+            "ポスターウォールのカバー、スクリーンショット、メタデータはすべてここから取得します。品番での命名時にも作品名を取得します。アドレスを空にするとポスターウォールにカバーが表示されません。",
+            "포스터 월의 커버, 스크린샷, 메타데이터를 모두 여기에서 가져오며 품번으로 이름 지정 시 제목도 여기에서 조회합니다. 주소를 비워 두면 포스터 월에 커버가 표시되지 않습니다.",
+            "海報牆的封面、截圖與中繼資料都從這裡取得；按番號命名時也用它查片名。位址留空則海報牆沒有封面。",
+        ),
         onSave = { onSave(trimmedUrl, token.trim()) },
         saveEnabled = !urlInvalid,
         onDismiss = onDismiss,

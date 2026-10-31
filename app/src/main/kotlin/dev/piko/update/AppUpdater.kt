@@ -39,7 +39,8 @@ data class AndroidUpdate(
  * 从 GitHub Releases 检查并安装新版本。
  *
  * 发版由 v* tag 触发，Release 附按 ABI 拆分的 APK（piko-<版本>-<abi>.apk）与通用包。这里选
- * 本机主 ABI 的包，没有就退回通用包；下载时边写边算 SHA-256，与 GitHub 为附件公布的 digest
+ * 本机主 ABI 的包，没有就退回通用包；两者都没有、整个 Release 又只挂了一个 apk 时（早期发布
+ * 的附件名不规范）也认，见 [pickApk]。下载时边写边算 SHA-256，与 GitHub 为附件公布的 digest
  * 对不上不安装。安装走 PackageInstaller 会话而不是 ACTION_INSTALL_PACKAGE，后者自 API 29 弃用。
  *
  * debug 包的包名是 dev.piko.debug，Release 里是 dev.piko，装上去是另一个应用而不是升级，
@@ -142,13 +143,25 @@ class AppUpdater(private val context: Context) : GithubUpdateService<AndroidUpda
     internal fun onInstallFailed(message: String) {
         PikoLog.w(TAG, "系统安装未完成：$message")
         val update = (status as? UpdateStatus.Installing)?.update
-        status = UpdateStatus.Failed(tr("安装未完成", "Installation incomplete", "インストールが未完了です", "설치 미완료", "安裝未完成"), update)
+        // 界面上要说清是取消了还是失败了：只有一句「安装未完成」时，用户不知道该重试还是放弃
+        status = UpdateStatus.Failed(
+            tr("安装未完成：", "Installation incomplete: ", "インストールが未完了です: ", "설치 미완료: ", "安裝未完成：") + message,
+            update,
+        )
         mutableMessages.tryEmit(message)
     }
 
-    private fun pickApk(release: LatestRelease): ReleaseAsset? =
-        Build.SUPPORTED_ABIS.firstNotNullOfOrNull { release.asset("piko-${release.version}-$it.apk") }
-            ?: release.asset("piko-${release.version}-universal.apk")
+    private fun pickApk(release: LatestRelease): ReleaseAsset? {
+        val apks = release.assets.filter { it.name.endsWith(".apk", ignoreCase = true) }
+        // 规范命名 piko-<版本>-<abi>.apk：按本机 ABI 优先级挑，都没有再退通用包
+        Build.SUPPORTED_ABIS.firstNotNullOfOrNull { abi ->
+            apks.firstOrNull { it.name == "piko-${release.version}-$abi.apk" }
+        }?.let { return it }
+        apks.firstOrNull { it.name == "piko-${release.version}-universal.apk" }?.let { return it }
+        // 历史发布的附件名不规范（v0.5.0 叫 piko-poster-wall-release.apk）：整个 Release 只挂了一个
+        // apk 时就用它。不认它会被当成「本平台附件尚未上传」，界面误报已是最新，新版永远装不上
+        return apks.singleOrNull()
+    }
 
     private companion object {
         const val TAG = "Update"

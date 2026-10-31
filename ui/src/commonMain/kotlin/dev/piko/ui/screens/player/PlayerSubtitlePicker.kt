@@ -21,6 +21,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.outlined.Folder
 import androidx.compose.material.icons.outlined.Subtitles
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -81,7 +82,16 @@ internal fun DriveSubtitlePanel(
                 PickerRow(icon = Icons.Outlined.Folder, label = folder.name, onClick = { state.open(folder) })
             }
             items(state.subtitles, key = { "f:" + it.id }) { file ->
-                PickerRow(icon = Icons.Outlined.Subtitles, label = file.name, onClick = { onPick(file) })
+                PickerRow(
+                    icon = Icons.Outlined.Subtitles,
+                    label = file.name,
+                    onClick = { onPick(file) },
+                    trailing = {
+                        // 删的是网盘里的那个字幕文件（进回收站，可恢复），删完列表自己重列。
+                        // 按钮尺寸与样式见 SubtitleDeleteButton：带底圈的老版在多行时圆圈会贴到一起
+                        SubtitleDeleteButton(onClick = { state.delete(file) })
+                    },
+                )
             }
             val error = state.loadError
             when {

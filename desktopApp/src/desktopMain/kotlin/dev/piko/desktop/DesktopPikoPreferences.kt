@@ -43,6 +43,10 @@ class DesktopPikoPreferences(
     private val autoCheckUpdates = MutableStateFlow(settings.get(KEY_AUTO_CHECK_UPDATES, "true").toBoolean())
     private val autoDetectClipboardLinks = MutableStateFlow(settings.get("ui.autoDetectClipboardLinks") == "true")
     private val reduceMotion = MutableStateFlow(settings.get(KEY_REDUCE_MOTION) == "true")
+    /** 详情页顶部自动播放预览片，默认开。 */
+    private val posterAutoPreview = MutableStateFlow(settings.get(KEY_POSTER_AUTO_PREVIEW, "true").toBoolean())
+    /** 预览片最高画面高度，0 为自动。 */
+    private val posterPreviewMaxHeight = MutableStateFlow(settings.get(KEY_POSTER_PREVIEW_MAX_HEIGHT).toIntOrNull() ?: 0)
     private val hardwareDecoding = MutableStateFlow(settings.get(KEY_HARDWARE_DECODING, "true").toBoolean())
     private val playbackMaxHeight = MutableStateFlow(settings.get(KEY_PLAYBACK_MAX_HEIGHT).toIntOrNull() ?: 0)
     private val downloadMaxHeight = MutableStateFlow(settings.get(KEY_DOWNLOAD_MAX_HEIGHT).toIntOrNull())
@@ -160,6 +164,18 @@ class DesktopPikoPreferences(
     override suspend fun setReduceMotion(enabled: Boolean) {
         settings.set(KEY_REDUCE_MOTION, enabled.toString())
         reduceMotion.value = enabled
+    }
+
+    override val posterAutoPreviewFlow: Flow<Boolean> = posterAutoPreview.asStateFlow()
+    override suspend fun setPosterAutoPreviewEnabled(enabled: Boolean) {
+        settings.set(KEY_POSTER_AUTO_PREVIEW, enabled.toString())
+        posterAutoPreview.value = enabled
+    }
+
+    override val posterPreviewMaxHeightFlow: Flow<Int> = posterPreviewMaxHeight.asStateFlow()
+    override suspend fun setPosterPreviewMaxHeight(height: Int) {
+        settings.set(KEY_POSTER_PREVIEW_MAX_HEIGHT, height.toString())
+        posterPreviewMaxHeight.value = height
     }
 
     override val hardwareDecodingFlow: Flow<Boolean> = hardwareDecoding.asStateFlow()
@@ -444,10 +460,108 @@ class DesktopPikoPreferences(
         metaTubeToken.value = token
     }
 
+    private val translationBaseUrl = MutableStateFlow(settings.get(KEY_TRANSLATION_BASE_URL))
+    override val translationBaseUrlFlow: Flow<String> = translationBaseUrl.asStateFlow()
+    override suspend fun setTranslationBaseUrl(url: String) {
+        settings.set(KEY_TRANSLATION_BASE_URL, url)
+        translationBaseUrl.value = url
+    }
+
+    /** 与 MetaTube 令牌同样放系统保管处；null 表示还没读出来。 */
+    private val translationApiKey = MutableStateFlow<String?>(null)
+    override val translationApiKeyFlow: Flow<String> = translationApiKey.onStart {
+        if (translationApiKey.value == null) {
+            val stored = withSecrets { runCatching { secrets.read(SECRET_TRANSLATION_API_KEY)?.decodeToString() } }
+            translationApiKey.compareAndSet(
+                null,
+                stored.onFailure { PikoLog.w(TAG, "翻译 API Key 未能从系统保管处读出", it) }.getOrNull().orEmpty(),
+            )
+        }
+    }.filterNotNull()
+
+    override suspend fun setTranslationApiKey(key: String) {
+        withSecrets {
+            if (key.isEmpty()) {
+                secrets.delete(SECRET_TRANSLATION_API_KEY)
+            } else {
+                secrets.write(SECRET_TRANSLATION_API_KEY, key.encodeToByteArray())
+            }
+        }
+        translationApiKey.value = key
+    }
+
+    private val translationModel = MutableStateFlow(settings.get(KEY_TRANSLATION_MODEL))
+    override val translationModelFlow: Flow<String> = translationModel.asStateFlow()
+    override suspend fun setTranslationModel(model: String) {
+        settings.set(KEY_TRANSLATION_MODEL, model)
+        translationModel.value = model
+    }
+
+    /**
+     * 档案列表 JSON（含密钥）放系统保管处，与单项 Key 同等待遇；null 表示还没读出来。
+     */
+    private val translationProfiles = MutableStateFlow<String?>(null)
+    override val translationProfilesFlow: Flow<String> = translationProfiles.onStart {
+        if (translationProfiles.value == null) {
+            val stored = withSecrets { runCatching { secrets.read(SECRET_TRANSLATION_PROFILES)?.decodeToString() } }
+            translationProfiles.compareAndSet(
+                null,
+                stored.onFailure { PikoLog.w(TAG, "翻译档案未能从系统保管处读出", it) }.getOrNull().orEmpty(),
+            )
+        }
+    }.filterNotNull()
+
+    override suspend fun setTranslationProfiles(json: String) {
+        withSecrets {
+            if (json.isEmpty()) {
+                secrets.delete(SECRET_TRANSLATION_PROFILES)
+            } else {
+                secrets.write(SECRET_TRANSLATION_PROFILES, json.encodeToByteArray())
+            }
+        }
+        translationProfiles.value = json
+    }
+
+    private val translationActiveProfile = MutableStateFlow(settings.get(KEY_TRANSLATION_ACTIVE_PROFILE))
+    override val translationActiveProfileFlow: Flow<String> = translationActiveProfile.asStateFlow()
+    override suspend fun setTranslationActiveProfile(id: String) {
+        settings.set(KEY_TRANSLATION_ACTIVE_PROFILE, id)
+        translationActiveProfile.value = id
+    }
+
+    private val translationReasoning = MutableStateFlow(settings.get(KEY_TRANSLATION_REASONING))
+    override val translationReasoningFlow: Flow<String> = translationReasoning.asStateFlow()
+    override suspend fun setTranslationReasoning(level: String) {
+        settings.set(KEY_TRANSLATION_REASONING, level)
+        translationReasoning.value = level
+    }
+
+    private val translationPrompt = MutableStateFlow(settings.get(KEY_TRANSLATION_PROMPT))
+    override val translationPromptFlow: Flow<String> = translationPrompt.asStateFlow()
+    override suspend fun setTranslationPrompt(prompt: String) {
+        settings.set(KEY_TRANSLATION_PROMPT, prompt)
+        translationPrompt.value = prompt
+    }
+
+    private val translationConcurrency = MutableStateFlow(settings.get(KEY_TRANSLATION_CONCURRENCY).toIntOrNull() ?: 0)
+    override val translationConcurrencyFlow: Flow<Int> = translationConcurrency.asStateFlow()
+    override suspend fun setTranslationConcurrency(count: Int) {
+        settings.set(KEY_TRANSLATION_CONCURRENCY, count.toString())
+        translationConcurrency.value = count
+    }
+
     private companion object {
         const val TAG = "credentials"
         const val SECRET_METATUBE_TOKEN = "metatube-token"
+        const val SECRET_TRANSLATION_API_KEY = "translation-api-key"
+        const val SECRET_TRANSLATION_PROFILES = "translation-profiles"
         const val KEY_METATUBE_URL = "scrape.metaTubeUrl"
+        const val KEY_TRANSLATION_BASE_URL = "translate.baseUrl"
+        const val KEY_TRANSLATION_MODEL = "translate.model"
+        const val KEY_TRANSLATION_ACTIVE_PROFILE = "translate.activeProfile"
+        const val KEY_TRANSLATION_REASONING = "translate.reasoning"
+        const val KEY_TRANSLATION_PROMPT = "translate.prompt"
+        const val KEY_TRANSLATION_CONCURRENCY = "translate.concurrency"
 
         fun uploadCredentialsKey(taskId: String) = "upload-$taskId"
 
@@ -467,6 +581,8 @@ class DesktopPikoPreferences(
         const val KEY_PROXY_SETTING = "network.proxy"
         const val KEY_IGNORED_UPDATE = "update.ignoredVersion"
         const val KEY_SPOILER = "ui.spoilerBlur"
+        const val KEY_POSTER_AUTO_PREVIEW = "ui.posterAutoPreview"
+        const val KEY_POSTER_PREVIEW_MAX_HEIGHT = "ui.posterPreviewMaxHeight"
         const val KEY_AUTO_CHECK_UPDATES = "update.autoCheck"
         const val KEY_REDUCE_MOTION = "ui.reduceMotion"
         const val KEY_HARDWARE_DECODING = "player.hardwareDecoding"

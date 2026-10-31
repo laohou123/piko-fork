@@ -81,6 +81,8 @@ kotlin {
                 implementation(libs.ktor.client.logging)
                 implementation(libs.coil.compose)
                 implementation(libs.coil.network.okhttp)
+                // 海报墙索引库的驱动（每账号一个 SQLite 文件，见 DesktopLibraryDriverFactory）
+                implementation(libs.sqldelight.sqlite.driver)
                 // PikoUploadSources.open 返回 RawSource，shared 只以 implementation 引入
                 implementation(libs.kotlinx.io.core)
             }

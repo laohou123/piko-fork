@@ -64,6 +64,8 @@ import androidx.compose.material.icons.filled.FullscreenExit
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.PushPin
+import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.outlined.StarOutline
 import androidx.compose.material.icons.filled.Replay10
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
@@ -178,6 +180,9 @@ fun PlayerTopBar(
     onTracksClick: (() -> Unit)? = null,
     onStatsClick: (() -> Unit)? = null,
     onSettingsClick: (() -> Unit)? = null,
+    /** 作品收藏（海报墙收藏夹）：心形按钮，[onFavoriteClick] 为 null 时不显示。 */
+    isFavorite: Boolean = false,
+    onFavoriteClick: (() -> Unit)? = null,
 ) {
     // 桌面端独立的播放窗口没有标题栏：关窗按钮放在右上角，与其他按钮同款，左边的返回键与它重复，不再显示
     val framelessWindow = LocalFramelessWindow.current
@@ -259,6 +264,15 @@ fun PlayerTopBar(
                 icon = Icons.Outlined.Tune,
                 label = tr("播放设置", "Playback settings", "再生設定", "재생 설정", "播放設定"),
                 onClick = onSettingsClick,
+                tooltipBelow = true,
+            )
+        }
+        // 作品收藏：心形，实心表示已收藏（与海报墙收藏夹同一份数据）
+        if (onFavoriteClick != null) {
+            PlayerIconButton(
+                icon = if (isFavorite) Icons.Filled.Star else Icons.Outlined.StarOutline,
+                label = if (isFavorite) "取消收藏" else "收藏",
+                onClick = onFavoriteClick,
                 tooltipBelow = true,
             )
         }

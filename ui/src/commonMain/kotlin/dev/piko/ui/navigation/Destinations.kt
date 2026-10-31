@@ -34,6 +34,14 @@ sealed interface Screen : NavKey {
     @Serializable
     data class Library(val libraryId: String) : Screen
 
+    /** 海报墙的根：扫描目录、按番号收的作品网格。 */
+    @Serializable
+    data object PosterWall : Screen
+
+    /** 海报墙里的一部作品：封面、演员、标签与它名下的文件。 */
+    @Serializable
+    data class WorkDetail(val code: String) : Screen
+
     @Serializable
     data class VideoPlayer(
         val fileId: String,
@@ -44,7 +52,9 @@ sealed interface Screen : NavKey {
     ) : Screen
 }
 
+/** 底部导航的标签页，**声明顺序就是底部栏的顺序**（海报墙放最左，进 App 先到它）。 */
 enum class MainTab(private val titleText: () -> String) {
+    POSTERS({ tr("海报墙", "Posters", "ポスター", "포스터", "海報牆") }),
     FILES({ tr("文件", "Files", "ファイル", "파일", "檔案") }),
     TRANSFERS({ tr("任务", "Tasks", "タスク", "작업", "任務") }),
     SETTINGS({ tr("我的", "Me", "マイページ", "내 정보", "我的") }),

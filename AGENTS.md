@@ -77,6 +77,15 @@ gh workflow run release.yml -f version=9.9.9      # 发版演练：完整执行�
 
 Windows 触摸与手写笔接入 Compose Desktop 的桥接库独立发布于 `dev.nihildigit:compose-windows-touch`（仓库 `NihilDigit/compose-windows-touch`，版本记录于 `gradle/libs.versions.toml`）；本地联调时在 `local.properties` 中写入 `windowstouch.dir=../compose-windows-touch` 即可启用复合构建。
 
+### 海报墙与刮削（本分支新增）
+
+上游没有这套东西，是本分支在海报墙上的全部增量，改动时注意别与上游的重构撞车：
+
+- `shared/.../library`：按账号各一个 SQLite（`Library.sq` + `2.sqm`..`7.sqm` 迁移），存作品、文件、演员、标签、收藏；
+- `shared/.../state/PosterWallState.kt`：扫描、筛选、搜索、补刮的状态机；`ui/.../screens/poster`：海报墙、作品详情、目录选择；
+- 刮削走自建 MetaTube 代理（`MetaTubeScraper`），字幕源与 AI 翻译在 `shared/.../library/Subtitle*`、`shared/.../translate`；
+- 与上游的接缝只有几处：`PikoServices` 的构造参数、`PikoMainScaffold` 的 `MainTab.POSTERS` 分支、`AndroidPikoPlatform` / `DesktopPikoPlatform` 的 `CoverPicker` 与 `LibraryDriverFactory`、`PikoSettingsSync` 的同步项。合并上游时优先保证这几处编译通过，其余按上游结构走。
+
 ### 自适应前端与状态归属
 
 所有平台共用同一套自适应工作区模型（详见 `docs/development/adaptive-frontend-framework.md`、`docs/development/interaction-refactor.md` 与 `ui/AGENTS.md`）：

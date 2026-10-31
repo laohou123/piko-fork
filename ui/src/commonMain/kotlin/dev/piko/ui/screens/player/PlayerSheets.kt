@@ -49,12 +49,14 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.outlined.Cloud
+import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.FileOpen
 import androidx.compose.material.icons.outlined.Movie
+import androidx.compose.material.icons.outlined.Search
+import androidx.compose.material.icons.outlined.Translate
 import androidx.compose.material3.ButtonGroupDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
@@ -105,11 +107,25 @@ import dev.piko.ui.components.ActionIconRow
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.rememberUpdatedState
 import kotlinx.coroutines.delay
+import dev.piko.shared.media.player.DriveSubtitleFile
 import dev.piko.shared.media.player.PlaybackStatsSection
 import androidx.compose.foundation.text.selection.SelectionContainer
 import kotlin.math.roundToInt
 
-internal enum class PlayerSheet { Episodes, Settings, Tracks, DriveSubtitles, Stats }
+internal enum class PlayerSheet {
+    Episodes, Settings, Tracks, DriveSubtitles, TranslateSubtitle, SearchSubtitle, Stats
+}
+
+/**
+ * 在播放器里搜字幕需要知道的三样：拿什么词搜、字幕下到哪个目录、目录叫什么。
+ * 三者齐全才给出「搜索字幕」入口，缺一个就退回调用方的外部面板。
+ * 对 app 模块可见（PlayerControlsOverlay 的参数），所以是 public 而没标 internal。
+ */
+data class SubtitleSearchTarget(
+    val code: String,
+    val folderId: String,
+    val folderName: String,
+)
 
 /**
  * 播放器的面板容器：横屏是贴右侧的浮动 side sheet，竖屏是 bottom sheet。
@@ -141,7 +157,9 @@ internal fun PlayerSheetHost(
         ) {
             // 选集与网盘字幕固定占七成高：按内容定高时几十项会顶满全屏，几项时又只露一条，
             // 字幕目录里进出一层面板还会跟着跳。其余面板内容少，按内容定高
-            val fixedHeight = sheet == PlayerSheet.Episodes || sheet == PlayerSheet.DriveSubtitles
+            val fixedHeight = sheet == PlayerSheet.Episodes ||
+                sheet == PlayerSheet.DriveSubtitles || sheet == PlayerSheet.TranslateSubtitle ||
+                sheet == PlayerSheet.SearchSubtitle
             val height = if (fixedHeight) Modifier.fillMaxHeight(EPISODE_SHEET_HEIGHT_FRACTION) else Modifier
             Column(height.wheelStaysInSheet()) {
                 Text(
@@ -160,7 +178,15 @@ private val PlayerSheet.title: String
         PlayerSheet.Episodes -> tr("选集", "Playlist", "再生リスト", "재생 목록", "選集")
         PlayerSheet.Settings -> tr("播放设置", "Playback settings", "再生設定", "재생 설정", "播放設定")
         PlayerSheet.Tracks -> tr("音轨与字幕", "Audio and subtitles", "音声と字幕", "오디오 및 자막", "音軌與字幕")
-        PlayerSheet.DriveSubtitles -> tr("从网盘选择字幕", "Choose subtitles from drive", "ドライブから字幕を選択", "드라이브에서 자막 선택", "從雲端硬碟選擇字幕")
+        PlayerSheet.DriveSubtitles -> tr(
+            "网盘字幕（右侧图标可删除）",
+            "Drive subtitles (delete with the icon on the right)",
+            "ドライブ字幕（右のアイコンで削除）",
+            "드라이브 자막 (오른쪽 아이콘으로 삭제)",
+            "網盤字幕（右側圖示可刪除）",
+        )
+        PlayerSheet.TranslateSubtitle -> tr("AI 翻译字幕", "AI subtitle translation", "AI 字幕翻訳", "AI 자막 번역", "AI 翻譯字幕")
+        PlayerSheet.SearchSubtitle -> tr("搜索字幕", "Search subtitles", "字幕を検索", "자막 검색", "搜尋字幕")
         PlayerSheet.Stats -> tr("详细信息", "Details", "詳細情報", "세부 정보", "詳細資訊")
     }
 
@@ -780,8 +806,8 @@ internal fun PlayerSettingsPanel(
 
 /**
  * 音轨与字幕。轨道名常带语言、字幕组与「外挂」，长短不一，按钮组放不下，所以一行一条、单选。
- * 音轨只有一条时整节不出现；字幕第一项是关闭，末尾是从本机或网盘另挑一个字幕文件的入口，
- * 平台或后端做不到时为 null，不显示。
+ * 音轨只有一条时整节不出现；字幕第一项是关闭，末尾是另挑字幕文件的入口
+ * （本机 / 网盘 / 在线搜索），平台或后端做不到时为 null，不显示。
  */
 @Composable
 internal fun TracksPanel(
@@ -794,6 +820,14 @@ internal fun TracksPanel(
     onPickLocalSubtitle: (() -> Unit)?,
     onPickDriveSubtitle: (() -> Unit)?,
     modifier: Modifier = Modifier,
+    /** 在线搜字幕（SubtitleCat）：搜到下载到视频所在目录，再回到这里挂。 */
+    onSearchSubtitle: (() -> Unit)? = null,
+    /** 打开 AI 翻译面板；没配置翻译模型时为 null，不显示这一项。 */
+    onTranslateSubtitle: (() -> Unit)? = null,
+    /** 已挂上的网盘字幕文件（标题 + 文件 id），标题与轨道一致，用来给字幕行配删除按钮。 */
+    driveSubtitleFiles: List<DriveSubtitleFile> = emptyList(),
+    /** 删除一条网盘字幕文件；为 null 时字幕行不给删除按钮。 */
+    onDeleteSubtitle: ((fileId: String) -> Unit)? = null,
 ) {
     Column(
         modifier = modifier
@@ -815,26 +849,91 @@ internal fun TracksPanel(
         }
         TrackSection(tr("字幕", "Subtitles", "字幕", "자막", "字幕")) {
             TrackRow(label = tr("关闭", "Close", "閉じる", "닫기", "關閉"), selected = selectedSubtitleTrackId == null, onClick = { onSelectSubtitle(null) })
+            // 取成局部 val：下面的 lambda 会延后执行，参数的智能转换在 lambda 里不成立
+            val delete = onDeleteSubtitle
             subtitleTracks.forEachIndexed { index, track ->
+                // 只有网盘来的外挂字幕有文件可删；本机字幕与容器内轨道没有 fileId
+                val file = driveSubtitleFiles.firstOrNull { it.title == track.title }
                 TrackRow(
                     label = trackDisplayName(track, index),
                     selected = track.id == selectedSubtitleTrackId,
                     onClick = { onSelectSubtitle(track) },
+                    trailing = if (file != null && delete != null) {
+                        { SubtitleDeleteButton(onClick = { delete(file.fileId) }) }
+                    } else {
+                        null
+                    },
+                )
+            }
+            if (onSearchSubtitle != null) {
+                PickerRow(icon = Icons.Outlined.Search, label = tr("搜索字幕…", "Search subtitles…", "字幕を検索…", "자막 검색…", "搜尋字幕…"), onClick = onSearchSubtitle)
+            }
+            if (onTranslateSubtitle != null) {
+                PickerRow(
+                    icon = Icons.Outlined.Translate,
+                    label = tr("AI 翻译字幕…", "AI subtitle translation…", "AI 字幕翻訳…", "AI 자막 번역…", "AI 翻譯字幕…"),
+                    onClick = onTranslateSubtitle,
                 )
             }
             if (onPickLocalSubtitle != null) {
                 PickerRow(icon = Icons.Outlined.FileOpen, label = tr("从本机选择字幕…", "Choose subtitles from device…", "この端末から字幕を選択…", "기기에서 자막 선택…", "從本機選擇字幕…"), onClick = onPickLocalSubtitle)
             }
             if (onPickDriveSubtitle != null) {
-                PickerRow(icon = Icons.Outlined.Cloud, label = tr("从网盘选择字幕…", "Choose subtitles from drive…", "ドライブから字幕を選択…", "드라이브에서 자막 선택…", "從雲端硬碟選擇字幕…"), onClick = onPickDriveSubtitle)
+                PickerRow(
+                    icon = Icons.Outlined.Cloud,
+                    label = tr(
+                        "网盘字幕（选择 / 删除）…",
+                        "Drive subtitles (choose / delete)…",
+                        "ドライブ字幕（選択 / 削除）…",
+                        "드라이브 자막 (선택 / 삭제)…",
+                        "網盤字幕（選擇 / 刪除）…",
+                    ),
+                    onClick = onPickDriveSubtitle,
+                )
             }
         }
     }
 }
 
+/**
+ * 字幕行的删除按钮：只有图标，不带底圈。
+ *
+ * 早先带 32dp 的浅红圆圈、又用 IconButton 承载——Material3 会给 IconButton 一个 48dp 的
+ * 最小触控区，而行高也是 48dp，几行字幕叠在一起时几个圆圈几乎贴到一起。这里改成
+ * 固定 30dp 的点击区、18dp 的图标，行与行之间才留得出空隙。
+ */
+@Composable
+internal fun SubtitleDeleteButton(
+    onClick: () -> Unit,
+    contentDescription: String = "删除字幕",
+    modifier: Modifier = Modifier,
+) {
+    Box(
+        modifier = modifier
+            .size(30.dp)
+            .clip(CircleShape)
+            .clickable(role = Role.Button, onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(
+            Icons.Outlined.Delete,
+            contentDescription = contentDescription,
+            tint = MaterialTheme.colorScheme.error,
+            modifier = Modifier.size(18.dp),
+        )
+    }
+}
+
 /** 字幕列表末尾的入口行：与轨道行同高，前面带图标，看得出它不是一条轨道。 */
 @Composable
-internal fun PickerRow(icon: ImageVector, label: String, onClick: () -> Unit, modifier: Modifier = Modifier) {
+internal fun PickerRow(
+    icon: ImageVector,
+    label: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    /** 行尾的附加动作，例如删除。给了就不再点整行触发 [onClick]。 */
+    trailing: (@Composable () -> Unit)? = null,
+) {
     Row(
         modifier = modifier
             .fillMaxWidth()
@@ -854,6 +953,10 @@ internal fun PickerRow(icon: ImageVector, label: String, onClick: () -> Unit, mo
             overflow = TextOverflow.MiddleEllipsis,
             modifier = Modifier.weight(1f),
         )
+        trailing?.let {
+            Spacer(Modifier.width(4.dp))
+            it()
+        }
     }
 }
 
@@ -871,7 +974,13 @@ private fun TrackSection(title: String, content: @Composable ColumnScope.() -> U
 }
 
 @Composable
-private fun TrackRow(label: String, selected: Boolean, onClick: () -> Unit) {
+private fun TrackRow(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+    /** 行尾附加动作（如删除）。按钮自己处理点击，不会连带选中这一轨。 */
+    trailing: (@Composable () -> Unit)? = null,
+) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -890,13 +999,9 @@ private fun TrackRow(label: String, selected: Boolean, onClick: () -> Unit) {
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f),
         )
-        if (selected) {
-            Icon(
-                imageVector = Icons.Filled.Check,
-                contentDescription = null,
-                tint = MaterialTheme.colorScheme.onSecondaryContainer,
-                modifier = Modifier.padding(start = 12.dp).size(20.dp),
-            )
+        if (trailing != null) {
+            Spacer(Modifier.width(8.dp))
+            trailing()
         }
     }
 }
