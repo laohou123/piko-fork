@@ -18,6 +18,7 @@ import dev.piko.shared.media.PreparedPlayback
 import dev.piko.shared.media.bestTranscodeName
 import dev.piko.shared.media.transcodeName
 import dev.piko.shared.media.proxy.ProxyStream
+import io.github.nihildigit.pikpak.PikPakStreamReader
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -695,6 +696,9 @@ class PlayerScreenState(
                 val prepareMillis = prepareStarted.elapsedNow().inWholeMilliseconds
                 // 出第一帧前就有人在等；之后由 init 里按缓冲状态接管
                 playback.urgent = true
+                // 起播阶段不往后预读：SDK 默认预读 32 MiB，那些低优先级请求会占满连接额度，
+                // 而首帧只要前几 MB（索引）。出第一帧后再按码率放开，见 steadyReadAheadBytes
+                playback.readAheadLimit = STARTUP_READ_AHEAD_BYTES
                 prepared = playback
                 mediaInfo = playback.info
                 // 按实际打开的那一档标：没点选过时由设置的上限挑，点选的档位没有时 SDK 退回原画
@@ -714,6 +718,19 @@ class PlayerScreenState(
                         )
                         backend.open(PlaybackTarget.Url(proxyUrl ?: playback.info.currentUrl), startPosition(), subtitles = openSubtitles())
                         sessionSpeed?.let(backend::setSpeed)
+                        // 起播预取文件头（mp4 的 moov 索引）。解复用器一次只问一块、串着往下读，
+                        // 剩下的连接额度全在空转；预取把这几 MB 摊成几十块并行取，播放器随后读到的都是命中。
+                        // 取不到就算了，不影响播放
+                        if (usingProxy) {
+                            val ranges = prefetchRanges()
+                            scope.launch {
+                                val started = TimeSource.Monotonic.markNow()
+                                runCatching { playback.prefetchRanges(ranges, PikPakStreamReader.STREAMING_PRIORITY) }
+                                    .onSuccess {
+                                        PikoLog.d(TAG, "起播预取 ${describeRanges(ranges)}：${started.elapsedNow().inWholeMilliseconds} ms")
+                                    }
+                            }
+                        }
                     }
                 }
             }
@@ -735,9 +752,15 @@ class PlayerScreenState(
         if (released) return
         when (event) {
             PlaybackBackendEvent.Ready -> {
-                if (!startedThisAttempt) PikoLog.d(TAG, "首帧就绪")
+                val firstFrame = !startedThisAttempt
+                if (firstFrame) PikoLog.d(TAG, "首帧就绪")
                 startedThisAttempt = true
                 isRecovering = false
+                // 画面出来了，预读按这一档的字节速率放开到十秒的量；不用 SDK 的 32 MiB，
+                // 播几秒就换下一个文件的用法下，那 32 MiB 里九成用不上，还占着连接额度
+                if (firstFrame) {
+                    prepared?.readAheadLimit = steadyReadAheadBytes(prepared?.estimatedBytesPerSecond)
+                }
                 // 出第一帧不代表故障过去了：流每次放几秒就断，立刻清零会无限重连。
                 // 稳定播放一段时间才把退避次数还原
                 stableJob?.cancel()
@@ -926,6 +949,29 @@ class PlayerScreenState(
         return subtitles + manual
     }
 
+    /**
+     * 首帧之后的预读深度：按这一档的字节速率给十秒的量，再留点余量。
+     *
+     * 拿不到码率时退回 [FALLBACK_READ_AHEAD_BYTES]。上下限避免极低码率的短片预读太浅、
+     * 高码率原画一次要太多：实测播放器每十来秒才吃完十秒的缓冲，这个量够它跑在前面。
+     */
+    private fun steadyReadAheadBytes(bytesPerSecond: Long?): Long {
+        val rate = bytesPerSecond?.takeIf { it > 0 } ?: return FALLBACK_READ_AHEAD_BYTES
+        val bytes = (rate * STEADY_READ_AHEAD_SECONDS * STEADY_READ_AHEAD_MARGIN).toLong()
+        return bytes.coerceIn(MIN_READ_AHEAD_BYTES, MAX_READ_AHEAD_BYTES)
+    }
+
+    /**
+     * 起播预取要取哪几段：只有文件头。
+     *
+     * 转码与原画的 mp4 索引（moov）都在开头，实测每次起播 0-8 MB 这一桶都要收 3.0 到 5.2 MB，
+     * 从头播与续播都一样；而解复用器是顺着往下问的，等于用一两路连接把这段串起来读。
+     */
+    private fun prefetchRanges(): List<LongRange> = listOf(0L until STARTUP_PREFETCH_BYTES)
+
+    private fun describeRanges(ranges: List<LongRange>): String =
+        ranges.joinToString(" + ") { "${it.first / 1024}K-${(it.last + 1) / 1024}K" }
+
     private suspend fun runCatchingNonCancel(block: suspend () -> Unit) {
         try {
             block()
@@ -945,6 +991,19 @@ class PlayerScreenState(
         const val SEEK_SETTLE_MS = 200L
         const val SEEK_WATCH_MS = 15_000L
         const val RESUME_THRESHOLD_MILLIS = 3_000L
+
+        /** 起播阶段一个块都不往后预读（SDK 的 0 表示只要读位置那一块），首帧后按码率放开。 */
+        const val STARTUP_READ_AHEAD_BYTES = 0L
+
+        /** 起播时主动预取的文件头长度，见 [prefetchRanges]。覆盖典型的 mp4 索引，留一点余量。 */
+        const val STARTUP_PREFETCH_BYTES = 5L * 1024 * 1024
+
+        /** 首帧之后的预读按播放速度给几秒的量，再放宽一点；上下限见 [steadyReadAheadBytes]。 */
+        const val STEADY_READ_AHEAD_SECONDS = 10
+        const val STEADY_READ_AHEAD_MARGIN = 1.6
+        const val FALLBACK_READ_AHEAD_BYTES = 4L * 1024 * 1024
+        const val MIN_READ_AHEAD_BYTES = 2L * 1024 * 1024
+        const val MAX_READ_AHEAD_BYTES = 16L * 1024 * 1024
 
         // 打开第一个文件前等播放列表的上限，超过就不带外挂字幕先放
         const val PLAYLIST_WAIT_MILLIS = 3_000L

@@ -17,6 +17,7 @@ import dev.piko.shared.media.proxy.ProxyByteSource
 import dev.piko.shared.media.proxy.ProxyStream
 import dev.piko.shared.media.proxy.SlicedByteSource
 import io.github.nihildigit.pikpak.BlockStore
+import io.github.nihildigit.pikpak.PikPakStreamReader
 import dev.piko.shared.media.cache.PikoFileCachePool
 import dev.piko.download.DownloadTask
 import io.github.nihildigit.pikpak.FileDetail
@@ -119,6 +120,36 @@ class PreparedPlayback internal constructor(
         set(value) {
             stream?.urgent = value
         }
+
+    /** 往后预读多少字节，null 交给 SDK 默认（32 MiB）。见 ProxyStream.readAheadLimit。 */
+    var readAheadLimit: Long?
+        get() = stream?.readAheadLimit
+        set(value) {
+            stream?.readAheadLimit = value
+        }
+
+    /**
+     * 起播预取：把 [ranges] 一次压进缓存，取完才返回。
+     *
+     * 解复用器是一块一块往下问的：问一块、等这块到手、再问下一块，同一时刻只有一两路连接在干活，
+     * 剩下几路额度空着（实测起播期 4 MB 索引用了 20 个请求、五六秒，而每条请求本身只要三五百毫秒）。
+     * 预取把这几段摊成几十块同时发，播放器随后读到的也就是命中。
+     * 优先级缺省取 [PikPakStreamReader.WARM_PRIORITY]，排在各档真实需求之后，只吃空出来的额度；
+     * 文件头这种「解复用器马上就要、而且要全部」的段用 STREAMING，免得被饿在最后。
+     */
+    suspend fun prefetchRanges(ranges: List<LongRange>, priority: Int = PikPakStreamReader.WARM_PRIORITY) {
+        val target = stream ?: return
+        val size = target.size
+        if (size <= 0L) return
+        val last = size - 1
+        val clipped = ranges.mapNotNull { range ->
+            val from = range.first.coerceIn(0L, last)
+            val to = range.last.coerceIn(0L, last)
+            if (from > to) null else from..to
+        }
+        if (clipped.isEmpty()) return
+        target.prefetch(clipped, priority = priority)
+    }
 
     /** 向代理会话与底层 SDK 流读取器反馈当前播放器的缓冲时长与媒体平均字节速率。 */
     fun reportPlaybackBuffer(bufferedDuration: Duration, mediaBytesPerSecond: Long? = null) {
