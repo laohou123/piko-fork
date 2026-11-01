@@ -157,6 +157,9 @@ class PlayerScreenState(
     // 只在第一次打开时等播放列表；等过一次仍没有，之后的换集、重试都不再等
     private var waitedForPlaylist = false
 
+    // 外挂字幕改到首帧之后再挂，每个文件只挂一次（重连时不重复开代理会话）
+    private var subtitlesAttached = false
+
     val audioTracks: List<MediaTrack> get() = backend.audioTracks
     val subtitleTracks: List<MediaTrack> get() = backend.subtitleTracks
 
@@ -651,6 +654,7 @@ class PlayerScreenState(
         isPreparing = true
         failure = null
         startedThisAttempt = false
+        subtitlesAttached = false
         resumeTipJob?.cancel()
         resumedFromMillis = null
         val oldStreams = detachPrepared()
@@ -716,8 +720,9 @@ class PlayerScreenState(
                                 "${info.width}x${info.height}，${info.sizeBytes} B，取流 $prepareMillis ms" +
                                 (requestedQuality?.let { "，指定档位 $it" } ?: "") + (if (retryAttempt > 0) "，第 $retryAttempt 次重连" else ""),
                         )
-                        backend.open(PlaybackTarget.Url(proxyUrl ?: playback.info.currentUrl), startPosition(), subtitles = openSubtitles())
+                        backend.open(PlaybackTarget.Url(proxyUrl ?: playback.info.currentUrl), startPosition(), subtitles = emptyList())
                         sessionSpeed?.let(backend::setSpeed)
+                        // 外挂字幕不挡在首帧前面：见 loadSubtitlesLate
                         // 起播预取文件头（mp4 的 moov 索引）。解复用器一次只问一块、串着往下读，
                         // 剩下的连接额度全在空转；预取把这几 MB 摊成几十块并行取，播放器随后读到的都是命中。
                         // 取不到就算了，不影响播放
@@ -760,6 +765,12 @@ class PlayerScreenState(
                 // 播几秒就换下一个文件的用法下，那 32 MiB 里九成用不上，还占着连接额度
                 if (firstFrame) {
                     prepared?.readAheadLimit = steadyReadAheadBytes(prepared?.estimatedBytesPerSecond)
+                    // 画面已经在放，这时才去挂外挂字幕：开播前挂要先等播放列表、再给每条字幕开代理会话，
+                    // 那些往返全落在黑屏里，还会跟首帧抢带宽
+                    if (!subtitlesAttached) {
+                        subtitlesAttached = true
+                        loadSubtitlesLate()
+                    }
                 }
                 // 出第一帧不代表故障过去了：流每次放几秒就断，立刻清零会无限重连。
                 // 稳定播放一段时间才把退避次数还原
@@ -912,9 +923,47 @@ class PlayerScreenState(
     }
 
     /**
-     * 当前视频挂着的外挂字幕，各开一个代理会话，用户手动挂过的排在后面。播放列表还没取到时最多等一会儿：
-     * 开播后虽然也能再挂（见 [PlaybackBackend.addSubtitle]），但「文件里没有选中的字幕就选第一条外挂」
-     * 只在打开时判断一次，晚到的字幕不会被自动选中。开不起来的那条跳过。
+     * 首帧之后才去挂外挂字幕。
+     *
+     * [openSubtitles] 的活儿全在网络和等待上：播放列表没到要先等，然后每条字幕都要取文件详情、
+     * 开一个代理会话。这些原本卡在 [PlaybackBackend.open] 之前，等于用黑屏时间换字幕早到几百毫秒，
+     * 而绝大多数文件根本没有外挂字幕。放到首帧之后，播放器照常先出画面。
+     *
+     * 内封字幕已经选中的，补挂时不能把它顶掉（[PlaybackBackend.addSubtitleWithoutSelecting]）。
+     */
+    private fun loadSubtitlesLate() {
+        if (!mayHaveSubtitles()) return
+        // 重连时同一个文件还挂着上次补的字幕，再挂一遍会多出重复轨道
+        if (backend.subtitleTracks.any { it.isExternal }) return
+        scope.launch {
+            val started = TimeSource.Monotonic.markNow()
+            val subs = try {
+                openSubtitles()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                PikoLog.w(TAG, "挂外挂字幕失败：${e.message}")
+                emptyList()
+            }
+            // 一条都没选中的话，第一条要自动选中，与开播时挂的行为一致
+            val selectFirst = backend.selectedSubtitleTrackId == null
+            subs.forEachIndexed { index, subtitle ->
+                if (index == 0 && selectFirst) backend.addSubtitle(subtitle) else backend.addSubtitleWithoutSelecting(subtitle)
+            }
+            PikoLog.d(TAG, "字幕后补：${started.elapsedNow().inWholeMilliseconds} ms，${subs.size} 条")
+        }
+    }
+
+    /** 播放列表还没到时判断不出有没有字幕，仍然要试一次；列表已到且没有外挂字幕就完全跳过。 */
+    private fun mayHaveSubtitles(): Boolean =
+        manualSubtitles.isNotEmpty() || !isPlaylistLoaded || currentEntry?.subtitles?.isNotEmpty() == true
+
+    /**
+     * 当前视频挂着的外挂字幕，各开一个代理会话，用户手动挂过的排在后面。
+     * 播放列表还没取到时最多等 [PLAYLIST_WAIT_MILLIS]，等不到就只带手动挂的。开不起来的那条跳过。
+     *
+     * 网盘文件现在只在首帧之后调它（见 [loadSubtitlesLate]）；本地副本还在 open 前调用，
+     * 那条路径读的是本地路径，不走网络。
      */
     private suspend fun openSubtitles(): List<ExternalSubtitle> {
         if (!isPlaylistLoaded && !waitedForPlaylist) {
@@ -1005,8 +1054,10 @@ class PlayerScreenState(
         const val MIN_READ_AHEAD_BYTES = 2L * 1024 * 1024
         const val MAX_READ_AHEAD_BYTES = 16L * 1024 * 1024
 
-        // 打开第一个文件前等播放列表的上限，超过就不带外挂字幕先放
-        const val PLAYLIST_WAIT_MILLIS = 3_000L
+        // 打开第一个文件前等播放列表的上限，超过就不带外挂字幕先放。
+        // 字幕已经改到首帧之后才挂（见 loadSubtitlesLate），这里只剩「列表还没到、先看一眼」的意义，
+        // 原来三秒相当于每次打开都赌三秒，而多数文件根本没有外挂字幕
+        const val PLAYLIST_WAIT_MILLIS = 400L
 
         /** 刚传上去的字幕，网盘可能还没放进目录、取不到链接：多试几次再放弃。 */
         /**

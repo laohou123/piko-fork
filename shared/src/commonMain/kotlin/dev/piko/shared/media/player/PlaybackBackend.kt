@@ -82,6 +82,14 @@ interface PlaybackBackend {
     fun addSubtitle(subtitle: ExternalSubtitle) = Unit
 
     /**
+     * 挂一条外挂字幕但不改当前选中的轨道：文件里内封字幕已经选中的，补挂时不能把它顶掉。
+     *
+     * 用于开播之后补挂——首帧优先，字幕晚几百毫秒不影响观看，倒过来则要拿黑屏时间换。
+     * 默认实现退化成 [addSubtitle]（会选中），只有分得清 select 与 auto 的后端覆写。
+     */
+    fun addSubtitleWithoutSelecting(subtitle: ExternalSubtitle) = addSubtitle(subtitle)
+
+    /**
      * 卸下一条外挂字幕。[trackId] 来自 [subtitleTracks]，只有 [MediaTrack.isExternal]
      * 的轨道能卸（容器内自带的字幕属于文件本身，不归这里管）。
      *

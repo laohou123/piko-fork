@@ -409,6 +409,16 @@ internal class MpvPlaybackBackend(
         onMpv { mpv.command(mpvSubtitleSelectCommand(subtitle)) }
     }
 
+    override fun addSubtitleWithoutSelecting(subtitle: ExternalSubtitle) {
+        if (released || preview) return
+        if (!fileLoaded) {
+            pendingSubtitles = pendingSubtitles + subtitle
+            return
+        }
+        // 第三参数 auto：挂上但不切走当前选中的那条
+        onMpv { mpv.command(arrayOf("sub-add", subtitle.url, "auto", subtitle.title, subtitle.language.orEmpty())) }
+    }
+
     override fun removeSubtitle(trackId: String) {
         if (released) return
         // sub-remove 只认外挂字幕的 sid；容器内的轨道会被 mpv 拒绝，这里不必区分
