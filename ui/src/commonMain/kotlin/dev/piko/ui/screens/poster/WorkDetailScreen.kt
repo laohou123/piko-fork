@@ -41,6 +41,7 @@ import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material.icons.outlined.Translate
+import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.ImageNotSupported
 import androidx.compose.material3.OutlinedTextField
@@ -75,6 +76,7 @@ import dev.piko.shared.media.PreparedPlayback
 import dev.piko.shared.media.player.PlaybackTarget
 import dev.piko.ui.LocalPikoServices
 import dev.piko.ui.components.PikoDialog
+import dev.piko.ui.components.PikoDialogConfirm
 import dev.piko.ui.components.PikoEmptyState
 import dev.piko.ui.components.PikoScaffold
 import dev.piko.ui.components.PikoSheet
@@ -122,6 +124,9 @@ fun WorkDetailScreen(
     // 标题：AI 翻译进行中 / 手动编辑框
     var translatingTitle by remember { mutableStateOf(false) }
     var editingTitle by remember { mutableStateOf(false) }
+    // 删除网盘原文件：先二次确认，确认后把这部作品的文件移进网盘回收站
+    var confirmDelete by remember { mutableStateOf(false) }
+    var deleting by remember { mutableStateOf(false) }
     // 详情页「标签」那一行末尾的 + ：自定义标签
     var editingTags by remember { mutableStateOf(false) }
     var tagDraft by remember { mutableStateOf("") }
@@ -301,6 +306,20 @@ fun WorkDetailScreen(
                                     modifier = Modifier.size(18.dp),
                                 )
                             }
+                            // 删除紧挨着改片名右边：删的是网盘里的真文件，所以单独给错误色，
+                            // 并且先弹二次确认，不跟改片名一样一点就动
+                            IconButton(
+                                enabled = !deleting && d.files.isNotEmpty(),
+                                onClick = { confirmDelete = true },
+                                modifier = Modifier.size(32.dp),
+                            ) {
+                                Icon(
+                                    Icons.Outlined.Delete,
+                                    contentDescription = "删除网盘原文件",
+                                    modifier = Modifier.size(18.dp),
+                                    tint = MaterialTheme.colorScheme.error,
+                                )
+                            }
                         }
                         if (!d.work.scraped) {
                             Text(
@@ -425,6 +444,63 @@ fun WorkDetailScreen(
         } else {
             viewerIndex = null
         }
+    }
+
+    // 删网盘原文件：这一步动了用户自己的收藏，所以先问一次再动手。
+    // 走回收站而不是彻底删除——删错了还能在网盘里捞回来。
+    if (confirmDelete) {
+        val files = detail?.files.orEmpty()
+        val shownCode = detail?.work?.code?.substringBeforeLast('.') ?: code
+        PikoDialog(
+            onDismissRequest = { if (!deleting) confirmDelete = false },
+            title = { Text("删除网盘原文件") },
+            text = {
+                Column {
+                    Text(
+                        if (files.size > 1) {
+                            "$shownCode 在网盘里有 ${files.size} 个文件，会一起删除。"
+                        } else {
+                            "$shownCode 在网盘里的这个文件会被删除。"
+                        },
+                    )
+                    Text(
+                        text = "删除后进网盘回收站，约 30 天内可在网盘里恢复；海报墙的这条记录会一起移除。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 8.dp),
+                    )
+                }
+            },
+            confirmButton = {
+                PikoDialogConfirm(
+                    label = if (deleting) "正在删除…" else "删除",
+                    enabled = !deleting,
+                    destructive = true,
+                    onClick = {
+                        val ids = files.map { it.fileId }
+                        scope.launch {
+                            deleting = true
+                            val result = services.mediaRepository.trashFiles(ids)
+                            deleting = false
+                            result.onSuccess {
+                                confirmDelete = false
+                                // 网盘已经删了：本地索引清不掉也只是海报墙上多留一张空壳，
+                                // 下次整轮扫描会补上，所以这里不该因为收尾失败让界面崩掉
+                                runCatching { services.libraryStore?.removeWork(code) }
+                                services.posterWall?.refreshList()
+                                services.postAppNotice("已删除 ${ids.size} 个文件")
+                                onBackClick()
+                            }.onFailure { e ->
+                                services.postAppNotice("删除失败：${e.message ?: "请稍后再试"}")
+                            }
+                        }
+                    },
+                )
+            },
+            dismissButton = {
+                TextButton(enabled = !deleting, onClick = { confirmDelete = false }) { Text("取消") }
+            },
+        )
     }
 
     // 多文件：底栏播放按钮向上展开，右侧每行一个播放键

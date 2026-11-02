@@ -10,6 +10,7 @@ import dev.piko.shared.log.logFailure
 import dev.piko.shared.log.logFile
 import dev.piko.shared.log.logRangeAttempt
 import io.github.nihildigit.pikpak.batchDelete
+import io.github.nihildigit.pikpak.batchTrash
 import io.github.nihildigit.pikpak.leaseDetail
 import dev.piko.shared.media.proxy.PikPakByteSource
 import dev.piko.shared.media.proxy.PikoMediaProxy
@@ -272,6 +273,17 @@ class PikoMediaRepository(
     suspend fun deleteFiles(ids: List<String>): Result<Unit> =
         withContext(Dispatchers.Default) {
             runSuspendCatching { client.batchDelete(ids) }
+        }
+
+    /**
+     * 把网盘文件移进回收站（不是永久删除）。
+     *
+     * 海报墙详情页的「删除原文件」走这里：片子是用户自己的收藏，删错了还能在网盘回收站里捞回来；
+     * 播放器删字幕用的是 [deleteFiles]，字幕是随时能重下的临时文件，两条路径不必同样谨慎。
+     */
+    suspend fun trashFiles(ids: List<String>): Result<Unit> =
+        withContext(Dispatchers.Default) {
+            runSuspendCatching { client.batchTrash(ids) }
         }
 
     /**

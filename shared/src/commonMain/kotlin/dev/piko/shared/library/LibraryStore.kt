@@ -396,6 +396,34 @@ class LibraryStore(
         )
     }
 
+    /**
+     * 网盘里删掉了整部作品：索引连同文件清单、演员、标签、截图、收藏一起清掉。
+     * 不清的话海报墙上会留一张点进去没有文件的空壳，点播放只会报错。
+     *
+     * 只动本机索引，不碰网盘——删除请求由调用方（详情页）先发出去，成功了才来这里收尾。
+     */
+    suspend fun removeWork(code: String) = withQueries { q ->
+        q.transaction {
+            q.deleteWorkFiles(code)
+            q.deleteWorkActorsFor(code)
+            q.deleteWorkTagsFor(code)
+            q.deleteWorkImagesFor(code)
+            q.deleteWork(code)
+            q.deleteFavoriteWork(code)
+        }
+        // 作品数跟着减：扫描页那一行显示的是库里的真实条数，不跟着改就多算一部
+        q.selectScanState().executeAsOneOrNull()?.let { state ->
+            q.setScanState(
+                state.root_folder_id,
+                state.root_folder_name,
+                state.last_scan_at,
+                q.selectWorkCount().executeAsOne(),
+                state.scanning,
+            )
+        }
+        Unit
+    }.also { _changes.tryEmit(Unit) }
+
     // ---------------------------------------------------------------- 标题翻译
 
     /** 写入中文标题；[titleZh] 传空串表示清掉译名、恢复显示原文。 */
