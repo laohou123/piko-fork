@@ -672,6 +672,14 @@ class VaultStore(
         return ConfirmOutcome.Unconfirmed(ownEntry?.phase)
     }
 
+    /**
+     * 读一条清单里的条目，按清单文件 ID 缓存。
+     *
+     * 海报墙把引用保存的片子也当作品展示时用它：扫目录时顺手收下 `.piko-vault-*.json`，
+     * 扫完再逐条解析，不必为每个目录再列一次。
+     */
+    suspend fun entriesIn(file: FileStat): List<VaultEntry> = entriesOf(file)
+
     private suspend fun entriesOf(file: FileStat): List<VaultEntry> {
         lookupParsed(file)?.let { return it }
         val entries = JSON.decodeFromString(Manifest.serializer(), io.read(file.id).decodeToString()).entries

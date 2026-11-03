@@ -9,6 +9,9 @@ import dev.piko.shared.data.PikoClientProvider
 import dev.piko.shared.data.ScanStop
 import dev.piko.shared.data.ScannedFile
 import dev.piko.data.repository.isPlayableVideo
+import dev.piko.shared.data.VaultEdits
+import dev.piko.shared.data.VaultEntry
+import dev.piko.shared.data.VaultStore
 import dev.piko.shared.library.LibraryStore
 import dev.piko.shared.library.LibraryScraper
 import dev.piko.shared.library.NamedCount
@@ -21,6 +24,9 @@ import dev.piko.shared.translate.TranslationGateway
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
@@ -44,15 +50,20 @@ class PosterWallState(
     private val metaTubeBase: suspend () -> String,
     /** AI 翻译（片名与字幕）。未配置模型时为 null，翻译入口置灰。 */
     private val translation: TranslationGateway? = null,
+    /**
+     * 归档清单：扫目录时收下的 `.piko-vault-*.json` 由它解析成条目。
+     * 为空时引用库一直是空的（不影响普通扫描）。
+     */
+    private val vaultStore: VaultStore? = null,
     private val scope: CoroutineScope,
 ) {
     enum class Phase { IDLE, SCANNING, DONE, FAILED }
 
     /**
-     * 全部 / 收藏 / 按演员 / 按标签 / 只看已刮削 / 只看未刮削。
+     * 全部 / 收藏 / 按演员 / 按标签 / 只看已刮削 / 只看未刮削 / 只看引用保存。
      * [filterName] 只在 ACTOR 与 TAG 下有意义。
      */
-    enum class Filter { ALL, FAVORITE, ACTOR, TAG, SCRAPED, UNSCRAPED }
+    enum class Filter { ALL, FAVORITE, ACTOR, TAG, SCRAPED, UNSCRAPED, VAULT }
 
     var phase by mutableStateOf(Phase.IDLE)
         private set
@@ -145,6 +156,9 @@ class PosterWallState(
     /** 其中已刮到元数据的数量；[workCount] 减去它就是未刮削的。 */
     var scrapedCount by mutableStateOf(0L)
         private set
+    /** 引用保存的作品数：网盘里没有原文件、只记在归档清单里的那批。 */
+    var vaultCount by mutableStateOf(0L)
+        private set
     var loading by mutableStateOf(false)
         private set
 
@@ -178,6 +192,7 @@ class PosterWallState(
 
     private var scanner: DuplicateScanner? = null
     private var scanJob: Job? = null
+    private var vaultJob: Job? = null
     private var enrichJob: Job? = null
     private var titleJob: Job? = null
 
@@ -262,8 +277,20 @@ class PosterWallState(
                                 works = grouped,
                                 complete = event.stop == null,
                             )
+                            // 引用库整批对齐：清单没扫全时不动，否则半份结果会把没遇到的条目当成已移除。
+                            // 解析要逐份下载清单，不挡扫描出结果：先把墙画出来，引用条目在后台补上
+                            if (event.stop == null) {
+                                vaultJob?.cancel()
+                                vaultJob = scope.launch {
+                                    runCatching { syncVault(event.manifests) }
+                                        .onFailure { PikoLog.w(TAG, "解析归档清单失败", it) }
+                                    vaultCount = store.vaultWorkCount()
+                                    refresh()
+                                }
+                            }
                             store.setScanning(false)
                             workCount = store.workCount()
+                            vaultCount = store.vaultWorkCount()
                             refresh()
                             if (grouped.isNotEmpty()) enrich(silent = true)
                         }
@@ -310,6 +337,81 @@ class PosterWallState(
             )
         }
         return byCode.map { (code, list) -> ScannedWork(code, list.sortedBy { it.name }) }
+    }
+
+    /**
+     * 把这一轮遇到的归档清单解析成作品。
+     *
+     * 引用条目没有网盘文件，只能靠清单里的片名、大小与 gcid 摆上墙：片名认番号，gcid 拼缩略图，
+     * 播放时按 gcid 借一份对象（见 LeasedFile）。同一份内容被引用到好几个目录时按 gcid + 大小去重，
+     * 删除时再把各处条目一起抹掉（[removeVaultWork]）。
+     */
+    private suspend fun syncVault(manifests: List<ScannedFile>) {
+        val vault = vaultStore ?: return
+        if (manifests.isEmpty()) {
+            store.saveVaultWorks(emptyList())
+            return
+        }
+        // 一次读四份清单：每份都是一次下载，串行读上千个目录会很慢
+        val entries = mutableListOf<Pair<VaultEntry, String>>()
+        // 一个目录可能有历史上写下的好几份清单（旧版本、输掉的竞争），只有胜出的那份算数，
+        // 挨个读会把已经移除的条目又翻出来
+        val winners = manifests.groupBy { it.file.parentId }
+            .mapNotNull { (_, group) -> VaultStore.winnerOf(group.map { it.file }) }
+        for (batch in winners.chunked(4)) {
+            entries += coroutineScope {
+                batch.map { manifest ->
+                    async {
+                        val folderId = manifest.parentId?.takeIf { it.isNotEmpty() }
+                            ?: return@async emptyList()
+                        runCatching { vault.entriesIn(manifest) }.getOrDefault(emptyList())
+                            // 已取回的条目在网盘里有真实文件，扫描会收它，这里再来一份就重复了
+                            .filter { it.isArchived && it.name.isPlayableVideo() }
+                            .map { it to folderId }
+                    }
+                }.awaitAll().flatten()
+            }
+        }
+        val seen = HashSet<String>()
+        val byCode = LinkedHashMap<String, MutableList<ScannedWorkFile>>()
+        for ((entry, folderId) in entries) {
+            if (!seen.add("${entry.gcid}:${entry.size}")) continue
+            val stem = entry.name.substringBeforeLast('.')
+            if (stem.isBlank()) continue
+            val code = matchAv(stem, allowLanguageSuffix = true)?.info?.code ?: stem
+            byCode.getOrPut(code) { mutableListOf() } += ScannedWorkFile(
+                fileId = entry.virtualId,
+                name = entry.name,
+                size = entry.size,
+                folderId = folderId,
+                part = null,
+            )
+        }
+        store.saveVaultWorks(byCode.map { (code, files) -> ScannedWork(code, files.sortedBy { it.name }) })
+    }
+
+    /**
+     * 从海报墙移除一部引用作品：删归档清单里的条目，网盘里没有文件可删。
+     *
+     * 同一条目可能被引用到多个目录（列表上按 gcid 去重合成一部），所以按文件记录里的目录分组，
+     * 每一处都抹掉，否则下次扫描它又会出现。
+     */
+    suspend fun removeVaultWork(code: String): Result<Unit> {
+        val vault = vaultStore ?: return Result.failure(IllegalStateException("归档清单未就绪"))
+        val files = store.workDetail(code)?.files.orEmpty()
+        val byFolder = files.mapNotNull { file ->
+            val id = VaultEntry.entryIdOf(file.fileId) ?: return@mapNotNull null
+            file.folderId to id
+        }.groupBy({ it.first }, { it.second })
+        if (byFolder.isEmpty()) return Result.failure(IllegalStateException("这部作品下没有引用条目"))
+        for ((folderId, ids) in byFolder) {
+            vault.update(folderId = folderId, edit = VaultEdits.remove(ids.toSet()))
+                .exceptionOrNull()?.let { return Result.failure(it) }
+        }
+        store.removeWork(code)
+        vaultCount = store.vaultWorkCount()
+        refresh()
+        return Result.success(Unit)
     }
 
     // ---------------------------------------------------------------- 补刮
@@ -512,11 +614,13 @@ class PosterWallState(
                 Filter.UNSCRAPED -> false
                 else -> null
             },
+            vault = filter == Filter.VAULT,
         )
         actors = store.actors()
         tags = store.tags()
         workCount = store.workCount()
         scrapedCount = store.scrapedWorkCount()
+        vaultCount = store.vaultWorkCount()
         titlePending = store.titleTranslationPendingCount()
         loading = false
     }

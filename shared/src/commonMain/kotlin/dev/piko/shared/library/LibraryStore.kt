@@ -2,7 +2,9 @@ package dev.piko.shared.library
 
 import app.cash.sqldelight.db.SqlDriver
 import dev.piko.library.LibraryQueries
+import dev.piko.shared.data.VaultEntry
 import dev.piko.shared.naming.av.matchAvFile
+import io.github.nihildigit.pikpak.videoThumbnailUrlOf
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -179,12 +181,13 @@ class LibraryStore(
             val codes = works.map { it.code }
             if (complete) {
                 // 只有文件是这一轮的真实结果，整表重建；
-                // 演员、标签、截图、标题、封面、译名都是刮削来的，重扫时一律不动
-                q.clearWorkFiles()
+                // 演员、标签、截图、标题、封面、译名都是刮削来的，重扫时一律不动。
+                // 引用保存的条目不在网盘文件流里，它的记录与编号都不参与这一步，见 saveVaultWorks
+                q.clearScanWorkFiles()
                 // 差集分批删：一次 NOT IN 上千个番号会超过 Android SQLite 的 999 变量上限，
                 // 抛异常后整个事务回滚，用户看到的就是"扫完了还是旧数量"
                 val keep = codes.toHashSet()
-                q.allWorkCodes().executeAsList()
+                q.selectScanWorkCodes().executeAsList()
                     .filterNot { it in keep }
                     .chunked(DELETE_CHUNK)
                     .forEach { chunk -> q.deleteWorksIn(chunk) }
@@ -215,6 +218,47 @@ class LibraryStore(
 
     /** 已刮到元数据的作品数；与 [workCount] 的差就是还没刮到的（含认不出番号的）。 */
     suspend fun scrapedWorkCount(): Long = withQueries { q -> q.selectScrapedCount().executeAsOne() } ?: 0L
+
+    /** 引用保存的作品数（网盘里没有原文件的那批）。 */
+    suspend fun vaultWorkCount(): Long = withQueries { q -> q.selectVaultWorkCount().executeAsOne() } ?: 0L
+
+    /**
+     * 引用保存的条目入库。
+     *
+     * 这些条目没有网盘文件，「这轮没扫到就删」那套判断对它们不成立：每解析完一遍清单整批对齐一次。
+     * 已经在这儿的番号只重建文件清单，刮削结果、译名、标签、收藏都留着——否则每次扫描后引用库都要重刮一遍。
+     * 同番号已经被真实文件占着时跳过：那部片本来就在海报墙上，再挂一条引用只会让播放列表出现两份。
+     */
+    suspend fun saveVaultWorks(works: List<ScannedWork>) = withQueries { q ->
+        q.transactionWithResult {
+            val next = works.map { it.code }.toHashSet()
+            // 这一轮清单里没有的引用作品：文件与作品一起删（收藏等孤儿记录最后统一清）
+            q.selectVaultWorkCodes().executeAsList()
+                .filterNot { it in next }
+                .chunked(DELETE_CHUNK)
+                .forEach { chunk ->
+                    q.deleteWorkFilesIn(chunk)
+                    q.deleteWorksIn(chunk)
+                }
+            // 只看扫描到的作品：它们占着的番号引用条目不能再插，否则同一部片会出现两份播放列表
+            val taken = q.selectScanWorkCodes().executeAsList().toHashSet()
+            works.forEach { work ->
+                if (work.code in taken) return@forEach
+                q.insertVaultWorkIfAbsent(work.code)
+                // 引用条目的文件清单每次整部重建：同一部可能有多个版本，以这份清单为准
+                q.deleteWorkFiles(work.code)
+                work.files.forEach { f ->
+                    q.insertWorkFile(f.fileId, work.code, f.name, f.size, f.folderId, f.part)
+                }
+            }
+            q.deleteOrphanActors()
+            q.deleteOrphanTags()
+            q.deleteOrphanImages()
+            q.deleteOrphanFavoriteWorks()
+            q.backfillTitleZhFromMarks()
+        }
+        Unit
+    }
 
     /** 扫描进行中/结束落库，进程被杀后下次进来也知道上一轮有没有扫完。 */
     suspend fun setScanning(scanning: Boolean) = withQueries { q ->
@@ -284,16 +328,38 @@ class LibraryStore(
         query: String? = null,
         /** true 只留已刮到元数据的，false 只留没刮到的，null 不按刮削状态过滤。 */
         scraped: Boolean? = null,
+        /**
+         * true 只看引用保存的条目，false（默认）只看扫描到的真实文件。
+         * 两类作品同在一张表里，靠 origin 区分，列表上从不混排。
+         */
+        vault: Boolean = false,
     ): List<WorkRow> = withQueries { q ->
         val counts = q.selectFileCounts().executeAsList().associate { it.work_code to (it.count to it.total) }
         // 卡片左下角的女优名：一次批量取出，不逐行查
         val actors = q.selectFirstActors().executeAsList().associate { it.work_code to it.actor }
+        // 来源过滤在内存里做：四条列表查询结构不同，为它各写一份带 origin 的版本不划算
+        val vaultCodes = q.selectVaultWorkCodes().executeAsList().toSet()
+        // 引用条目还没刮到封面时，用清单里的 gcid 拼一张缩略图顶上：整墙空白卡片等于没有入口
+        val vaultCovers = if (vault) {
+            q.selectVaultFiles().executeAsList()
+                .groupBy({ it.work_code }, { it.file_id })
+                .mapNotNull { (code, ids) ->
+                    val gcid = ids.asSequence()
+                        .mapNotNull { VaultEntry.resolvedFileOf(it)?.gcid?.takeIf(String::isNotBlank) }
+                        .firstOrNull() ?: return@mapNotNull null
+                    code to videoThumbnailUrlOf(gcid)
+                }.toMap()
+        } else {
+            emptyMap()
+        }
         // 搜索先用一条 UNION 查出候选番号，再在内存里过滤（数据量是几百条，比逐个 LIKE 简单）
         val matched = query?.trim()?.takeIf { it.isNotEmpty() }?.let { text ->
             q.searchCodes("%$text%").executeAsList().toSet()
         }
         fun List<WorkRow>.applyQuery(): List<WorkRow> =
             if (matched == null) this else filter { it.code in matched }
+        fun List<WorkRow>.applyOrigin(): List<WorkRow> =
+            filter { (it.code in vaultCodes) == vault }
         // 四个查询各生成一个同构不同名的数据类，公共类型是 Any；逐个映射，不靠 when 推断
         when {
             favoriteOnly -> q.selectFavoriteWorks().executeAsList()
@@ -304,10 +370,15 @@ class LibraryStore(
                 .map { it.toRow(counts, actors) }
             else -> q.selectAllWorks().executeAsList()
                 .map { it.toRow(counts, actors) }
-        }.applyQuery().let { rows ->
+        }.applyOrigin().applyQuery().let { rows ->
+            val covered = if (vault) {
+                rows.map { row -> if (row.coverUrl.isNullOrBlank()) row.copy(coverUrl = vaultCovers[row.code]) else row }
+            } else {
+                rows
+            }
             // 刮削状态在内存里过滤：它本来就是从 scraped_at 推出来的一个布尔，
             // 为它再写两条同构 SQL 不值当，几百条的量也不差这一步
-            if (scraped == null) rows else rows.filter { it.scraped == scraped }
+            if (scraped == null) covered else covered.filter { it.scraped == scraped }
         }
     }.orEmpty()
 
@@ -378,7 +449,10 @@ class LibraryStore(
                 code = w.code,
                 title = w.title,
                 titleZh = w.title_zh,
-                coverUrl = w.cover_url,
+                // 引用条目多半还没刮封面，这里退回清单里的 gcid 缩略图
+                coverUrl = w.cover_url?.takeIf { it.isNotBlank() } ?: files.asSequence()
+                    .mapNotNull { VaultEntry.resolvedFileOf(it.fileId)?.gcid?.takeIf(String::isNotBlank) }
+                    .firstOrNull()?.let(::videoThumbnailUrlOf),
                 releaseDate = w.release_date,
                 durationMinutes = w.duration?.toInt(),
                 scraped = w.scraped_at > 0L,

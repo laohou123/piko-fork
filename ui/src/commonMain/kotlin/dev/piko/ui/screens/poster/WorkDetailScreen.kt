@@ -70,6 +70,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import coil3.compose.SubcomposeAsyncImage
+import dev.piko.shared.data.VaultEntry
 import dev.piko.shared.library.ScannedWorkFile
 import dev.piko.shared.library.WorkDetail
 import dev.piko.shared.media.PreparedPlayback
@@ -315,7 +316,11 @@ fun WorkDetailScreen(
                             ) {
                                 Icon(
                                     Icons.Outlined.Delete,
-                                    contentDescription = "删除网盘原文件",
+                                    contentDescription = if (d.files.isNotEmpty() && d.files.all { VaultEntry.isVaulted(it.fileId) }) {
+                                        "从海报墙移除此视频"
+                                    } else {
+                                        "删除网盘原文件"
+                                    },
                                     modifier = Modifier.size(18.dp),
                                     tint = MaterialTheme.colorScheme.error,
                                 )
@@ -448,50 +453,75 @@ fun WorkDetailScreen(
 
     // 删网盘原文件：这一步动了用户自己的收藏，所以先问一次再动手。
     // 走回收站而不是彻底删除——删错了还能在网盘里捞回来。
+    // 引用保存的条目网盘里没有文件可删，这里只是把它从海报墙上摘掉，文案与动作都分开。
     if (confirmDelete) {
         val files = detail?.files.orEmpty()
+        val vaultOnly = files.isNotEmpty() && files.all { VaultEntry.isVaulted(it.fileId) }
         val shownCode = detail?.work?.code?.substringBeforeLast('.') ?: code
         PikoDialog(
             onDismissRequest = { if (!deleting) confirmDelete = false },
-            title = { Text("删除网盘原文件") },
+            title = { Text(if (vaultOnly) "从海报墙移除此视频" else "删除网盘原文件") },
             text = {
                 Column {
-                    Text(
-                        if (files.size > 1) {
-                            "$shownCode 在网盘里有 ${files.size} 个文件，会一起删除。"
-                        } else {
-                            "$shownCode 在网盘里的这个文件会被删除。"
-                        },
-                    )
-                    Text(
-                        text = "删除后进网盘回收站，约 30 天内可在网盘里恢复；海报墙的这条记录会一起移除。",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.padding(top = 8.dp),
-                    )
+                    if (vaultOnly) {
+                        Text("$shownCode 是以引用保存的，网盘里没有它的文件。")
+                        Text(
+                            text = "移除只是把这条记录从海报墙摘掉，不占空间也不会动网盘；想找回来要重新从分享链接保存。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 8.dp),
+                        )
+                    } else {
+                        Text(
+                            if (files.size > 1) {
+                                "$shownCode 在网盘里有 ${files.size} 个文件，会一起删除。"
+                            } else {
+                                "$shownCode 在网盘里的这个文件会被删除。"
+                            },
+                        )
+                        Text(
+                            text = "删除后进网盘回收站，约 30 天内可在网盘里恢复；海报墙的这条记录会一起移除。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 8.dp),
+                        )
+                    }
                 }
             },
             confirmButton = {
                 PikoDialogConfirm(
-                    label = if (deleting) "正在删除…" else "删除",
+                    label = if (deleting) "正在删除…" else if (vaultOnly) "移除" else "删除",
                     enabled = !deleting,
                     destructive = true,
                     onClick = {
                         val ids = files.map { it.fileId }
                         scope.launch {
                             deleting = true
-                            val result = services.mediaRepository.trashFiles(ids)
-                            deleting = false
-                            result.onSuccess {
-                                confirmDelete = false
-                                // 网盘已经删了：本地索引清不掉也只是海报墙上多留一张空壳，
-                                // 下次整轮扫描会补上，所以这里不该因为收尾失败让界面崩掉
-                                runCatching { services.libraryStore?.removeWork(code) }
-                                services.posterWall?.refreshList()
-                                services.postAppNotice("已删除 ${ids.size} 个文件")
-                                onBackClick()
-                            }.onFailure { e ->
-                                services.postAppNotice("删除失败：${e.message ?: "请稍后再试"}")
+                            if (vaultOnly) {
+                                val result = services.posterWall?.removeVaultWork(code)
+                                    ?: Result.failure(IllegalStateException("海报墙未就绪"))
+                                deleting = false
+                                result.onSuccess {
+                                    confirmDelete = false
+                                    services.postAppNotice("已从海报墙移除")
+                                    onBackClick()
+                                }.onFailure { e ->
+                                    services.postAppNotice("移除失败：${e.message ?: "请稍后再试"}")
+                                }
+                            } else {
+                                val result = services.mediaRepository.trashFiles(ids)
+                                deleting = false
+                                result.onSuccess {
+                                    confirmDelete = false
+                                    // 网盘已经删了：本地索引清不掉也只是海报墙上多留一张空壳，
+                                    // 下次整轮扫描会补上，所以这里不该因为收尾失败让界面崩掉
+                                    runCatching { services.libraryStore?.removeWork(code) }
+                                    services.posterWall?.refreshList()
+                                    services.postAppNotice("已删除 ${ids.size} 个文件")
+                                    onBackClick()
+                                }.onFailure { e ->
+                                    services.postAppNotice("删除失败：${e.message ?: "请稍后再试"}")
+                                }
                             }
                         }
                     },

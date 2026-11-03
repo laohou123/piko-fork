@@ -247,6 +247,7 @@ class PikoServices(
             scraper = libraryScraper,
             metaTubeBase = { platformPreferences.metaTubeUrlFlow.first().trim() },
             translation = translation,
+            vaultStore = vaultStore,
             scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate),
         )
     }

@@ -1,0 +1,4 @@
+-- v8→v9：作品加来源列。
+-- 引用保存（`.piko-vault-*.json` 清单里的条目）没有网盘文件，海报墙把它们也当作品展示，
+-- 但整轮重扫时它们不在文件结果里，不能跟着「这轮没扫到就删」一起清掉，所以要记来源。
+ALTER TABLE works ADD COLUMN origin TEXT NOT NULL DEFAULT 'scan';

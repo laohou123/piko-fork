@@ -30,6 +30,8 @@ sealed interface DuplicateScanEvent {
      * 几千个目录里偶有一个超时，不值得让整轮扫描作废。
      * [subfolders] 是起点之下列出过内容的文件夹，没来得及列或列失败的不在里面：按番号规范命名（CanonicalTreeScan）据此看文件夹里有什么，
      * 内容不明的文件夹不能拿来判断。
+     * [manifests] 是路上遇到的归档清单（`.piko-vault-*.json`），海报墙据此把引用保存的条目也摆上墙；
+     * 它们不计进 [files]，两者的口径在界面上本来也不一样。
      */
     data class Finished(
         val files: List<ScannedFile>,
@@ -37,6 +39,7 @@ sealed interface DuplicateScanEvent {
         val failedFolders: Int,
         val stop: ScanStop?,
         val subfolders: List<ScannedFile> = emptyList(),
+        val manifests: List<ScannedFile> = emptyList(),
     ) : DuplicateScanEvent
 }
 
@@ -84,6 +87,7 @@ class DuplicateScanner(
         val deadline = TimeSource.Monotonic.markNow() + timeout
         val files = mutableListOf<ScannedFile>()
         val subfolders = mutableListOf<ScannedFile>()
+        val manifests = mutableListOf<ScannedFile>()
         var listed = 0
         var failed = 0
         var stop: ScanStop? = null
@@ -123,7 +127,14 @@ class DuplicateScanner(
                             entry.isFolder -> if (!(isRoot && rootId.isEmpty() && entry.name == PreviewTempFolder.FOLDER_NAME)) {
                                 next += ScanFolder(entry.id, folder.childPath(entry.name), ScannedFile(entry, folder.path))
                             }
-                            entry.isFile && !entry.trashed -> files += ScannedFile(entry, folder.path)
+                            entry.isFile && !entry.trashed -> {
+                                files += ScannedFile(entry, folder.path)
+                                // 归档清单另收一份：海报墙要拿它解出引用保存的条目。
+                                // 仍然留在 files 里，查重与规范命名的口径不变（它们自己会按扩展名筛）
+                                if (VaultStore.looksLikeManifest(entry)) {
+                                    manifests += ScannedFile(entry, folder.path)
+                                }
+                            }
                         }
                     }
                 }
@@ -132,7 +143,7 @@ class DuplicateScanner(
             isRoot = false
             level = next
         }
-        emit(DuplicateScanEvent.Finished(files.toList(), listed, failed, stop, subfolders.toList()))
+        emit(DuplicateScanEvent.Finished(files.toList(), listed, failed, stop, subfolders.toList(), manifests.toList()))
     }.flowOn(Dispatchers.Default)
 
     /** [entry] 是这个目录在上一层里的那一项，起点为 null。 */

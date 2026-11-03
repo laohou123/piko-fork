@@ -42,6 +42,7 @@ import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material.icons.outlined.GridView
 import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Search
+import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.outlined.StarOutline
 import androidx.compose.material.icons.outlined.Tune
 import androidx.compose.material3.Card
@@ -247,6 +248,7 @@ fun PosterWallScreen(
                             state.filter == PosterWallState.Filter.FAVORITE -> "还没有收藏"
                             state.filter == PosterWallState.Filter.SCRAPED -> "还没有已刮削的作品"
                             state.filter == PosterWallState.Filter.UNSCRAPED -> "全部作品都已刮到"
+                            state.filter == PosterWallState.Filter.VAULT -> "还没有引用保存的作品"
                             state.query.isNotBlank() -> "没搜到「${state.query}」"
                             state.workCount == 0L -> "这个目录里还没有番号片"
                             else -> "没有符合条件的作品"
@@ -256,6 +258,8 @@ fun PosterWallScreen(
                             state.filter == PosterWallState.Filter.FAVORITE -> "长按演员或标签、或在详情页点心形按钮即可收藏"
                             state.filter == PosterWallState.Filter.SCRAPED -> "点右上角「补刮元数据」，刮到元数据的作品会出现在这里"
                             state.filter == PosterWallState.Filter.UNSCRAPED -> "没有待刮削的作品，点右上角「重新扫描」看看有没有新片"
+                            state.filter == PosterWallState.Filter.VAULT ->
+                                "在网盘里用「以引用保存」归档的片子会出现在这里。它们不占空间，播放时按内容临时借用；扫描目录要包含归档目录"
                             state.query.isNotBlank() -> "换个关键词试试：番号、标题、女优、标签都能搜"
                             else -> "换个筛选条件，或扫别的目录看看"
                         },
@@ -411,6 +415,46 @@ private fun ScanHeader(
                         selected = state.filter == PosterWallState.Filter.UNSCRAPED,
                         onClick = { state.toggleScrapeFilter(PosterWallState.Filter.UNSCRAPED) },
                     )
+                    StatSeparator()
+                    // 引用保存的片子：网盘里没有文件，不占「全部」的数字，单独一栏看。
+                    // 点一下切过去，再点一下回全部（与上面两个统计项同一套手势）
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .clickable {
+                                state.selectFilter(
+                                    if (state.filter == PosterWallState.Filter.VAULT) {
+                                        PosterWallState.Filter.ALL
+                                    } else {
+                                        PosterWallState.Filter.VAULT
+                                    },
+                                )
+                            }
+                            .padding(horizontal = 4.dp, vertical = 2.dp),
+                    ) {
+                        val vaultSelected = state.filter == PosterWallState.Filter.VAULT
+                        Icon(
+                            Icons.Outlined.Share,
+                            contentDescription = "引用保存",
+                            modifier = Modifier.size(14.dp),
+                            tint = if (vaultSelected) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                        )
+                        Text(
+                            text = " ${state.vaultCount}",
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = if (vaultSelected) FontWeight.SemiBold else null,
+                            color = if (vaultSelected) {
+                                MaterialTheme.colorScheme.primary
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                        )
+                    }
                 }
                 when (state.phase) {
                     PosterWallState.Phase.SCANNING -> {

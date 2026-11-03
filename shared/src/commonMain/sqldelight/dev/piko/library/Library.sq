@@ -23,7 +23,10 @@ CREATE TABLE works (
     -- 预览片地址（几十秒样片），详情页顶部自动播放；没有时顶部显示封面
     preview_video_url TEXT,
     -- 刮削完成的时刻（毫秒）；0 表示扫到了文件但还没刮到元数据
-    scraped_at INTEGER NOT NULL DEFAULT 0
+    scraped_at INTEGER NOT NULL DEFAULT 0,
+    -- 来源：scan = 扫描到的网盘真实文件；vault = 引用保存的清单条目（网盘里没有文件）
+    -- 两者分开维护：整轮重扫只重建 scan，引用条目由清单解析单独重建，不会互相清掉
+    origin TEXT NOT NULL DEFAULT 'scan'
 );
 
 -- 详情页截图墙：position = 0 是封面，其后是片段截图（MetaTube 的 preview_images）
@@ -115,11 +118,19 @@ VALUES (?, ?, ?, ?, ?, ?);
 deleteWorkFiles:
 DELETE FROM work_files WHERE work_code = ?;
 
+-- 批量删（引用条目整批重建时按消失的番号删）：变量上限同 deleteWorksIn，调用方分批 ≤500
+deleteWorkFilesIn:
+DELETE FROM work_files WHERE work_code IN ?;
+
 deleteWork:
 DELETE FROM works WHERE code = ?;
 
 clearWorkFiles:
 DELETE FROM work_files;
+
+-- 整轮重扫只重建扫描到的文件，引用条目的记录归清单那边管，不能一起清掉
+clearScanWorkFiles:
+DELETE FROM work_files WHERE work_code IN (SELECT code FROM works WHERE origin = 'scan');
 
 clearWorkActors:
 DELETE FROM work_actors;
@@ -134,6 +145,26 @@ DELETE FROM works;
 -- 刮削结果与译名因此能留下来（以前每次重扫都会把元数据冲成空）
 insertWorkIfAbsent:
 INSERT OR IGNORE INTO works (code) VALUES (?);
+
+-- 引用保存的作品：只补空壳，刮削结果由 enrich 照常写。
+-- OR IGNORE：同番号已经被真实文件占着时不抢，引用条目在这里被跳过（见 LibraryStore.saveVaultWorks）
+insertVaultWorkIfAbsent:
+INSERT OR IGNORE INTO works (code, origin) VALUES (?, 'vault');
+
+-- 引用条目整批重建前先清空。顺序不能反：先删文件再删作品，否则子查询已经空了
+deleteVaultWorkFiles:
+DELETE FROM work_files WHERE work_code IN (SELECT code FROM works WHERE origin = 'vault');
+
+deleteVaultWorks:
+DELETE FROM works WHERE origin = 'vault';
+
+-- 引用条目对应的作品编号：列表按它区分「扫到的」与「引用来的」
+selectVaultWorkCodes:
+SELECT code FROM works WHERE origin = 'vault';
+
+-- 引用作品的文件记录：没刮到封面时靠 file_id 里的 gcid 拼一张缩略图
+selectVaultFiles:
+SELECT work_code, file_id FROM work_files WHERE work_code IN (SELECT code FROM works WHERE origin = 'vault');
 
 -- 注意：不要用 NOT IN 一次传上千个番号。Android 的 SQLite 变量上限是 999，
 -- 超了就是「too many SQL variables」，整个扫描事务回滚、列表还是旧的。
@@ -158,6 +189,10 @@ DELETE FROM favorite_works WHERE code NOT IN (SELECT code FROM works);
 
 allWorkCodes:
 SELECT code FROM works;
+
+-- 重扫的差集只在这些里面算：引用条目的编号不能被判成「这轮没扫到」而删掉
+selectScanWorkCodes:
+SELECT code FROM works WHERE origin = 'scan';
 
 -- 待刮削的番号：从没刮过的（scraped_at = 0），加上刮到了但封面为空的。
 -- 后者是「刮削源不通/页面改版导致封面没解析出来」的自愈通道：网络恢复或用户换了
@@ -295,11 +330,18 @@ selectFirstActors:
 SELECT work_code, MIN(actor_name) AS actor FROM work_actors GROUP BY work_code;
 
 selectWorkCount:
-SELECT COUNT(*) FROM works;
+SELECT COUNT(*) FROM works WHERE origin = 'scan';
 
--- 已刮到元数据的作品数（未识别与刮削失败的都不算）
+selectVaultWorkCount:
+SELECT COUNT(*) FROM works WHERE origin = 'vault';
+
+-- 已刮到元数据的作品数（未识别与刮削失败的都不算）。引用条目分开算，
+-- 顶部那行「全部 / 已刮削 / 未刮削」只讲扫描到的作品，引用库有自己的数字。
 selectScrapedCount:
-SELECT COUNT(*) FROM works WHERE scraped_at > 0;
+SELECT COUNT(*) FROM works WHERE scraped_at > 0 AND origin = 'scan';
+
+selectVaultScrapedCount:
+SELECT COUNT(*) FROM works WHERE scraped_at > 0 AND origin = 'vault';
 
 -- 译名：AI 翻译与手动修改都写这一列。传空串表示恢复原标题
 setWorkTitleZh:
