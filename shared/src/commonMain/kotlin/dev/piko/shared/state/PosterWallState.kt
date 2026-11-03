@@ -277,16 +277,14 @@ class PosterWallState(
                                 works = grouped,
                                 complete = event.stop == null,
                             )
-                            // 引用库整批对齐：清单没扫全时不动，否则半份结果会把没遇到的条目当成已移除。
+                            // 引用库整批对齐：清单没扫全时只增不删，否则半份结果会把没遇到的条目当成已移除。
                             // 解析要逐份下载清单，不挡扫描出结果：先把墙画出来，引用条目在后台补上
-                            if (event.stop == null) {
-                                vaultJob?.cancel()
-                                vaultJob = scope.launch {
-                                    runCatching { syncVault(event.manifests) }
-                                        .onFailure { PikoLog.w(TAG, "解析归档清单失败", it) }
-                                    vaultCount = store.vaultWorkCount()
-                                    refresh()
-                                }
+                            vaultJob?.cancel()
+                            vaultJob = scope.launch {
+                                runCatching { syncVault(event.manifests, complete = event.stop == null) }
+                                    .onFailure { PikoLog.w(TAG, "解析归档清单失败", it) }
+                                vaultCount = store.vaultWorkCount()
+                                refresh()
                             }
                             store.setScanning(false)
                             workCount = store.workCount()
@@ -346,35 +344,75 @@ class PosterWallState(
      * 播放时按 gcid 借一份对象（见 LeasedFile）。同一份内容被引用到好几个目录时按 gcid + 大小去重，
      * 删除时再把各处条目一起抹掉（[removeVaultWork]）。
      */
-    private suspend fun syncVault(manifests: List<ScannedFile>) {
-        val vault = vaultStore ?: return
-        if (manifests.isEmpty()) {
-            store.saveVaultWorks(emptyList())
+    private suspend fun syncVault(manifests: List<ScannedFile>, complete: Boolean = true) {
+        val vault = vaultStore ?: run {
+            PikoLog.w(TAG, "引用库：归档存储未就绪，跳过")
             return
         }
-        // 一次读四份清单：每份都是一次下载，串行读上千个目录会很慢
-        val entries = mutableListOf<Pair<VaultEntry, String>>()
+        if (manifests.isEmpty()) {
+            // 一份清单都没遇到，多半是扫描根没覆盖归档目录，或这轮扫描没走到那层。
+            // 不清空已有记录：宁可留着旧数据，也不要因为一次没扫到就让引用库整墙消失
+            PikoLog.i(TAG, "引用库：本轮没扫到归档清单（完整走完=$complete），扫描根 $rootFolder")
+            return
+        }
+        // 服务端回来的 parentId 不一定有值，扫描时记下的目录 ID 更可靠
+        fun folderOf(item: ScannedFile) = item.folderId ?: item.file.parentId?.takeIf { it.isNotEmpty() }
         // 一个目录可能有历史上写下的好几份清单（旧版本、输掉的竞争），只有胜出的那份算数，
         // 挨个读会把已经移除的条目又翻出来
-        val winners = manifests.groupBy { it.file.parentId }
-            .mapNotNull { (_, group) -> VaultStore.winnerOf(group.map { it.file }) }
-        for (batch in winners.chunked(4)) {
-            entries += coroutineScope {
-                batch.map { manifest ->
-                    async {
-                        val folderId = manifest.parentId?.takeIf { it.isNotEmpty() }
-                            ?: return@async emptyList()
-                        runCatching { vault.entriesIn(manifest) }.getOrDefault(emptyList())
-                            // 已取回的条目在网盘里有真实文件，扫描会收它，这里再来一份就重复了
-                            .filter { it.isArchived && it.name.isPlayableVideo() }
-                            .map { it to folderId }
-                    }
-                }.awaitAll().flatten()
+        val winners = manifests.groupBy { folderOf(it) ?: "" }
+            .mapNotNull { (folderId, group) ->
+                if (folderId.isEmpty()) {
+                    PikoLog.w(TAG, "引用库：${group.size} 份清单认不出所在目录，跳过")
+                    return@mapNotNull null
+                }
+                VaultStore.winnerOf(group.map { it.file })?.let { it to folderId }
             }
+        PikoLog.i(TAG, "引用库：扫到清单 ${manifests.size} 份，按目录取胜出 ${winners.size} 份")
+        // 一次读四份清单：每份都是一次下载，串行读上千个目录会很慢
+        val entries = mutableListOf<Triple<VaultEntry, String, String>>()
+        var failed = 0
+        var notArchived = 0
+        var notVideo = 0
+        for (batch in winners.chunked(4)) {
+            // 每份清单各记各的统计，回到这里再汇总：并发协程里改外面的计数器不是好习惯
+            val results = coroutineScope {
+                batch.map { (manifest, folderId) ->
+                    async {
+                        val stat = intArrayOf(0, 0, 0) // 读取失败 / 已取回 / 非视频
+                        val parsed = runCatching { vault.entriesIn(manifest) }
+                            .onFailure {
+                                stat[0] = 1
+                                PikoLog.w(TAG, "引用库：读清单失败 ${manifest.name}", it)
+                            }
+                            .getOrDefault(emptyList())
+                        val usable = parsed.mapNotNull { entry ->
+                            when {
+                                // 已取回的条目在网盘里有真实文件，扫描会收它，这里再来一份就重复了
+                                !entry.isArchived -> { stat[1]++; null }
+                                !entry.name.isPlayableVideo() -> { stat[2]++; null }
+                                else -> Triple(entry, folderId, manifest.name)
+                            }
+                        }
+                        usable to stat
+                    }
+                }.awaitAll()
+            }
+            for ((list, stat) in results) {
+                entries += list
+                failed += stat[0]
+                notArchived += stat[1]
+                notVideo += stat[2]
+            }
+        }
+        if (failed + notArchived + notVideo > 0) {
+            PikoLog.i(
+                TAG,
+                "引用库：清单解析 ${entries.size} 条可用，丢弃 取回中 $notArchived / 非视频 $notVideo / 读取失败 $failed",
+            )
         }
         val seen = HashSet<String>()
         val byCode = LinkedHashMap<String, MutableList<ScannedWorkFile>>()
-        for ((entry, folderId) in entries) {
+        for ((entry, folderId, _) in entries) {
             if (!seen.add("${entry.gcid}:${entry.size}")) continue
             val stem = entry.name.substringBeforeLast('.')
             if (stem.isBlank()) continue
@@ -387,7 +425,13 @@ class PosterWallState(
                 part = null,
             )
         }
-        store.saveVaultWorks(byCode.map { (code, files) -> ScannedWork(code, files.sortedBy { it.name }) })
+        val works = byCode.map { (code, files) -> ScannedWork(code, files.sortedBy { it.name }) }
+        store.saveVaultWorks(works, complete = complete)
+        PikoLog.i(
+            TAG,
+            "引用库：条目 ${entries.size} 条去重后 ${seen.size} 条，写入 ${works.size} 部（完整走完=$complete）" +
+                if (works.isEmpty() && entries.isNotEmpty()) "，示例 ${entries.first().first.name}" else "",
+        )
     }
 
     /**

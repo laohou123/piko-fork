@@ -14,8 +14,12 @@ import kotlin.time.Duration
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.TimeSource
 
-/** 扫描到的一个文件。[folderPath] 是所在目录相对扫描起点的路径，起点下的文件为空串。 */
-data class ScannedFile(val file: FileStat, val folderPath: String) {
+/**
+ * 扫描到的一个文件。[folderPath] 是所在目录相对扫描起点的路径，起点下的文件为空串。
+ * [folderId] 是它所在目录的 ID：服务端回来的 [FileStat.parentId] 不一定有值，
+ * 归档清单要按目录分组，用扫描时自己记下的这个更可靠。
+ */
+data class ScannedFile(val file: FileStat, val folderPath: String, val folderId: String? = null) {
     val path: String get() = if (folderPath.isEmpty()) file.name else "$folderPath/${file.name}"
 }
 
@@ -132,7 +136,7 @@ class DuplicateScanner(
                                 // 归档清单另收一份：海报墙要拿它解出引用保存的条目。
                                 // 仍然留在 files 里，查重与规范命名的口径不变（它们自己会按扩展名筛）
                                 if (VaultStore.looksLikeManifest(entry)) {
-                                    manifests += ScannedFile(entry, folder.path)
+                                    manifests += ScannedFile(entry, folder.path, folder.id)
                                 }
                             }
                         }
