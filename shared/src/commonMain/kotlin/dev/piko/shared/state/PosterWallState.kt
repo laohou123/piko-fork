@@ -435,6 +435,57 @@ class PosterWallState(
     }
 
     /**
+     * 当前列表的样子：筛的谁、滚到哪。
+     *
+     * 从详情页点演员/标签会临时把筛选换成那一位，筛选页关掉后要能原样变回去，
+     * 所以进去之前先存一份。
+     */
+    data class FilterSnapshot(
+        val filter: Filter,
+        val name: String?,
+        val scrollIndex: Int,
+        val scrollOffset: Int,
+    )
+
+    fun filterSnapshot(): FilterSnapshot = FilterSnapshot(filter, filterName, scrollIndex, scrollOffset)
+
+    /**
+     * 恢复 [filterSnapshot]：筛选与滚动位置一起回去。
+     *
+     * 先换列表再给位置：界面要按新列表的长度去滚，早给就会落在旧长度上。
+     * 筛选本来就没变（回到的是同一位演员）时不发恢复信号，免得下次切筛选误用这个位置。
+     */
+    fun restoreFilter(snapshot: FilterSnapshot) {
+        if (filter == snapshot.filter && filterName == snapshot.name) {
+            scrollIndex = snapshot.scrollIndex
+            scrollOffset = snapshot.scrollOffset
+            return
+        }
+        filter = snapshot.filter
+        filterName = snapshot.name
+        scope.launch {
+            refresh()
+            pendingScrollRestore = snapshot.scrollIndex to snapshot.scrollOffset
+        }
+    }
+
+    /**
+     * 待恢复的滚动位置，界面滚过去之后取走。
+     *
+     * [scrollIndex] 是普通字段、写它不触发重组，界面没法"看到"恢复动作，所以另给一个
+     * 状态量当信号：不为 null 就是要滚一次。
+     */
+    var pendingScrollRestore by mutableStateOf<Pair<Int, Int>?>(null)
+        private set
+
+    /** 取走待恢复的位置；没有时返回 null。 */
+    fun takePendingScrollRestore(): Pair<Int, Int>? {
+        val pending = pendingScrollRestore ?: return null
+        pendingScrollRestore = null
+        return pending
+    }
+
+    /**
      * 统计行里点「已刮削 / 未刮削」：已经筛着这一批了再点就回到全部，否则切过去。
      * 入口只有一行小字，做成开关比"再找一个地方点全部"顺手。
      */

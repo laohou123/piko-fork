@@ -951,13 +951,31 @@ fun PikoMainScaffold(
     // 旧版在宽窗口里也会停在「我的」，恢复出来的就回到文件
     LaunchedEffect(desktop) { if (desktop && currentTab == MainTab.SETTINGS) currentTab = MainTab.FILES }
 
+    // 从详情页点演员/标签进来之前的列表样子（多半是「全部」与滚到哪）。
+    // 筛选页退回详情页时按它恢复，否则一路退回根页面还停在「演员：某某」上，看着像没退出去。
+    var posterFilterBeforePush by remember { mutableStateOf<PosterWallState.FilterSnapshot?>(null) }
+
     // 从作品详情点演员/标签：回海报墙并直接按它筛选
     fun openPosterWallFiltered(filter: dev.piko.shared.state.PosterWallState.Filter, name: String) {
         currentTab = MainTab.POSTERS
-        services.posterWall?.selectFilter(filter, name)
+        services.posterWall?.let { wall ->
+            // 筛选页里再点演员（嵌套进来）时保留最初那份，一路退回最开始的列表
+            if (posterFilterBeforePush == null) posterFilterBeforePush = wall.filterSnapshot()
+            wall.selectFilter(filter, name)
+        }
         // 压一页海报墙而不是清栈：从这儿按返回回到刚才的详情页。
         // 之前清到只剩根，返回被 BackHandler 接走切成文件页，看着像「跳错页」。
         if (backStack.lastOrNull() != Screen.PosterWall) backStack.add(Screen.PosterWall)
+    }
+
+    // 栈里不再有筛选页（退回了详情页，或切页时清了栈）就把列表恢复成进来前的样子。
+    // 按「栈里还有没有 PosterWall」判断而不是数层数：嵌套的筛选页要一层层退完，只恢复一次。
+    val filteredWallOpen = backStack.any { it == Screen.PosterWall }
+    LaunchedEffect(filteredWallOpen, posterFilterBeforePush) {
+        val snapshot = posterFilterBeforePush ?: return@LaunchedEffect
+        if (filteredWallOpen) return@LaunchedEffect
+        services.posterWall?.restoreFilter(snapshot)
+        posterFilterBeforePush = null
     }
 
     // 应用里的各个去处。命令面板与网盘页的地址栏共用这一份：怎么打开它们（压不压一栏「我的」、切不切页）只有这里知道

@@ -147,13 +147,22 @@ fun PosterWallScreen(
             .collect { (index, offset) -> state.rememberScroll(index, offset) }
     }
 
-    // 筛选或搜索换了，列表整体变了，回顶部；首帧不碰，好让恢复的位置生效
+    // 筛选或搜索换了，列表整体变了，回顶部；首帧不碰，好让恢复的位置生效。
+    // 从详情页筛选回来那一帧位置上另有安排（见下一条），这里让开，免得先跳到顶部再跳回来。
     val listKey = state.filter to state.query
     var prevListKey by remember { mutableStateOf(listKey) }
     LaunchedEffect(listKey) {
         if (listKey != prevListKey) {
             prevListKey = listKey
-            gridState.scrollToItem(0)
+            if (state.pendingScrollRestore == null) gridState.scrollToItem(0)
+        }
+    }
+
+    // 从详情页点演员/标签压进来的那一页关掉了：列表已变回进来前的样子，
+    // 位置也要回去。放在上面那条之后：同一帧里先让上面那条看到信号让开，再滚到这里。
+    LaunchedEffect(state.pendingScrollRestore) {
+        state.takePendingScrollRestore()?.let { (index, offset) ->
+            gridState.scrollToItem(index, offset)
         }
     }
 
