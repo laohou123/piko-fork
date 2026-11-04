@@ -198,6 +198,8 @@ class PosterWallState(
     private var scanJob: Job? = null
     private var vaultJob: Job? = null
     private var enrichJob: Job? = null
+    /** 补刮进行中又被要求补一轮（典型是扫描后引用条目异步入库），结束后再跑一次。 */
+    private var enrichQueued = false
     private var titleJob: Job? = null
 
     init {
@@ -289,6 +291,9 @@ class PosterWallState(
                                     .onFailure { PikoLog.w(TAG, "解析归档清单失败", it) }
                                 vaultCount = store.vaultWorkCount()
                                 refresh()
+                                // 引用条目是刚入库的，它们的元数据（标题、封面、标签）还没刮过。
+                                // 扫描那一轮的补刮已经跑在前面了，这里补一轮；正在跑时它自己会排队
+                                enrich(silent = true)
                             }
                             store.setScanning(false)
                             workCount = store.workCount()
@@ -434,7 +439,10 @@ class PosterWallState(
         PikoLog.i(
             TAG,
             "引用库：条目 ${entries.size} 条去重后 ${seen.size} 条，写入 ${works.size} 部（完整走完=$complete）" +
-                if (works.isEmpty() && entries.isNotEmpty()) "，示例 ${entries.first().first.name}" else "",
+                // 番号认错时刮削会整部落空，日志里留几个实际写进去的 code 方便对照
+                if (works.isNotEmpty()) "，番号示例 ${works.take(3).joinToString { it.code }}"
+                else if (entries.isNotEmpty()) "，示例 ${entries.first().first.name}"
+                else "",
         )
     }
 
@@ -468,10 +476,17 @@ class PosterWallState(
      * 给还没刮到元数据（或封面为空）的作品逐个找刮削源。一部失败不打断整轮：计数后继续。
      * 触发时机：扫描完成后、进海报墙（启动/换号）时、用户更换刮削源后——失败的作品
      * 在这些时机自动重试，不用用户手动干预。
+     *
+     * 已经有一轮在跑时只记一笔，等它结束再补一轮：扫描结束后引用条目才异步入库，
+     * 那一轮的待刮列表里没有它们，不补这一轮，引用作品要等到下次进海报墙才有标题与标签。
      */
     fun enrich(silent: Boolean = false) {
         val scraper = scraper
-        if (scraper == null || enriching) return
+        if (scraper == null) return
+        if (enriching) {
+            enrichQueued = true
+            return
+        }
         enrichJob?.cancel()
         enrichJob = scope.launch {
             try {
@@ -529,6 +544,12 @@ class PosterWallState(
             } finally {
                 enriching = false
                 refresh()
+                // 这一轮跑的时候又有作品入库（典型是扫描刚补进来的引用条目）：接着再补一轮，
+                // 不让它们等到下次进海报墙才有标题与标签
+                if (enrichQueued) {
+                    enrichQueued = false
+                    enrich(silent = true)
+                }
             }
         }
     }
