@@ -18,7 +18,7 @@ interface LibraryDriverFactory {
     fun create(account: String): SqlDriver
 }
 
-/** 同步记录里的类别：译名与三种收藏。 */
+/** 同步记录里的类别：译名、三种收藏，以及详情页手加的标签与女优。 */
 object SyncKind {
     const val TITLE = "title"
     const val WORK = "work"
@@ -27,6 +27,9 @@ object SyncKind {
 
     /** 详情页手动加的标签。key 是「作品编号|标签名」，因为同一部作品可以有好几个。 */
     const val CUSTOM_TAG = "custom_tag"
+
+    /** 详情页手动加的女优。key 同样是「作品编号|女优名」。 */
+    const val CUSTOM_ACTOR = "custom_actor"
 }
 
 /**
@@ -609,7 +612,10 @@ class LibraryStore(
                 q.insertSyncMarkIfAbsent(SyncKind.TAG, it, 0L, null, 1L)
             }
             q.selectCustomTags().executeAsList().forEach {
-                q.insertSyncMarkIfAbsent(SyncKind.CUSTOM_TAG, customTagKey(it.work_code, it.tag_name), 0L, it.tag_name, 1L)
+                q.insertSyncMarkIfAbsent(SyncKind.CUSTOM_TAG, customKey(it.work_code, it.tag_name), 0L, it.tag_name, 1L)
+            }
+            q.selectCustomActors().executeAsList().forEach {
+                q.insertSyncMarkIfAbsent(SyncKind.CUSTOM_ACTOR, customKey(it.work_code, it.actor_name), 0L, it.actor_name, 1L)
             }
         }
         q.selectSyncMarks().executeAsList().map {
@@ -643,6 +649,11 @@ class LibraryStore(
                         val (workCode, tagName) = splitCustomTagKey(mark.key) ?: continue
                         if (mark.on) q.insertCustomTag(workCode, mark.value?.takeIf { it.isNotBlank() } ?: tagName)
                         else q.deleteWorkTag(workCode, mark.value?.takeIf { it.isNotBlank() } ?: tagName)
+                    }
+                    SyncKind.CUSTOM_ACTOR -> {
+                        val (workCode, actorName) = splitCustomTagKey(mark.key) ?: continue
+                        if (mark.on) q.insertCustomActor(workCode, mark.value?.takeIf { it.isNotBlank() } ?: actorName)
+                        else q.deleteWorkActor(workCode, mark.value?.takeIf { it.isNotBlank() } ?: actorName)
                     }
                     else -> continue
                 }
@@ -689,7 +700,7 @@ class LibraryStore(
     suspend fun addCustomTag(code: String, name: String) = withQueries { q ->
         name.trim().takeIf { it.isNotEmpty() }?.let { tag ->
             q.insertCustomTag(code, tag)
-            q.upsertSyncMark(SyncKind.CUSTOM_TAG, customTagKey(code, tag), System.currentTimeMillis(), tag, 1)
+            q.upsertSyncMark(SyncKind.CUSTOM_TAG, customKey(code, tag), System.currentTimeMillis(), tag, 1)
         }
         Unit
     }?.also { _changes.tryEmit(Unit) }
@@ -703,11 +714,11 @@ class LibraryStore(
     suspend fun removeTag(code: String, name: String) = withQueries { q ->
         q.deleteWorkTag(code, name)
         // 删也算一次改动：别的设备拉到之后一起删掉，不会被补回来
-        q.upsertSyncMark(SyncKind.CUSTOM_TAG, customTagKey(code, name), System.currentTimeMillis(), name, 0)
+        q.upsertSyncMark(SyncKind.CUSTOM_TAG, customKey(code, name), System.currentTimeMillis(), name, 0)
         Unit
     }?.also { _changes.tryEmit(Unit) }
 
-    private fun customTagKey(code: String, name: String): String = "$code|$name"
+    private fun customKey(code: String, name: String): String = "$code|$name"
 
     // ---------------------------------------------------------------- 自定义女优
 
@@ -716,17 +727,22 @@ class LibraryStore(
      * 与刮削来的同名时就是同一个名字（保留自定义标记）。
      */
     suspend fun addCustomActor(code: String, name: String) = withQueries { q ->
-        name.trim().takeIf { it.isNotEmpty() }?.let { actor -> q.insertCustomActor(code, actor) }
+        name.trim().takeIf { it.isNotEmpty() }?.let { actor ->
+            q.insertCustomActor(code, actor)
+            q.upsertSyncMark(SyncKind.CUSTOM_ACTOR, customKey(code, actor), System.currentTimeMillis(), actor, 1)
+        }
         Unit
     }?.also { _changes.tryEmit(Unit) }
 
     /** 删掉这部作品上的某个女优（刮削来的也能删，下次刮削才会回来）。 */
     suspend fun removeActor(code: String, name: String) = withQueries { q ->
         q.deleteWorkActor(code, name)
+        // 删也算一次改动：别的设备拉到之后一起删掉，不会被补回来
+        q.upsertSyncMark(SyncKind.CUSTOM_ACTOR, customKey(code, name), System.currentTimeMillis(), name, 0)
         Unit
     }?.also { _changes.tryEmit(Unit) }
 
-    /** 拆「作品编号|标签名」；标签名里带竖线时按第一个竖线切，后面的都算标签名。 */
+    /** 拆「作品编号|标签名（或女优名）」；名字里带竖线时按第一个竖线切，后面的都算名字。 */
     private fun splitCustomTagKey(key: String): Pair<String, String>? {
         val i = key.indexOf('|')
         if (i <= 0 || i == key.length - 1) return null

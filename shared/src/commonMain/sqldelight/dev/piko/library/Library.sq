@@ -213,8 +213,10 @@ DELETE FROM works WHERE code IN ?;
 
 -- 作品没了，它的演员/标签/截图也别留着占地方。注意只删孤儿：
 -- 还在的作品的关联数据必须保住（重扫不清它们，见 saveScan）
+-- 自定义演员同样除外：它可能比作品先到（新设备登录即同步，此时还没扫到这部片），
+-- 一起清掉就再也回不来了——作品入库后同一行的 work_code 自然对得上，女优也就挂上了。
 deleteOrphanActors:
-DELETE FROM work_actors WHERE work_code NOT IN (SELECT code FROM works);
+DELETE FROM work_actors WHERE work_code NOT IN (SELECT code FROM works) AND custom = 0;
 
 -- 自定义标签除外：它可能比作品先到（新设备登录即同步，此时还没扫到这部片），
 -- 一起清掉就再也回不来了——作品入库后同一行的 work_code 自然对得上，标签也就挂上了。
@@ -435,6 +437,10 @@ SELECT kind, key, at, title_value, on_flag FROM sync_marks;
 -- 同步补历史：本机已有的自定义标签
 selectCustomTags:
 SELECT work_code, tag_name FROM work_tags WHERE custom = 1;
+
+-- 同步补历史：本机已有的自定义女优
+selectCustomActors:
+SELECT work_code, actor_name FROM work_actors WHERE custom = 1;
 
 -- 详情页加标签时的候选：用过一次的自定义标签，下次直接点
 selectCustomTagNames:

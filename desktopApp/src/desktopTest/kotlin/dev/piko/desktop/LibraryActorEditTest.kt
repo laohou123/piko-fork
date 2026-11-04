@@ -7,6 +7,7 @@ import dev.piko.shared.library.LibraryDriverFactory
 import dev.piko.shared.library.LibraryStore
 import dev.piko.shared.library.ScannedWork
 import dev.piko.shared.library.ScannedWorkFile
+import dev.piko.shared.library.SyncKind
 import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -119,5 +120,71 @@ class LibraryActorEditTest {
         store.addCustomActor("ABC-123", "   ")
 
         assertEquals(emptyList(), store.workDetail("ABC-123")!!.actors)
+    }
+
+    // ---------------------------------------------------------------- 同步
+
+    @Test
+    fun customActorIsWrittenAsSyncMark(): Unit = runBlocking {
+        val store = store()
+        store.saveScan("root", "根目录", listOf(work("ABC-123")))
+        store.addCustomActor("ABC-123", "手加女优")
+
+        val mark = store.exportSyncMarks().single { it.kind == SyncKind.CUSTOM_ACTOR }
+        assertEquals("ABC-123|手加女优", mark.key)
+        assertEquals("手加女优", mark.value)
+        assertTrue(mark.on)
+    }
+
+    @Test
+    fun customActorSyncsToOtherDevice(): Unit = runBlocking {
+        val phone = store()
+        phone.saveScan("root", "根目录", listOf(work("ABC-123")))
+        phone.addCustomActor("ABC-123", "手加女优")
+
+        val tablet = store()
+        tablet.saveScan("root", "根目录", listOf(work("ABC-123")))
+        tablet.applySyncMarks(phone.exportSyncMarks())
+
+        val actors = tablet.workDetail("ABC-123")!!.actors
+        assertEquals(listOf("手加女优"), actors.map { it.name })
+        assertTrue(actors.single().custom)
+    }
+
+    @Test
+    fun removalSyncsAsOffMark(): Unit = runBlocking {
+        val phone = store()
+        phone.saveScan("root", "根目录", listOf(work("ABC-123")))
+        phone.addCustomActor("ABC-123", "手加女优")
+
+        val tablet = store()
+        tablet.saveScan("root", "根目录", listOf(work("ABC-123")))
+        tablet.applySyncMarks(phone.exportSyncMarks())
+        assertEquals(1, tablet.workDetail("ABC-123")!!.actors.size)
+
+        phone.removeActor("ABC-123", "手加女优")
+        tablet.applySyncMarks(phone.exportSyncMarks())
+
+        assertEquals(emptyList(), tablet.workDetail("ABC-123")!!.actors)
+    }
+
+    /**
+     * 新设备刚登录就同步、作品还没扫到：这条女优不能当孤儿清掉。
+     * 标签踩过同一个坑，这里钉住同样的顺序——先同步，再扫到别的片，最后才扫到它。
+     */
+    @Test
+    fun syncedActorSurvivesScanThatHasNotReachedItYet(): Unit = runBlocking {
+        val phone = store()
+        phone.saveScan("root", "根目录", listOf(work("ABC-123")))
+        phone.addCustomActor("ABC-123", "手加女优")
+
+        val tablet = store()
+        tablet.applySyncMarks(phone.exportSyncMarks())
+        tablet.saveScan("root", "根目录", listOf(work("XYZ-999")))
+        tablet.saveScan("root", "根目录", listOf(work("ABC-123"), work("XYZ-999")))
+
+        val actors = tablet.workDetail("ABC-123")!!.actors
+        assertEquals(listOf("手加女优"), actors.map { it.name })
+        assertTrue(actors.single().custom)
     }
 }

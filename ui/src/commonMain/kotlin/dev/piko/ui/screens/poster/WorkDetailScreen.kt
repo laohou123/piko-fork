@@ -750,7 +750,7 @@ fun WorkDetailScreen(
             text = {
                 Column {
                     Text(
-                        text = "只加在这部作品上，重新刮削也不会被冲掉。",
+                        text = "只加在这部作品上，重新刮削不会被冲掉；会跟着备份同步到其它设备。",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
