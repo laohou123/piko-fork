@@ -329,16 +329,17 @@ SELECT work_code FROM work_tags WHERE tag_name LIKE :pattern;
 selectFirstActors:
 SELECT work_code, MIN(actor_name) AS actor FROM work_actors GROUP BY work_code;
 
+-- 海报墙「全部」的数字：扫描到的与引用保存的都算
 selectWorkCount:
-SELECT COUNT(*) FROM works WHERE origin = 'scan';
+SELECT COUNT(*) FROM works;
 
 selectVaultWorkCount:
 SELECT COUNT(*) FROM works WHERE origin = 'vault';
 
--- 已刮到元数据的作品数（未识别与刮削失败的都不算）。引用条目分开算，
--- 顶部那行「全部 / 已刮削 / 未刮削」只讲扫描到的作品，引用库有自己的数字。
+-- 已刮到元数据的作品数（未识别与刮削失败的都不算）。两类来源一起算：
+-- 引用条目也在「全部」里出现，统计口径必须与列表一致
 selectScrapedCount:
-SELECT COUNT(*) FROM works WHERE scraped_at > 0 AND origin = 'scan';
+SELECT COUNT(*) FROM works WHERE scraped_at > 0;
 
 selectVaultScrapedCount:
 SELECT COUNT(*) FROM works WHERE scraped_at > 0 AND origin = 'vault';

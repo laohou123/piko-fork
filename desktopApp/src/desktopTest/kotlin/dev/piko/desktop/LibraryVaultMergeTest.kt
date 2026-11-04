@@ -60,16 +60,19 @@ class LibraryVaultMergeTest {
         store.saveScan("root", "根目录", listOf(work("SSIS-001", "SSIS-001.mp4")))
         store.saveVaultWorks(listOf(vaultWork("ABC-123", "ABC-123.mp4")))
 
-        assertEquals(1L, store.workCount())
+        // 「全部」的数字与列表都含引用条目，两者口径一致
+        assertEquals(2L, store.workCount())
         assertEquals(1L, store.vaultWorkCount())
+        assertEquals(setOf("SSIS-001", "ABC-123"), store.works(actor = null, tag = null).map { it.code }.toSet())
 
         // 整轮重扫：网盘里只有 SSIS-001，引用条目不该被当成「没扫到」
         store.saveScan("root", "根目录", listOf(work("SSIS-001", "SSIS-001.mp4")))
 
-        assertEquals(1L, store.workCount())
+        assertEquals(2L, store.workCount())
         assertEquals(1L, store.vaultWorkCount())
         assertEquals(1, store.works(actor = null, tag = null, vault = true).size)
-        assertEquals(listOf("SSIS-001"), store.works(actor = null, tag = null).map { it.code })
+        assertEquals(listOf("SSIS-001"), store.works(actor = null, tag = null, vault = false).map { it.code })
+        assertEquals(setOf("SSIS-001", "ABC-123"), store.works(actor = null, tag = null).map { it.code }.toSet())
     }
 
     @Test

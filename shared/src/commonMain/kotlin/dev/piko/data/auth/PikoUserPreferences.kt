@@ -259,7 +259,9 @@ interface PikoUserPreferences {
     suspend fun setHardwareDecoding(enabled: Boolean)
 
     /**
-     * 播放画质上限：画面高度，0 是原画（默认）。播放时挑不高于它的最大一档转码，没有就放原画，见 transcodeNameAtMost。
+     * 播放画质上限：画面高度，0 是原画（默认）。播放时挑不高于它的最大一档转码；
+     * 这一档没有（例如设了 480 而片源最低只有 720）就取高一档里最接近的那个，只有完全没有转码才放原画。
+     * 见 transcodeNameAtMost。
      * 每台设备各自的，不同步：手机走流量想要 720P，电脑上要原画。
      */
     val playbackMaxHeightFlow: Flow<Int>

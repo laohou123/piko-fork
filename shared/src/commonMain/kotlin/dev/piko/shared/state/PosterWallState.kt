@@ -662,7 +662,8 @@ class PosterWallState(
                 Filter.UNSCRAPED -> false
                 else -> null
             },
-            vault = filter == Filter.VAULT,
+            // 只有顶部的引用库入口单独筛引用条目；其余筛选与「全部」一样两类都看
+            vault = if (filter == Filter.VAULT) true else null,
         )
         actors = store.actors()
         tags = store.tags()

@@ -334,18 +334,20 @@ class LibraryStore(
         /** true 只留已刮到元数据的，false 只留没刮到的，null 不按刮削状态过滤。 */
         scraped: Boolean? = null,
         /**
-         * true 只看引用保存的条目，false（默认）只看扫描到的真实文件。
-         * 两类作品同在一张表里，靠 origin 区分，列表上从不混排。
+         * true 只看引用保存的条目，false 只看扫描到的真实文件，null（默认）两者都看。
+         * 「全部」与按演员/标签/收藏/刮削状态的筛选都包含引用条目，只有顶部的引用库入口
+         * 单独筛它们；两类作品同在一张表里，靠 origin 区分。
          */
-        vault: Boolean = false,
+        vault: Boolean? = null,
     ): List<WorkRow> = withQueries { q ->
         val counts = q.selectFileCounts().executeAsList().associate { it.work_code to (it.count to it.total) }
         // 卡片左下角的女优名：一次批量取出，不逐行查
         val actors = q.selectFirstActors().executeAsList().associate { it.work_code to it.actor }
         // 来源过滤在内存里做：四条列表查询结构不同，为它各写一份带 origin 的版本不划算
         val vaultCodes = q.selectVaultWorkCodes().executeAsList().toSet()
-        // 引用条目还没刮到封面时，用清单里的 gcid 拼一张缩略图顶上：整墙空白卡片等于没有入口
-        val vaultCovers = if (vault) {
+        // 引用条目还没刮到封面时，用清单里的 gcid 拼一张缩略图顶上：整墙空白卡片等于没有入口。
+        // 「全部」里也混着引用条目，只要不是「只看扫描到的」，这张表就得备好
+        val vaultCovers = if (vault != false) {
             q.selectVaultFiles().executeAsList()
                 .groupBy({ it.work_code }, { it.file_id })
                 .mapNotNull { (code, ids) ->
@@ -364,7 +366,7 @@ class LibraryStore(
         fun List<WorkRow>.applyQuery(): List<WorkRow> =
             if (matched == null) this else filter { it.code in matched }
         fun List<WorkRow>.applyOrigin(): List<WorkRow> =
-            filter { (it.code in vaultCodes) == vault }
+            if (vault == null) this else filter { (it.code in vaultCodes) == vault }
         // 四个查询各生成一个同构不同名的数据类，公共类型是 Any；逐个映射，不靠 when 推断
         when {
             favoriteOnly -> q.selectFavoriteWorks().executeAsList()
@@ -376,7 +378,7 @@ class LibraryStore(
             else -> q.selectAllWorks().executeAsList()
                 .map { it.toRow(counts, actors) }
         }.applyOrigin().applyQuery().let { rows ->
-            val covered = if (vault) {
+            val covered = if (vault != false) {
                 rows.map { row -> if (row.coverUrl.isNullOrBlank()) row.copy(coverUrl = vaultCovers[row.code]) else row }
             } else {
                 rows

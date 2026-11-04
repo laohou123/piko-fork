@@ -92,16 +92,26 @@ val PlayableMediaInfo.transcodeName: String?
     get() = if (isOrigin) null else availableVariants.firstOrNull { it.mediaId == mediaId }?.qualityName
 
 /**
- * 画面高度不超过 [maxHeight] 的可读转码里最大的一档。没有返回 null，调用方退回原画：
- * 上限是为了省流量，挑一档更高的转码违背本意，原画至少是用户本来就会看到的。
+ * 按画面高度挑一档可读的转码：优先不超过 [maxHeight] 的最大一档。
+ *
+ * 一档都不超过时（例如用户把上限设成 480，这个片源最低只有 720），取高一档里最低的那个：
+ * 720 依然比原画省流量，直接退回原画等于把上限完全作废，用户看到的反而更清楚也更费流量。
+ * 连转码都没有才返回 null，由调用方播原画。
  */
-fun List<MediaVariant>.transcodeNameAtMost(maxHeight: Int): String? = this
-    .filter { !it.isOrigin && it.video != null && it.link.url.isNotBlank() && (it.video?.height ?: 0) <= maxHeight }
-    .maxByOrNull { it.video?.height ?: 0 }
-    ?.qualityName
+fun List<MediaVariant>.transcodeNameAtMost(maxHeight: Int): String? {
+    val usable = filter { !it.isOrigin && it.video != null && it.link.url.isNotBlank() }
+    fun height(variant: MediaVariant) = variant.video?.height ?: 0
+    val within = usable.filter { height(it) <= maxHeight }.maxByOrNull(::height)
+    val nearestAbove = usable.filter { height(it) > maxHeight }.minByOrNull(::height)
+    return (within ?: nearestAbove)?.qualityName
+}
 
 private val MediaVariant.qualityName: String?
     get() = mediaName.ifBlank { resolutionName }.takeIf { it.isNotBlank() }
+
+/** 这一档在当前片源里是否真的能读：名字对上、有画面参数、链接不为空。 */
+private fun List<MediaVariant>.hasQuality(name: String): Boolean =
+    any { !it.isOrigin && it.video != null && it.link.url.isNotBlank() && it.qualityName == name }
 
 /**
  * 一次播放准备的结果。关闭它即释放代理会话、reader 与 handle。
@@ -317,8 +327,13 @@ class PikoMediaRepository(
                     }
                 }
                 val detail = detailOf(client, fileId)
-                val resolution = preferredResolution
-                    ?: defaultMaxHeight.takeIf { it > 0 }?.let { detail.medias.transcodeNameAtMost(it) }
+                // 点选的那一档在这一集未必存在（同名档位只在部分片源里有），
+                // 缺席时按它的画面高度重新挑，而不是让 SDK 直接退回原画
+                val resolution = when {
+                    preferredResolution == ORIGINAL_QUALITY -> ORIGINAL_QUALITY
+                    !preferredResolution.isNullOrBlank() && detail.medias.hasQuality(preferredResolution) -> preferredResolution
+                    else -> defaultMaxHeight.takeIf { it > 0 }?.let { detail.medias.transcodeNameAtMost(it) }
+                }
                 val resolved = detail.resolveVariant(preferenceFor(resolution))
                 val info = playableMediaInfo(detail, resolved, fileId)
                 val leased = LeasedFile.isLeased(fileId)
