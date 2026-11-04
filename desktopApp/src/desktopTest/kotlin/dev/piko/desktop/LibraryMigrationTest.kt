@@ -146,9 +146,15 @@ class LibraryMigrationTest {
             "INSERT INTO work_files (file_id, work_code, name, size, folder_id) VALUES ('f1', 'ABC-123', 'ABC-123.mp4', 100, 'root')",
             0,
         )
+        // v10 迁移还要动 work_actors（补 custom 列），老库里这张表本来就在
+        driver.execute(
+            null,
+            "CREATE TABLE work_actors (work_code TEXT NOT NULL, actor_name TEXT NOT NULL, PRIMARY KEY (work_code, actor_name))",
+            0,
+        )
 
         Library.Schema.migrate(driver, 9L, Library.Schema.version)
-        assertEquals(10, Library.Schema.version.toInt())
+        assertEquals(11, Library.Schema.version.toInt())
 
         // 老行还在，只是还没有 gcid（要重扫一轮才会填）
         assertEquals(1L, count(driver, "SELECT count(*) FROM work_files"))
@@ -157,6 +163,34 @@ class LibraryMigrationTest {
         // 新列可写：重扫时按 gcid 写回去
         driver.execute(null, "UPDATE work_files SET gcid = 'GCID1' WHERE file_id = 'f1'", 0)
         assertEquals(1L, count(driver, "SELECT count(*) FROM work_files WHERE gcid = 'GCID1'"))
+    }
+
+    @Test
+    fun v10ToV11AddsCustomFlagToWorkActors() {
+        val driver = JdbcSqliteDriver(JdbcSqliteDriver.IN_MEMORY)
+        // 照 v10 的 work_actors 结构建表：只有作品与演员名，没有 custom
+        driver.execute(
+            null,
+            "CREATE TABLE work_actors (work_code TEXT NOT NULL, actor_name TEXT NOT NULL, PRIMARY KEY (work_code, actor_name))",
+            0,
+        )
+        driver.execute(
+            null,
+            "INSERT INTO work_actors (work_code, actor_name) VALUES ('ABC-123', '旧演员')",
+            0,
+        )
+
+        Library.Schema.migrate(driver, 10L, Library.Schema.version)
+        assertEquals(11, Library.Schema.version.toInt())
+
+        // 老演员还在，默认算刮削来的（custom = 0），刮削重写时照旧会被替换
+        assertEquals(
+            1L,
+            count(driver, "SELECT count(*) FROM work_actors WHERE actor_name = '旧演员' AND custom = 0"),
+        )
+        // 新列可写：手加的女优标 1
+        driver.execute(null, "UPDATE work_actors SET custom = 1 WHERE actor_name = '旧演员'", 0)
+        assertEquals(1L, count(driver, "SELECT count(*) FROM work_actors WHERE custom = 1"))
     }
 
     @Test

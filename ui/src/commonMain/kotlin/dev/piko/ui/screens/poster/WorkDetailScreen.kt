@@ -16,11 +16,14 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
@@ -71,6 +74,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import coil3.compose.SubcomposeAsyncImage
 import dev.piko.shared.data.VaultEntry
+import dev.piko.shared.library.NamedCount
 import dev.piko.shared.library.ScannedWorkFile
 import dev.piko.shared.library.WorkDetail
 import dev.piko.shared.media.PreparedPlayback
@@ -143,6 +147,14 @@ fun WorkDetailScreen(
     var tagCandidates by remember { mutableStateOf<List<String>>(emptyList()) }
     LaunchedEffect(editingTags) {
         if (editingTags) tagCandidates = services.libraryStore?.customTagCandidates().orEmpty()
+    }
+    // 详情页「女优」那一行末尾的 + ：自定义，或从库里已有的女优里挑
+    var editingActors by remember { mutableStateOf(false) }
+    var actorDraft by remember { mutableStateOf("") }
+    // 打开对话框时读一次。演员多的库可能上千条，列表要能滚，输入框同时当筛选
+    var actorCandidates by remember { mutableStateOf<List<NamedCount>>(emptyList()) }
+    LaunchedEffect(editingActors) {
+        if (editingActors) actorCandidates = services.libraryStore?.actors().orEmpty()
     }
 
     // 顶栏按钮与「还没有封面」占位卡片共用：刮这一部，刮完重读详情
@@ -427,28 +439,28 @@ fun WorkDetailScreen(
                                     },
                                 )
                             }
-                            AddTagChip(onClick = { tagDraft = ""; editingTags = true })
+                            AddChip(label = "标签", onClick = { tagDraft = ""; editingTags = true })
                         }
-                        if (d.actors.isNotEmpty()) {
-                            SectionLabel("女优")
-                            FlowRow(
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                verticalArrangement = Arrangement.spacedBy(8.dp),
-                            ) {
-                                d.actors.forEach { actor ->
-                                    FavoriteChip(
-                                        name = actor.name,
-                                        favorite = actor.favorite,
-                                        onClick = { onFilterActor(actor.name) },
-                                        onLongClick = {
-                                            scope.launch {
-                                                services.libraryStore?.toggleActorFavorite(actor.name)
-                                                detail = services.libraryStore?.workDetail(code)
-                                            }
-                                        },
-                                    )
-                                }
+                        // 女优这一行也始终显示：一部片子一个演员都没刮到时，照样能自己补
+                        SectionLabel("女优")
+                        FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            d.actors.forEach { actor ->
+                                FavoriteChip(
+                                    name = actor.name,
+                                    favorite = actor.favorite,
+                                    onClick = { onFilterActor(actor.name) },
+                                    onLongClick = {
+                                        scope.launch {
+                                            services.libraryStore?.toggleActorFavorite(actor.name)
+                                            detail = services.libraryStore?.workDetail(code)
+                                        }
+                                    },
+                                )
                             }
+                            AddChip(label = "女优", onClick = { actorDraft = ""; editingActors = true })
                         }
                         Box(modifier = Modifier.padding(bottom = 24.dp))
                     }
@@ -718,6 +730,130 @@ fun WorkDetailScreen(
             },
             confirmButton = {
                 TextButton(onClick = { editingTags = false }) { Text("完成") }
+            },
+        )
+    }
+
+    // 加女优：可以敲一个新名字，也可以从库里已有的女优里点一个。
+    // 已在这部作品上的不再列出；输入框同时当筛选用，女优上千条时打两个字就缩到几个人。
+    if (editingActors) {
+        val onThisWork = detail?.actors?.map { it.name }?.toSet().orEmpty()
+        val customActors = detail?.actors?.filter { it.custom }.orEmpty()
+        val keyword = actorDraft.trim()
+        val suggestions = actorCandidates.filter { candidate ->
+            candidate.name !in onThisWork &&
+                (keyword.isEmpty() || candidate.name.contains(keyword, ignoreCase = true))
+        }
+        PikoDialog(
+            onDismissRequest = { editingActors = false },
+            title = { Text("添加女优") },
+            text = {
+                Column {
+                    Text(
+                        text = "只加在这部作品上，重新刮削也不会被冲掉。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(top = 8.dp),
+                    ) {
+                        OutlinedTextField(
+                            value = actorDraft,
+                            onValueChange = { actorDraft = it },
+                            singleLine = true,
+                            label = { Text("女优名") },
+                            modifier = Modifier.weight(1f),
+                        )
+                        TextButton(
+                            enabled = actorDraft.isNotBlank(),
+                            onClick = {
+                                val name = actorDraft.trim()
+                                actorDraft = ""
+                                scope.launch {
+                                    services.libraryStore?.addCustomActor(code, name)
+                                    detail = services.libraryStore?.workDetail(code)
+                                }
+                            },
+                            modifier = Modifier.padding(start = 8.dp),
+                        ) { Text("添加") }
+                    }
+                    if (customActors.isNotEmpty()) {
+                        Text(
+                            text = "自己加的（点右侧可删）",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 12.dp),
+                        )
+                        customActors.forEach { actor ->
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                            ) {
+                                Text(
+                                    text = actor.name,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                IconButton(
+                                    onClick = {
+                                        scope.launch {
+                                            services.libraryStore?.removeActor(code, actor.name)
+                                            detail = services.libraryStore?.workDetail(code)
+                                        }
+                                    },
+                                    modifier = Modifier.size(32.dp),
+                                ) {
+                                    Icon(
+                                        Icons.Filled.Close,
+                                        contentDescription = "删除女优 ${actor.name}",
+                                        modifier = Modifier.size(16.dp),
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    Text(
+                        text = if (keyword.isEmpty()) "已有女优（点一下直接加）" else "匹配「$keyword」的女优",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 12.dp),
+                    )
+                    // 库里的女优可能上千条，屏幕放不下：这里限高，列表自己往上滑
+                    LazyColumn(
+                        modifier = Modifier.fillMaxWidth().heightIn(max = 240.dp).padding(top = 4.dp),
+                    ) {
+                        items(suggestions, key = { it.name }) { candidate ->
+                            ActorSuggestionRow(
+                                name = candidate.name,
+                                workCount = candidate.count,
+                                onClick = {
+                                    scope.launch {
+                                        services.libraryStore?.addCustomActor(code, candidate.name)
+                                        detail = services.libraryStore?.workDetail(code)
+                                    }
+                                },
+                            )
+                        }
+                    }
+                    if (suggestions.isEmpty()) {
+                        Text(
+                            text = if (keyword.isEmpty()) {
+                                "库里还没有别的女优，直接在上面输入名字添加。"
+                            } else {
+                                "没有匹配的女优，点上面的「添加」新建一个。"
+                            },
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 6.dp),
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { editingActors = false }) { Text("完成") }
             },
         )
     }
@@ -1159,11 +1295,11 @@ private fun SectionLabel(text: String) {
 }
 
 /**
- * 标签行末尾的「+ 标签」。外观与旁边的标签芯片一致（同样的圆角、底色、内边距与字号），
+ * 标签/女优行末尾的「+ 标签」「+ 女优」。外观与旁边的芯片一致（同样的圆角、底色、内边距与字号），
  * 只是内容是一个加号加两个字——放在一排里不该看着像另一种控件。
  */
 @Composable
-private fun AddTagChip(onClick: () -> Unit) {
+private fun AddChip(label: String, onClick: () -> Unit) {
     Surface(
         shape = RoundedCornerShape(8.dp),
         color = MaterialTheme.colorScheme.surfaceContainerHigh,
@@ -1180,7 +1316,42 @@ private fun AddTagChip(onClick: () -> Unit) {
                 modifier = Modifier.size(14.dp),
             )
             Spacer(modifier = Modifier.width(4.dp))
-            Text(text = "标签", style = MaterialTheme.typography.labelLarge)
+            Text(text = label, style = MaterialTheme.typography.labelLarge)
+        }
+    }
+}
+
+/** 候选女优的一行：名字在左，作品数在右；整行可点，点了就加到这部作品上。 */
+@Composable
+private fun ActorSuggestionRow(name: String, workCount: Long, onClick: () -> Unit) {
+    Surface(
+        color = Color.Transparent,
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick),
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.padding(horizontal = 4.dp, vertical = 10.dp),
+        ) {
+            Icon(
+                Icons.Filled.Add,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(14.dp),
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(
+                text = name,
+                style = MaterialTheme.typography.bodyMedium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            Text(
+                text = "$workCount 部",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(start = 8.dp),
+            )
         }
     }
 }

@@ -53,6 +53,8 @@ CREATE INDEX index_work_files_on_work_code ON work_files(work_code);
 CREATE TABLE work_actors (
     work_code TEXT NOT NULL,
     actor_name TEXT NOT NULL,
+    -- 1 = 用户在详情页手动加的：重新刮削重写演员时不删这些
+    custom INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (work_code, actor_name)
 );
 CREATE INDEX index_work_actors_on_actor ON work_actors(actor_name);
@@ -241,7 +243,8 @@ codesNeedingScrape:
 SELECT code FROM works WHERE scraped_at = 0 OR cover_url IS NULL OR cover_url = '';
 
 insertWorkActor:
-INSERT OR REPLACE INTO work_actors (work_code, actor_name) VALUES (?, ?);
+-- OR IGNORE：用户已经手动加过同名演员时保留它（custom = 1），别被刮削覆盖回去
+INSERT OR IGNORE INTO work_actors (work_code, actor_name) VALUES (?, ?);
 
 insertWorkTag:
 -- OR IGNORE：用户已经手动加过同名标签时保留它（custom = 1），别被刮削覆盖回去
@@ -249,6 +252,17 @@ INSERT OR IGNORE INTO work_tags (work_code, tag_name) VALUES (?, ?);
 
 deleteWorkActorsFor:
 DELETE FROM work_actors WHERE work_code = ?;
+
+-- 刮削重写演员：只删源站带来的，用户自己加的不动
+deleteScrapedActorsFor:
+DELETE FROM work_actors WHERE work_code = ? AND custom = 0;
+
+-- 详情页手动加女优，标成自定义
+insertCustomActor:
+INSERT OR REPLACE INTO work_actors (work_code, actor_name, custom) VALUES (?, ?, 1);
+
+deleteWorkActor:
+DELETE FROM work_actors WHERE work_code = ? AND actor_name = ?;
 
 deleteWorkTagsFor:
 DELETE FROM work_tags WHERE work_code = ?;
@@ -325,7 +339,7 @@ SELECT work_code, gcid FROM work_files WHERE gcid IS NOT NULL AND gcid != '';
 
 -- 详情页的演员与标签：带上收藏标志，长按可收藏/取消收藏
 selectActorsForWork:
-SELECT a.actor_name AS name, CASE WHEN f.actor_name IS NULL THEN 0 ELSE 1 END AS favorite
+SELECT a.actor_name AS name, CASE WHEN f.actor_name IS NULL THEN 0 ELSE 1 END AS favorite, a.custom AS custom
 FROM work_actors a LEFT JOIN favorite_actors f ON f.actor_name = a.actor_name
 WHERE a.work_code = ? ORDER BY a.actor_name;
 

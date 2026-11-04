@@ -323,7 +323,7 @@ class LibraryStore(
                 title, coverUrl, releaseDate, durationMinutes?.toLong(), summary, studio, series,
                 provider, mtProvider, mtId, previewVideoUrl, System.currentTimeMillis(), code,
             )
-            q.deleteWorkActorsFor(code)
+            q.deleteScrapedActorsFor(code)
             q.deleteScrapedTagsFor(code)
             q.deleteWorkImagesFor(code)
             actors.forEach { q.insertWorkActor(code, it) }
@@ -516,7 +516,9 @@ class LibraryStore(
                 totalSize = counts?.total ?: files.sumOf { it.size },
             ),
             files = files,
-            actors = q.selectActorsForWork(code).executeAsList().map { NamedFavorite(it.name, it.favorite == 1L) },
+            actors = q.selectActorsForWork(code).executeAsList().map {
+                NamedFavorite(it.name, it.favorite == 1L, it.custom == 1L)
+            },
             tags = q.selectTagsForWork(code).executeAsList().map { NamedFavorite(it.name, it.favorite == 1L, it.custom == 1L) },
             studio = w.studio,
             series = w.series,
@@ -706,6 +708,23 @@ class LibraryStore(
     }?.also { _changes.tryEmit(Unit) }
 
     private fun customTagKey(code: String, name: String): String = "$code|$name"
+
+    // ---------------------------------------------------------------- 自定义女优
+
+    /**
+     * 详情页手动给这部作品补一个女优。标成自定义：重新刮削重写演员时不会把它删掉。
+     * 与刮削来的同名时就是同一个名字（保留自定义标记）。
+     */
+    suspend fun addCustomActor(code: String, name: String) = withQueries { q ->
+        name.trim().takeIf { it.isNotEmpty() }?.let { actor -> q.insertCustomActor(code, actor) }
+        Unit
+    }?.also { _changes.tryEmit(Unit) }
+
+    /** 删掉这部作品上的某个女优（刮削来的也能删，下次刮削才会回来）。 */
+    suspend fun removeActor(code: String, name: String) = withQueries { q ->
+        q.deleteWorkActor(code, name)
+        Unit
+    }?.also { _changes.tryEmit(Unit) }
 
     /** 拆「作品编号|标签名」；标签名里带竖线时按第一个竖线切，后面的都算标签名。 */
     private fun splitCustomTagKey(key: String): Pair<String, String>? {

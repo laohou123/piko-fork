@@ -1,0 +1,4 @@
+-- v10→v11：演员也记「是不是用户自己加的」。
+-- 详情页能给作品补女优了，刮削重写演员时不能把这些手加的删掉；
+-- 老库的演员都是刮削来的，这一列默认 0，行为与之前一致。
+ALTER TABLE work_actors ADD COLUMN custom INTEGER NOT NULL DEFAULT 0;
