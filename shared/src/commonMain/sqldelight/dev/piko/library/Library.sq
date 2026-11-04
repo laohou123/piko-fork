@@ -128,9 +128,19 @@ DELETE FROM works WHERE code = ?;
 clearWorkFiles:
 DELETE FROM work_files;
 
--- 整轮重扫只重建扫描到的文件，引用条目的记录归清单那边管，不能一起清掉
+-- 整轮重扫只重建扫描到的文件，引用条目的记录归清单那边管，不能一起清掉。
+-- 引用条目可能挂在扫描作品下（同番号两个版本），所以按 file_id 前缀排除，而不是按作品来源
 clearScanWorkFiles:
-DELETE FROM work_files WHERE work_code IN (SELECT code FROM works WHERE origin = 'scan');
+DELETE FROM work_files WHERE work_code IN (SELECT code FROM works WHERE origin = 'scan')
+    AND file_id NOT LIKE 'piko-vault:%';
+
+-- 引用条目的文件记录整批重建：不论它挂在自己的作品下，还是借扫描作品的番号
+clearVaultWorkFiles:
+DELETE FROM work_files WHERE file_id LIKE 'piko-vault:%';
+
+-- 一部作品的引用文件重建：扫描作品下还有真实文件，只能删引用来源的那些
+deleteVaultFilesForWork:
+DELETE FROM work_files WHERE work_code = ? AND file_id LIKE 'piko-vault:%';
 
 clearWorkActors:
 DELETE FROM work_actors;
@@ -147,7 +157,8 @@ insertWorkIfAbsent:
 INSERT OR IGNORE INTO works (code) VALUES (?);
 
 -- 引用保存的作品：只补空壳，刮削结果由 enrich 照常写。
--- OR IGNORE：同番号已经被真实文件占着时不抢，引用条目在这里被跳过（见 LibraryStore.saveVaultWorks）
+-- OR IGNORE：同番号已经被真实文件占着时不抢，引用条目作为第二个版本挂到那一部下面
+-- （见 LibraryStore.saveVaultWorks），origin 保持 scan，列表上仍是一部
 insertVaultWorkIfAbsent:
 INSERT OR IGNORE INTO works (code, origin) VALUES (?, 'vault');
 
@@ -162,9 +173,14 @@ DELETE FROM works WHERE origin = 'vault';
 selectVaultWorkCodes:
 SELECT code FROM works WHERE origin = 'vault';
 
--- 引用作品的文件记录：没刮到封面时靠 file_id 里的 gcid 拼一张缩略图
+-- 引用条目的文件记录：没刮到封面时靠 file_id 里的 gcid 拼一张缩略图。
+-- 按前缀取而不是按作品来源：同番号两个版本时，引用那版挂在扫描作品下面
 selectVaultFiles:
-SELECT work_code, file_id FROM work_files WHERE work_code IN (SELECT code FROM works WHERE origin = 'vault');
+SELECT work_code, file_id FROM work_files WHERE file_id LIKE 'piko-vault:%';
+
+-- 某部作品下的引用条目数：详情页据此区分「真实文件 / 引用版本」
+countVaultFilesForWork:
+SELECT COUNT(*) FROM work_files WHERE work_code = ? AND file_id LIKE 'piko-vault:%';
 
 -- 注意：不要用 NOT IN 一次传上千个番号。Android 的 SQLite 变量上限是 999，
 -- 超了就是「too many SQL variables」，整个扫描事务回滚、列表还是旧的。

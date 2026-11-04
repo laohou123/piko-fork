@@ -87,6 +87,12 @@ import dev.piko.ui.platform.LocalPikoPlatform
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
+/** 详情页播放选择里的两个来源：网盘里能直接打开的真实文件、引用保存的虚拟条目。 */
+enum class FileVersion(val label: String) {
+    REAL("网盘文件"),
+    VAULT("引用保存"),
+}
+
 /**
  * 一部作品的详情，版式照参考图从上到下：
  * 预览片（**Piko 自己的播放后端**播这部片，没有文件就显示封面）→ 番号与标题 → 摘要
@@ -120,8 +126,10 @@ fun WorkDetailScreen(
     var scraping by remember { mutableStateOf(false) }
     // 截图全屏查看：点开的是第几张
     var viewerIndex by remember { mutableStateOf<Int?>(null) }
-    // 多文件时从底栏「播放」向上展开的文件列表
-    var showFiles by remember { mutableStateOf(false) }
+    // 底栏「播放」弹出的文件列表。同番号可能有两个版本（网盘里的原文件、引用保存的另一个版本），
+    // 那就先让人选版本，再在该版本里挑文件
+    var pickingVersion by remember { mutableStateOf(false) }
+    var fileSheet by remember { mutableStateOf<FileVersion?>(null) }
     // 标题：AI 翻译进行中 / 手动编辑框
     var translatingTitle by remember { mutableStateOf(false) }
     var editingTitle by remember { mutableStateOf(false) }
@@ -203,7 +211,18 @@ fun WorkDetailScreen(
                 DetailActionBar(
                     canPlay = d.files.isNotEmpty(),
                     onPlay = {
-                        if (d.files.size > 1) showFiles = true else d.files.firstOrNull()?.let(onPlay)
+                        val real = d.files.filterNot { VaultEntry.isVaulted(it.fileId) }
+                        val vault = d.files.filter { VaultEntry.isVaulted(it.fileId) }
+                        fun play(group: List<ScannedWorkFile>, version: FileVersion) {
+                            if (group.size > 1) fileSheet = version else group.firstOrNull()?.let(onPlay)
+                        }
+                        when {
+                            real.isEmpty() && vault.isEmpty() -> Unit
+                            real.isEmpty() -> play(vault, FileVersion.VAULT)
+                            vault.isEmpty() -> play(real, FileVersion.REAL)
+                            // 两个版本都在：先问播哪个，别默认挑一个让人以为另一个丢了
+                            else -> pickingVersion = true
+                        }
                     },
                     canSubtitle = d.files.isNotEmpty(),
                     onSubtitle = { d.files.firstOrNull()?.let { subtitleFile = it } },
@@ -244,7 +263,8 @@ fun WorkDetailScreen(
                     // 失败就只剩黑块与转圈，整页看着像坏了。改成一张带「刮削这部」的占位卡片。
                     if (d.work.scraped || d.work.coverUrl != null) {
                         WorkPreview(
-                            file = d.files.firstOrNull(),
+                            // 预览优先用网盘里的真实文件：引用条目要靠 gcid 借对象，原件不在时预览会空转
+                            file = d.files.firstOrNull { !VaultEntry.isVaulted(it.fileId) } ?: d.files.firstOrNull(),
                             coverUrl = d.work.coverUrl,
                             code = d.work.code,
                             enabled = autoPreview,
@@ -456,7 +476,11 @@ fun WorkDetailScreen(
     // 引用保存的条目网盘里没有文件可删，这里只是把它从海报墙上摘掉，文案与动作都分开。
     if (confirmDelete) {
         val files = detail?.files.orEmpty()
-        val vaultOnly = files.isNotEmpty() && files.all { VaultEntry.isVaulted(it.fileId) }
+        // 同一部可能既有网盘真实文件、又有引用保存的另一个版本：前者能删，后者只能摘记录
+        val realIds = files.filterNot { VaultEntry.isVaulted(it.fileId) }.map { it.fileId }
+        val vaultEntries = files.filter { VaultEntry.isVaulted(it.fileId) }
+        val vaultOnly = realIds.isEmpty() && vaultEntries.isNotEmpty()
+        val mixed = realIds.isNotEmpty() && vaultEntries.isNotEmpty()
         val shownCode = detail?.work?.code?.substringBeforeLast('.') ?: code
         PikoDialog(
             onDismissRequest = { if (!deleting) confirmDelete = false },
@@ -473,12 +497,20 @@ fun WorkDetailScreen(
                         )
                     } else {
                         Text(
-                            if (files.size > 1) {
-                                "$shownCode 在网盘里有 ${files.size} 个文件，会一起删除。"
+                            if (realIds.size > 1) {
+                                "$shownCode 在网盘里有 ${realIds.size} 个文件，会一起删除。"
                             } else {
                                 "$shownCode 在网盘里的这个文件会被删除。"
                             },
                         )
+                        if (mixed) {
+                            Text(
+                                text = "另有 ${vaultEntries.size} 条是引用保存的，网盘里没有它们的文件，只从海报墙移除。",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(top = 8.dp),
+                            )
+                        }
                         Text(
                             text = "删除后进网盘回收站，约 30 天内可在网盘里恢复；海报墙的这条记录会一起移除。",
                             style = MaterialTheme.typography.bodySmall,
@@ -494,7 +526,6 @@ fun WorkDetailScreen(
                     enabled = !deleting,
                     destructive = true,
                     onClick = {
-                        val ids = files.map { it.fileId }
                         scope.launch {
                             deleting = true
                             if (vaultOnly) {
@@ -509,7 +540,12 @@ fun WorkDetailScreen(
                                     services.postAppNotice("移除失败：${e.message ?: "请稍后再试"}")
                                 }
                             } else {
-                                val result = services.mediaRepository.trashFiles(ids)
+                                val result = services.mediaRepository.trashFiles(realIds)
+                                // 引用条目网盘里没有文件，trash 不能碰：单独从清单里摘掉。
+                                // 摘不掉也只是下次扫描又出现，不该让已经成功的删除报失败
+                                if (result.isSuccess && mixed) {
+                                    runCatching { services.posterWall?.removeVaultWork(code) }
+                                }
                                 deleting = false
                                 result.onSuccess {
                                     confirmDelete = false
@@ -517,7 +553,13 @@ fun WorkDetailScreen(
                                     // 下次整轮扫描会补上，所以这里不该因为收尾失败让界面崩掉
                                     runCatching { services.libraryStore?.removeWork(code) }
                                     services.posterWall?.refreshList()
-                                    services.postAppNotice("已删除 ${ids.size} 个文件")
+                                    services.postAppNotice(
+                                        if (mixed) {
+                                            "已删除 ${realIds.size} 个文件，并移除引用记录"
+                                        } else {
+                                            "已删除 ${realIds.size} 个文件"
+                                        },
+                                    )
                                     onBackClick()
                                 }.onFailure { e ->
                                     services.postAppNotice("删除失败：${e.message ?: "请稍后再试"}")
@@ -680,11 +722,62 @@ fun WorkDetailScreen(
         )
     }
 
-    if (showFiles) {
+    // 同一部片有两个版本（网盘里的、引用保存的）：先选播哪个。
+    // 不默认挑一个，否则另一个在用户看来就像丢了
+    if (pickingVersion) {
         val files = detail?.files.orEmpty()
+        val groups = FileVersion.entries
+            .map { it to files.filter { file -> VaultEntry.isVaulted(file.fileId) == (it == FileVersion.VAULT) } }
+            .filter { it.second.isNotEmpty() }
         PikoSheet(
-            onDismissRequest = { showFiles = false },
-            sideSheetTitle = "选择文件（${files.size}）",
+            onDismissRequest = { pickingVersion = false },
+            sideSheetTitle = "选择播放版本",
+        ) {
+            groups.forEach { (version, group) ->
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceContainerLow,
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(start = 12.dp, end = 4.dp, top = 8.dp, bottom = 8.dp),
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(version.label, style = MaterialTheme.typography.bodyLarge)
+                            Text(
+                                text = if (group.size > 1) "共 ${group.size} 个文件" else group.first().name,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            if (version == FileVersion.VAULT) {
+                                Text(
+                                    text = "引用保存，不占网盘空间",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                        IconButton(onClick = {
+                            pickingVersion = false
+                            if (group.size > 1) fileSheet = version else onPlay(group.first())
+                        }) {
+                            Icon(Icons.Outlined.PlayArrow, contentDescription = "播放${version.label}")
+                        }
+                    }
+                }
+            }
+            Box(modifier = Modifier.padding(bottom = 16.dp))
+        }
+    }
+
+    fileSheet?.let { version ->
+        val files = detail?.files.orEmpty()
+            .filter { VaultEntry.isVaulted(it.fileId) == (version == FileVersion.VAULT) }
+        PikoSheet(
+            onDismissRequest = { fileSheet = null },
+            sideSheetTitle = "${version.label}（${files.size}）",
         ) {
             files.forEach { file ->
                 Surface(
@@ -703,7 +796,7 @@ fun WorkDetailScreen(
                             modifier = Modifier.weight(1f),
                         )
                         IconButton(onClick = {
-                            showFiles = false
+                            fileSheet = null
                             onPlay(file)
                         }) {
                             Icon(Icons.Outlined.PlayArrow, contentDescription = "播放")

@@ -3,6 +3,7 @@ package dev.piko.desktop
 import app.cash.sqldelight.db.SqlDriver
 import app.cash.sqldelight.driver.jdbc.sqlite.JdbcSqliteDriver
 import dev.piko.library.Library
+import dev.piko.shared.data.VaultEntry
 import dev.piko.shared.library.LibraryDriverFactory
 import dev.piko.shared.library.LibraryStore
 import dev.piko.shared.library.ScannedWork
@@ -15,8 +16,8 @@ import kotlin.test.assertTrue
 /**
  * 引用保存的条目与扫描到的作品同住一张表，但各有各的重建时机。
  *
- * 钉住三件事：整轮重扫不碰引用条目、引用条目整批重建时留着刮削结果、
- * 同一个番号两边都有时只留扫描到的那份。
+ * 钉住四件事：整轮重扫不碰引用条目、引用条目整批重建时留着刮削结果、
+ * 同一个番号两边都有时合成一部、两个版本各留各的文件（详情页据此选播哪个）。
  */
 class LibraryVaultMergeTest {
 
@@ -107,16 +108,48 @@ class LibraryVaultMergeTest {
     }
 
     @Test
-    fun scanWinsWhenSameCode(): Unit = runBlocking {
+    fun sameCodeKeepsBothVersions(): Unit = runBlocking {
         val store = store()
         store.saveScan("root", "根目录", listOf(work("ABC-123", "ABC-123.mp4")))
         store.saveVaultWorks(listOf(vaultWork("ABC-123", "ABC-123.mp4")))
 
-        // 引用条目跳过，不抢占真实文件的作品
+        // 列表上仍是一部：作品行只有一条，来源还是扫描
         assertEquals(1L, store.workCount())
         assertEquals(0L, store.vaultWorkCount())
         val row = store.works(actor = null, tag = null).single()
-        assertEquals(1, row.fileCount)
+        assertEquals(2, row.fileCount)
+        // 详情页能看到两个版本，播放时让人选播哪个
+        val files = store.workDetail("ABC-123")!!.files
+        assertEquals(2, files.size)
+        assertEquals(1, files.count { VaultEntry.isVaulted(it.fileId) })
+        assertEquals(1, files.count { !VaultEntry.isVaulted(it.fileId) })
+    }
+
+    @Test
+    fun rescanKeepsVaultVersionUnderScannedWork(): Unit = runBlocking {
+        val store = store()
+        store.saveScan("root", "根目录", listOf(work("ABC-123", "ABC-123.mp4")))
+        store.saveVaultWorks(listOf(vaultWork("ABC-123", "ABC-123.mp4")))
+
+        // 整轮重扫只重建扫描到的文件，挂在同一部下面的引用版本要留着
+        store.saveScan("root", "根目录", listOf(work("ABC-123", "ABC-123.mp4")))
+
+        val files = store.workDetail("ABC-123")!!.files
+        assertEquals(2, files.size)
+        assertEquals(1, files.count { VaultEntry.isVaulted(it.fileId) })
+    }
+
+    @Test
+    fun removedVaultVersionLeavesScannedFile(): Unit = runBlocking {
+        val store = store()
+        store.saveScan("root", "根目录", listOf(work("ABC-123", "ABC-123.mp4")))
+        store.saveVaultWorks(listOf(vaultWork("ABC-123", "ABC-123.mp4")))
+
+        // 清单里的那条被移除了：引用版本消失，网盘里的真实文件不受影响
+        store.saveVaultWorks(emptyList())
+
+        assertEquals(1, store.workDetail("ABC-123")!!.files.size)
+        assertEquals(1L, store.workCount())
     }
 
     @Test

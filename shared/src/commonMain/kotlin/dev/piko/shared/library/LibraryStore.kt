@@ -227,7 +227,10 @@ class LibraryStore(
      *
      * 这些条目没有网盘文件，「这轮没扫到就删」那套判断对它们不成立：每解析完一遍清单整批对齐一次。
      * 已经在这儿的番号只重建文件清单，刮削结果、译名、标签、收藏都留着——否则每次扫描后引用库都要重刮一遍。
-     * 同番号已经被真实文件占着时跳过：那部片本来就在海报墙上，再挂一条引用只会让播放列表出现两份。
+     *
+     * 同番号已经被真实文件占着时**不跳过**：那多半是同一部片的另一个版本（正片与破解版、不同压制），
+     * 引用条目作为第二个版本挂到同一部作品下面，详情页再让人选播哪个。列表上仍是一部，
+     * 因为作品行只有一条，多出来的只是 work_files 里的引用条目。
      *
      * [complete] 为 false（扫描超时、被停止、目录列不全）时只增不删：那半份清单说明不了什么，
      * 拿它对齐会把没走到的归档目录里的作品当成"已移除"。
@@ -235,8 +238,8 @@ class LibraryStore(
     suspend fun saveVaultWorks(works: List<ScannedWork>, complete: Boolean = true) = withQueries { q ->
         q.transactionWithResult {
             val next = works.map { it.code }.toHashSet()
-            // 这一轮清单里没有的引用作品：文件与作品一起删（收藏等孤儿记录最后统一清）
             if (complete) {
+                // 这一轮清单里没有的引用作品：文件与作品一起删（收藏等孤儿记录最后统一清）
                 q.selectVaultWorkCodes().executeAsList()
                     .filterNot { it in next }
                     .chunked(DELETE_CHUNK)
@@ -244,14 +247,15 @@ class LibraryStore(
                         q.deleteWorkFilesIn(chunk)
                         q.deleteWorksIn(chunk)
                     }
+                // 引用文件整批重建：挂在扫描作品下的那部分也要跟上清单的增删，
+                // 只删引用来源的记录，扫描到的真实文件不动
+                q.clearVaultWorkFiles()
             }
-            // 只看扫描到的作品：它们占着的番号引用条目不能再插，否则同一部片会出现两份播放列表
-            val taken = q.selectScanWorkCodes().executeAsList().toHashSet()
             works.forEach { work ->
-                if (work.code in taken) return@forEach
                 q.insertVaultWorkIfAbsent(work.code)
-                // 引用条目的文件清单每次整部重建：同一部可能有多个版本，以这份清单为准
-                q.deleteWorkFiles(work.code)
+                // 引用条目的文件清单每次重建：同一部可能有多个版本，以这份清单为准。
+                // 只删引用来源的记录——同番号的扫描作品下面还挂着真实文件
+                if (!complete) q.deleteVaultFilesForWork(work.code)
                 work.files.forEach { f ->
                     q.insertWorkFile(f.fileId, work.code, f.name, f.size, f.folderId, f.part)
                 }
