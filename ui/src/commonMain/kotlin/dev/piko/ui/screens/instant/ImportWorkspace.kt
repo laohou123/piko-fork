@@ -40,6 +40,7 @@ import dev.piko.shared.state.InstantSheetState
 import dev.piko.shared.state.DriveListItem
 import dev.piko.shared.state.AddressCompletion
 import dev.piko.shared.data.PikoPathBreadcrumb
+import dev.piko.shared.data.TruncatedReason
 import dev.piko.ui.LocalPikoServices
 import dev.piko.ui.platform.LocalPikoPlatform
 import dev.piko.ui.components.*
@@ -157,7 +158,12 @@ internal fun ImportResolutionStatus(state: InstantSheetState, notice: PanelNotic
     }
     val message = error ?: notice?.text ?: when {
         state.isResolving -> tr("正在解析链接", "Resolving link", "リンクを解析中", "링크 분석 중", "正在解析連結")
-        state.resolution?.resource?.truncated == true -> tr("清单不完整，自动裁剪已停用", "Incomplete file list; automatic trimming disabled", "ファイル一覧が不完全なため、自動整理を無効にしました", "파일 목록이 불완전하여 자동 정리를 껐습니다", "清單不完整，已停用自動裁剪")
+        state.resolution?.truncatedReason != null -> when (state.resolution?.truncatedReason) {
+            TruncatedReason.SHARE_ROOT -> tr("分享顶层超过一页，只解析了第一页；自动裁剪已停用", "The share's top level spans more than one page; only the first was read. Automatic trimming disabled", "共有のトップ階層が1ページを超えています。1ページ目のみ解析しました。自動整理は無効です", "공유 최상위 항목이 한 페이지를 넘습니다. 첫 페이지만 분석했습니다. 자동 정리를 껐습니다", "分享頂層超過一頁，只解析了第一頁；已停用自動裁剪")
+            TruncatedReason.FOLDER_LIMIT -> tr("子文件夹超过 512 个，只展开前 512 个；自动裁剪已停用", "More than 512 subfolders; only the first 512 were expanded. Automatic trimming disabled", "サブフォルダが512個を超えています。最初の512個のみ展開しました。自動整理は無効です", "하위 폴더가 512개를 넘습니다. 처음 512개만 펼쳤습니다. 자동 정리를 껐습니다", "子資料夾超過 512 個，只展開前 512 個；已停用自動裁剪")
+            TruncatedReason.PAGE_LIMIT -> tr("有文件夹超过 100 页，只读了前 100 页；自动裁剪已停用", "A folder has more than 100 pages; only the first 100 were read. Automatic trimming disabled", "あるフォルダが100ページを超えています。最初の100ページのみ読み込みました。自動整理は無効です", "한 폴더가 100페이지를 넘습니다. 처음 100페이지만 읽었습니다. 자동 정리를 껐습니다", "有資料夾超過 100 頁，只讀了前 100 頁；已停用自動裁剪")
+            null -> tr("清单不完整，自动裁剪已停用", "Incomplete file list; automatic trimming disabled", "ファイル一覧が不完全なため、自動整理を無効にしました", "파일 목록이 불완전하여 자동 정리를 껐습니다", "清單不完整，已停用自動裁剪")
+        }
         state.saveAsReference && state.missingReferenceCount > 0 -> tr("已选文件中有 ${state.missingReferenceCount} 项缺少引用，保存时将跳过", "${state.missingReferenceCount} selected items lack references and will be skipped", "選択した ${state.missingReferenceCount} 項目に参照がなく、保存時にスキップします", "선택한 ${state.missingReferenceCount}개 항목에 참조가 없어 저장 시 건너뜁니다", "已選檔案中有 ${state.missingReferenceCount} 項缺少引用，儲存時將略過")
         missing > 0 -> tr("已选文件中有 ${missing} 项未收录", "${missing} selected items are not indexed", "選択した ${missing} 項目は未収録です", "선택한 ${missing}개 항목이 미등록입니다", "已選檔案中有 ${missing} 項未收錄")
         else -> null

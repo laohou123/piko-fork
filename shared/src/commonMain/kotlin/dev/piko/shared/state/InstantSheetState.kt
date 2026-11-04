@@ -20,6 +20,7 @@ import dev.piko.shared.log.logFailure
 import dev.piko.shared.log.reportFailure
 import dev.piko.shared.data.InstantMagnetRepository
 import dev.piko.shared.data.MagnetResolutionResult
+import dev.piko.shared.data.TruncatedReason
 import dev.piko.shared.data.OfflinePackTracker
 import dev.piko.shared.data.PikoDriveRepository
 import dev.piko.shared.data.PikoPathBreadcrumb
@@ -672,15 +673,16 @@ class InstantSheetState private constructor(
         val root = info.files.singleOrNull()?.takeIf { it.isFolder }
         val items = mutableListOf<InstantFileItem>()
         val visited = mutableSetOf<String>()
-        var truncated = info.nextPageToken.isNotEmpty()
+        // 第一个撞上的上限就是用户要看的那个原因：先撞顶层，再谈目录多少没意义
+        var truncatedBy = if (info.nextPageToken.isNotEmpty()) TruncatedReason.SHARE_ROOT else null
         var frontier = info.files.map { it to if (it == root) "" else it.name }
         while (frontier.isNotEmpty()) {
             val foldersToExpand = mutableListOf<Pair<io.github.nihildigit.pikpak.FileStat, String>>()
             for ((file, path) in frontier) {
                 if (file.isFolder) {
                     if (!visited.add(file.id)) continue
-                    if (visited.size > 64) {
-                        truncated = true
+                    if (visited.size > MAX_SHARE_FOLDERS) {
+                        truncatedBy = truncatedBy ?: TruncatedReason.FOLDER_LIMIT
                         continue
                     }
                     foldersToExpand += file to path
@@ -702,7 +704,7 @@ class InstantSheetState private constructor(
                 }
                 for ((parentPath, page) in listings) {
                     val (children, subTruncated) = page
-                    if (subTruncated) truncated = true
+                    if (subTruncated) truncatedBy = truncatedBy ?: TruncatedReason.PAGE_LIMIT
                     for (child in children) {
                         nextFrontier += child to if (parentPath.isEmpty()) child.name else "$parentPath/${child.name}"
                     }
@@ -710,9 +712,15 @@ class InstantSheetState private constructor(
             }
             frontier = nextFrontier
         }
+        if (truncatedBy != null) {
+            // 日志里记下是哪一种：用户来问「为什么少了文件」时，不用再猜
+            PikoLog.w(TAG, "分享 $id 的清单不完整（$truncatedBy）：已解析 ${items.size} 个文件、${visited.size} 个目录")
+        }
         val files = items.map { it.file }
-        MagnetResolutionResult(io.github.nihildigit.pikpak.MagnetResource(root?.name ?: info.title, files, truncated),
-            items, items.count { it.isInstantReady }, items.size)
+        MagnetResolutionResult(
+            io.github.nihildigit.pikpak.MagnetResource(root?.name ?: info.title, files, truncatedBy != null),
+            items, items.count { it.isInstantReady }, items.size, truncatedBy,
+        )
     }
 
     /**
@@ -1429,6 +1437,15 @@ class InstantSheetState private constructor(
         private const val TAG = "Instant"
         private const val AUTO_RESOLVE_DEBOUNCE_MS = 350L
         private const val BATCH_INDEX_STRIDE = 1_000_000
+
+        /**
+         * 一次解析最多展开多少个文件夹。
+         *
+         * 以前是 64：一个大合集的子目录就能撞上，后面的片子全部读不到，用户只看到一句
+         * 「清单不完整」。512 覆盖绝大多数合集，按每批 8 个并发列表请求算，也就多几十轮，
+         * 还不至于触发网盘限流；再多就该引导用户分批引用了。
+         */
+        private const val MAX_SHARE_FOLDERS = 512
 
         /**
          * 各文件的规范名。没有一个文件会改名时为 null。

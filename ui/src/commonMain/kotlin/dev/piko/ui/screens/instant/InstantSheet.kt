@@ -117,6 +117,7 @@ import dev.piko.shared.state.NameGroupSummary
 import dev.piko.shared.state.ShareSaveState
 import dev.piko.shared.state.VaultArchiveOptions
 import dev.piko.shared.data.PikoPathBreadcrumb
+import dev.piko.shared.data.TruncatedReason
 import dev.piko.ui.LocalPikoServices
 import dev.piko.ui.screens.drive.VaultRiskWarningDialog
 import kotlinx.coroutines.launch
@@ -451,9 +452,34 @@ private fun ColumnScope.InstantBody(
     fileListState: LazyListState? = null,
     onMaximizeTree: (() -> Unit)? = null,
 ) {
-    if (state.resolution?.resource?.truncated == true) {
+    val truncatedReason = state.resolution?.truncatedReason
+    if (truncatedReason != null) {
+        // 说清是哪一种上限：只写「清单不完整」用户既不知道原因，也不知道该分批还是重试
+        val text = when (truncatedReason) {
+            TruncatedReason.SHARE_ROOT -> tr(
+                "分享顶层超过一页，只解析了第一页；可分批引用，本轮不做自动裁剪",
+                "The share has more than one page of top-level items; only the first page was read. Save in batches; automatic trimming is off.",
+                "共有のトップ階層が1ページを超えています。1ページ目のみ解析しました。分割して保存してください（自動整理は行いません）。",
+                "공유 최상위 항목이 한 페이지를 넘습니다. 첫 페이지만 분석했습니다. 나눠서 저장하세요(자동 정리는 사용하지 않습니다).",
+                "分享頂層超過一頁，只解析了第一頁；可分批引用，本輪不做自動裁剪",
+            )
+            TruncatedReason.FOLDER_LIMIT -> tr(
+                "子文件夹超过 512 个，只展开前 512 个；可分批引用，本轮不做自动裁剪",
+                "More than 512 subfolders; only the first 512 were expanded. Save in batches; automatic trimming is off.",
+                "サブフォルダが512個を超えています。最初の512個のみ展開しました。分割して保存してください（自動整理は行いません）。",
+                "하위 폴더가 512개를 넘습니다. 처음 512개만 펼쳤습니다. 나눠서 저장하세요(자동 정리는 사용하지 않습니다).",
+                "子資料夾超過 512 個，只展開前 512 個；可分批引用，本輪不做自動裁剪",
+            )
+            TruncatedReason.PAGE_LIMIT -> tr(
+                "某个文件夹超过 100 页，只读了前 100 页；可分批引用，本轮不做自动裁剪",
+                "A folder has more than 100 pages; only the first 100 were read. Save in batches; automatic trimming is off.",
+                "あるフォルダが100ページを超えています。最初の100ページのみ読み込みました。分割して保存してください（自動整理は行いません）。",
+                "한 폴더가 100페이지를 넘습니다. 처음 100페이지만 읽었습니다. 나눠서 저장하세요(자동 정리는 사용하지 않습니다).",
+                "某個資料夾超過 100 頁，只讀了前 100 頁；可分批引用，本輪不做自動裁剪",
+            )
+        }
         StatusBanner(
-            tr("清单不完整：仅保存已解析文件，禁用自动裁剪", "Incomplete list: save resolved files only; automatic trimming disabled", "一覧が不完全です。解析済みのファイルのみ保存し、自動整理は行いません", "불완전한 목록: 분석된 파일만 저장하고 자동 정리는 사용하지 않습니다", "清單不完整：僅儲存已解析的檔案，停用自動裁剪"),
+            text,
             Icons.Outlined.Info, MaterialTheme.colorScheme.secondaryContainer, MaterialTheme.colorScheme.onSecondaryContainer,
             actionLabel = tr("重新解析", "Resolve again", "再解析", "다시 분석", "重新解析"), onAction = state::retryResolve,
         )

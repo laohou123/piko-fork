@@ -42,11 +42,29 @@ data class InstantFileItem(
     val meta: VaultMediaMeta? = null,
 )
 
+/**
+ * 清单为什么不全；null 表示完整。
+ *
+ * 分享目录是逐层列出来的，每层都要发请求，所以留了上限。撞上限时界面要说清是哪一种，
+ * 只写「清单不完整」用户既不知道原因，也不知道下一步该分批还是重试。
+ */
+enum class TruncatedReason {
+    /** 分享顶层就不止一页：SDK 的 getShareInfo 没有翻页参数，第一页之后读不到 */
+    SHARE_ROOT,
+
+    /** 展开的子文件夹超过上限，后面的目录没进去 */
+    FOLDER_LIMIT,
+
+    /** 单个文件夹的分页超过上限，只读了前面几页 */
+    PAGE_LIMIT,
+}
+
 data class MagnetResolutionResult(
     val resource: MagnetResource,
     val items: List<InstantFileItem>,
     val instantReadyCount: Int,
     val totalCount: Int,
+    val truncatedReason: TruncatedReason? = null,
 )
 
 internal fun httpResource(url: String, status: Int, headers: io.ktor.http.Headers): MagnetResolutionResult? {

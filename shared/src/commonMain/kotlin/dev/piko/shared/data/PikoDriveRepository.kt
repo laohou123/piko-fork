@@ -2356,12 +2356,18 @@ open class PikoDriveRepository(
         runSuspendCatching { client.getShareInfo(shareId, passCode) }
     }
 
-    /** 分享里某个文件夹的全部内容（自动翻页，超过 [maxPages] 页时返回截断标记）。子目录只能经它打开，GET /share 不认 parent_id。 */
+    /**
+     * 分享里某个文件夹的全部内容（自动翻页，超过 [maxPages] 页时返回截断标记）。
+     * 子目录只能经它打开，GET /share 不认 parent_id。
+     *
+     * [maxPages] 100 页约合上万项：以前是 20 页，一个塞满的合集文件夹就会剩下一半没读到，
+     * 用户只看到「清单不完整」。真有超过一万项的目录，宁可提示分批，也不该一次翻到底。
+     */
     suspend fun shareFolderFull(
         shareId: String,
         passCodeToken: String,
         parentId: String,
-        maxPages: Int = 20,
+        maxPages: Int = 100,
     ): Result<Pair<List<FileStat>, Boolean>> = withContext(Dispatchers.Default) {
         runSuspendCatching {
             val asked = client
