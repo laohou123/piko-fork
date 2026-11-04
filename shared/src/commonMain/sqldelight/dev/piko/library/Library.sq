@@ -193,8 +193,10 @@ DELETE FROM works WHERE code IN ?;
 deleteOrphanActors:
 DELETE FROM work_actors WHERE work_code NOT IN (SELECT code FROM works);
 
+-- 自定义标签除外：它可能比作品先到（新设备登录即同步，此时还没扫到这部片），
+-- 一起清掉就再也回不来了——作品入库后同一行的 work_code 自然对得上，标签也就挂上了。
 deleteOrphanTags:
-DELETE FROM work_tags WHERE work_code NOT IN (SELECT code FROM works);
+DELETE FROM work_tags WHERE work_code NOT IN (SELECT code FROM works) AND custom = 0;
 
 deleteOrphanImages:
 DELETE FROM work_images WHERE work_code NOT IN (SELECT code FROM works);

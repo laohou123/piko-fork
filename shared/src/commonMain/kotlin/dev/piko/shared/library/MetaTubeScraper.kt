@@ -85,6 +85,32 @@ class MetaTubeScraper(
             .filter { it.isNotEmpty() }
             .map { MetaTubeImages.byUrl(base, provider, id, it) }
 
+        // 详情接口偶尔比搜索结果少字段：同一个源有时在 detail 里给 actors / genres 空表或 null，
+        // 搜索列表里却有。空着不用就会变成「有标题有演员、就是没有标签」——缺哪样就用候选补哪样，
+        // 只在 detail 完全没有时才补，免得把另一个源的标签混进来。
+        fun valuesOf(pick: (MetaTubeMovie) -> List<String>?, source: MetaTubeMovie): List<String> =
+            pick(source).orEmpty().map { it.trim() }.filter { it.isNotEmpty() }
+
+        fun complement(pick: (MetaTubeMovie) -> List<String>?): List<String> =
+            valuesOf(pick, info).ifEmpty { candidates.flatMap { valuesOf(pick, it) } }.distinct()
+
+        var tags = complement { it.genres }
+        if (tags.isEmpty()) {
+            // 候选里也没有：再去别的源的详情问一次。同一部片各源字段覆盖不一样，标签常常只在另一处有。
+            // 只在缺标签时多这一次请求，拿到就停
+            for (candidate in candidates) {
+                if (candidate.provider == provider && candidate.id == id) continue
+                val other = runCatching { client.movie(candidate.provider, candidate.id) }
+                    .getOrNull()?.getOrNull() ?: continue
+                val found = valuesOf({ it.genres }, other)
+                if (found.isNotEmpty()) {
+                    PikoLog.i(TAG, "$code: 标签取自另一个源 ${candidate.provider}/${candidate.id}")
+                    tags = found.distinct()
+                    break
+                }
+            }
+        }
+
         val scraped = ScrapedMovie(
             code = code,
             title = info.title.trim().ifEmpty { null },
@@ -95,8 +121,8 @@ class MetaTubeScraper(
             summary = info.summary.trim().ifEmpty { null },
             studio = info.maker?.trim()?.ifEmpty { null },
             series = info.series?.trim()?.ifEmpty { null },
-            actors = info.actors.orEmpty().map { it.trim() }.filter { it.isNotEmpty() },
-            tags = info.genres.orEmpty().map { it.trim() }.filter { it.isNotEmpty() },
+            actors = complement { it.actors },
+            tags = tags,
             provider = PROVIDER_ID,
             previewVideoUrl = info.previewVideoUrl?.trim()?.ifEmpty { null },
             // 封面固定排第一：详情页截图墙按这个顺序展示，封面也是一张截图
@@ -109,6 +135,10 @@ class MetaTubeScraper(
             "$code: 刮到《${scraped.title ?: "?"}》 via $provider/$id，" +
                 "截图 ${scraped.previewImages.size} 张，演员 ${scraped.actors.size}，标签 ${scraped.tags.size}",
         )
+        // 有标题有演员却没有标签，多半是源端 genres 空：记一条，下次看日志就知道是源的问题还是解析的问题
+        if (scraped.tags.isEmpty()) {
+            PikoLog.w(TAG, "$code: 源 $provider/$id 与 ${candidates.size} 个候选都没给标签（genres 为空）")
+        }
         return scraped
     }
 

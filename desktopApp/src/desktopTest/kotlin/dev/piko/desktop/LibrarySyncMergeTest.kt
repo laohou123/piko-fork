@@ -159,4 +159,29 @@ class LibrarySyncMergeTest {
         assertEquals(0, a.applySyncMarks(stale))
         assertEquals("本机的新名", assertNotNull(a.workDetail("ABC-123")).work.titleZh)
     }
+
+    /**
+     * 新设备登录就同步，那时还没扫描，标签比作品先到。
+     * 之后扫描收尾会清孤儿标签——自定义标签得留下，等作品入库自己就挂上了。
+     */
+    @Test
+    fun `custom tags that arrive before the work survives the scan`() = runBlocking {
+        val a = store()
+        a.addWork("ABC-123", "原名")
+        a.addCustomTag("ABC-123", "我的标签")
+
+        val b = store()
+        b.applySyncMarks(a.exportSyncMarks())
+        // 还没扫描：库里没有这部作品，标签先躺着
+        assertEquals(null, b.workDetail("ABC-123"))
+
+        // 扫描先走到别的片子，这一轮里没有 ABC-123——收尾清孤儿时不能把同步来的标签当孤儿
+        b.addWork("SSIS-001", "别的片子")
+        // 下一轮才扫到它，标签应该还在
+        b.addWork("ABC-123", "原名")
+        assertTrue(
+            b.workDetail("ABC-123")!!.tags.any { it.name == "我的标签" },
+            "先同步到的自定义标签被扫描清掉了：${b.workDetail("ABC-123")!!.tags.map { it.name }}",
+        )
+    }
 }
