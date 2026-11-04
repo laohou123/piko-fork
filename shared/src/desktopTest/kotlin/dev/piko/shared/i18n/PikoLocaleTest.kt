@@ -9,6 +9,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
 import kotlin.test.assertNotEquals
+import kotlin.test.assertTrue
 
 class PikoLocaleTest {
     @Test
@@ -95,10 +96,24 @@ class PikoLocaleTest {
                 assertNotEquals("星标", DriveLibrary.STARRED.title)
                 assertNotEquals("名称", PikoSortField.NAME.label)
                 assertNotEquals("英语", dev.piko.shared.media.player.languageName("eng"))
-                for (code in listOf("NEED_MORE_QUOTA", "INVALID_FILE_FORMAT", "file_duplicated_name", "file_restore_own", "file_in_recycle_bin", "file_name_too_long", "space_not_enough")) {
+                for (code in listOf("NEED_MORE_QUOTA", "INVALID_FILE_FORMAT", "file_duplicated_name", "file_restore_own", "file_in_recycle_bin", "file_name_too_long", "space_not_enough", "file_space_not_enough")) {
                     assertNotNull(PikoErrorMapper.reason(code))
                 }
             }
+        } finally {
+            PikoLocale.apply(AppLanguage.ZH_CN)
+        }
+    }
+
+    @Test
+    fun `insufficient storage is explained instead of a generic retry`() {
+        try {
+            PikoLocale.apply(AppLanguage.ZH_CN)
+            // 播放引用条目时服务端用 file_space_not_enough 拒绝秒传；落到「播放失败，请重试」会让人以为链接失效
+            val refused = io.github.nihildigit.pikpak.PikPakException(8, "file_space_not_enough")
+            assertTrue(PikoErrorMapper.failure("播放", refused).startsWith("播放失败：网盘空间不足"))
+            // 同一个错误码换了 message 也要认出来
+            assertTrue(PikoErrorMapper.failure("播放", io.github.nihildigit.pikpak.PikPakException(8, "")).startsWith("播放失败：网盘空间不足"))
         } finally {
             PikoLocale.apply(AppLanguage.ZH_CN)
         }

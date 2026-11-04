@@ -16,6 +16,18 @@ object PikoErrorMapper {
         "無法識別壓縮檔格式，檔案可能已損毀或為分割壓縮檔",
     )
 
+    /**
+     * 云端要临时放下整个文件才能播引用条目（按 gcid 秒传重建一个对象），
+     * 空间不够时服务端返回 file_space_not_enough，用户看到「播放失败」会以为是链接失效。
+     */
+    private val spaceNotEnough: String get() = tr(
+        "网盘空间不足：播放引用视频需要在云端临时放置整个文件，清理空间或开通 Premium 后重试",
+        "Not enough cloud storage: playing a referenced video needs room for the whole file in the cloud. Free up space or upgrade to Premium and try again",
+        "クラウドの空き容量が不足しています。参照動画の再生にはファイル全体をクラウドに一時配置する必要があります。容量を空けるか Premium にアップグレードして再試行してください",
+        "클라우드 공간이 부족합니다. 참조 동영상 재생에는 파일 전체를 클라우드에 임시로 두어야 합니다. 공간을 확보하거나 Premium으로 업그레이드한 뒤 다시 시도하세요",
+        "雲端硬碟空間不足：播放引用影片需要在雲端暫存整個檔案，清理空間或開通 Premium 後重試",
+    )
+
     fun reason(code: String?): String? = when (code) {
         "NEED_MORE_QUOTA" -> tr("解压额度不足", "Extraction quota exceeded", "解凍の利用枠が不足しています", "압축 해제 할당량이 부족합니다", "解壓縮額度不足")
         "INVALID_FILE_FORMAT" -> invalidArchive
@@ -23,9 +35,14 @@ object PikoErrorMapper {
         "file_restore_own" -> tr("无法转存自己发布的分享", "You cannot save your own share link", "自分の共有リンクは保存できません", "자신의 공유 링크는 저장할 수 없습니다", "無法轉存自己發布的分享")
         "file_in_recycle_bin" -> tr("文件在回收站中", "The item is in the trash", "項目はゴミ箱にあります", "항목이 휴지통에 있습니다", "檔案位於資源回收筒中")
         "file_name_too_long" -> tr("文件名过长", "The file name is too long", "ファイル名が長すぎます", "파일 이름이 너무 깁니다", "檔案名稱過長")
-        "space_not_enough" -> tr("网盘空间不足", "Insufficient cloud storage space", "クラウドストレージの空き容量が不足しています", "클라우드 저장 공간이 부족합니다", "雲端硬碟空間不足")
+        // 服务端两种写法：上传/转存用 space_not_enough，秒传重建对象时用 file_space_not_enough
+        "space_not_enough", "file_space_not_enough" -> spaceNotEnough
         else -> null
     }
+
+    /** error_code=8 固定是空间不足，message 换了写法时也不至于落到「操作失败，请重试」。 */
+    private fun reason(error: PikPakException): String? =
+        reason(error.errorMessage) ?: if (error.errorCode == 8) spaceNotEnough else null
 
     private fun isReactivating(error: Throwable): Boolean =
         generateSequence(error) { it.cause }.take(6).any { it is FileReactivatingException }
@@ -41,13 +58,13 @@ object PikoErrorMapper {
     fun message(error: Throwable): String = when {
         isReactivating(error) -> reactivatingMessage
         error is InstantContentUnavailableException -> tr("云端未收录此文件，请使用离线下载", "File not indexed in the cloud. Use cloud download", "クラウドに未収録のファイルです。クラウドダウンロードを利用してください", "클라우드에 등록되지 않은 파일입니다. 클라우드 다운로드를 이용해 주세요", "雲端未收錄此檔案，請使用離線下載")
-        error is PikPakException -> reason(error.errorMessage) ?: tr("操作失败，请重试", "Operation failed. Please try again", "操作に失敗しました。もう一度お試しください", "작업에 실패했습니다. 다시 시도해 주세요", "操作失敗，請重試")
+        error is PikPakException -> reason(error) ?: tr("操作失败，请重试", "Operation failed. Please try again", "操作に失敗しました。もう一度お試しください", "작업에 실패했습니다. 다시 시도해 주세요", "操作失敗，請重試")
         error is IOException -> tr("网络异常", "Network error", "ネットワークエラー", "네트워크 오류", "網路異常")
         else -> tr("未知错误", "Unknown error", "不明なエラー", "알 수 없는 오류", "未知錯誤")
     }
 
     fun archive(error: Throwable): String = when (error) {
-        is PikPakException -> reason(error.errorMessage) ?: message(error)
+        is PikPakException -> reason(error) ?: message(error)
         is IllegalStateException -> error.message ?: tr("未知错误", "Unknown error", "不明なエラー", "알 수 없는 오류", "未知錯誤")
         else -> tr("网络异常", "Network error", "ネットワークエラー", "네트워크 오류", "網路異常")
     }
@@ -63,7 +80,7 @@ object PikoErrorMapper {
     fun failure(action: String, error: Throwable): String {
         if (isReactivating(error)) return reactivatingMessage
         if (error is InstantContentUnavailableException) return message(error)
-        val reason = (error as? PikPakException)?.let { reason(it.errorMessage) }
+        val reason = (error as? PikPakException)?.let { reason(it) }
         return when {
             reason != null -> tr("${action}失败：$reason", "$action failed: $reason", "$action に失敗しました：$reason", "$action 실패: $reason", "${action}失敗：$reason")
             error is IOException -> tr("${action}失败：网络连接中断，请重试", "$action failed: network connection interrupted. Please try again", "$action に失敗しました。接続が切れました。もう一度お試しください", "$action 실패: 네트워크 연결이 끊어졌습니다. 다시 시도해 주세요", "${action}失敗：網路連線中斷，請重試")
