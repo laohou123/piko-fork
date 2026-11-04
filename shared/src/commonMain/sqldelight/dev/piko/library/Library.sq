@@ -44,7 +44,9 @@ CREATE TABLE work_files (
     name TEXT NOT NULL,
     size INTEGER NOT NULL,
     folder_id TEXT NOT NULL,
-    part TEXT
+    part TEXT,
+    -- PikPak 的 gcid：刮不到封面时用它拼一张缩略图，别再整张白卡
+    gcid TEXT
 );
 CREATE INDEX index_work_files_on_work_code ON work_files(work_code);
 
@@ -112,8 +114,8 @@ INSERT OR REPLACE INTO works (code, title, cover_url, release_date, duration, su
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 
 insertWorkFile:
-INSERT OR REPLACE INTO work_files (file_id, work_code, name, size, folder_id, part)
-VALUES (?, ?, ?, ?, ?, ?);
+INSERT OR REPLACE INTO work_files (file_id, work_code, name, size, folder_id, part, gcid)
+VALUES (?, ?, ?, ?, ?, ?, ?);
 
 deleteWorkFiles:
 DELETE FROM work_files WHERE work_code = ?;
@@ -314,7 +316,12 @@ selectSampleCoverUrl:
 SELECT cover_url FROM works WHERE cover_url IS NOT NULL AND cover_url != '' LIMIT 1;
 
 selectFilesForWork:
-SELECT file_id, name, size, folder_id, part FROM work_files WHERE work_code = ? ORDER BY name;
+SELECT file_id, name, size, folder_id, part, gcid FROM work_files WHERE work_code = ? ORDER BY name;
+
+-- 每部作品一个 gcid，列表在没刮到封面时拿它拼缩略图。
+-- 老库升级后这一列为空，得再扫一轮才有；扫之前仍按原样显示。
+selectGcidCovers:
+SELECT work_code, gcid FROM work_files WHERE gcid IS NOT NULL AND gcid != '';
 
 -- 详情页的演员与标签：带上收藏标志，长按可收藏/取消收藏
 selectActorsForWork:

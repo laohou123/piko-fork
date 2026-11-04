@@ -53,6 +53,8 @@ data class ScannedWorkFile(
     val size: Long,
     val folderId: String,
     val part: String?,
+    /** PikPak 的 gcid，用来在没刮到封面时拼一张缩略图。老库升级后为空，重扫一轮才填上。 */
+    val gcid: String? = null,
 )
 
 /** 列表里的一行。 */
@@ -197,7 +199,7 @@ class LibraryStore(
                 // 没扫全时只重建这一部（它被这一轮看到了），其余作品的旧文件记录留着
                 if (!complete) q.deleteWorkFiles(work.code)
                 work.files.forEach { f ->
-                    q.insertWorkFile(f.fileId, work.code, f.name, f.size, f.folderId, f.part)
+                    q.insertWorkFile(f.fileId, work.code, f.name, f.size, f.folderId, f.part, f.gcid)
                 }
             }
             // 作品没了，它的演员/标签/截图/收藏记录才是孤儿；还在的作品的必须留着
@@ -265,7 +267,7 @@ class LibraryStore(
                 // 只删引用来源的记录——同番号的扫描作品下面还挂着真实文件
                 if (!complete) q.deleteVaultFilesForWork(work.code)
                 work.files.forEach { f ->
-                    q.insertWorkFile(f.fileId, work.code, f.name, f.size, f.folderId, f.part)
+                    q.insertWorkFile(f.fileId, work.code, f.name, f.size, f.folderId, f.part, f.gcid)
                 }
             }
             q.deleteOrphanActors()
@@ -384,6 +386,14 @@ class LibraryStore(
         } else {
             emptyMap()
         }
+        // 网盘里的真实文件同理：刮不到封面（源站没这个番号、或图片地址失效）时，
+        // 用扫描时存下的 gcid 拼一张 PikPak 缩略图，别整张白卡。
+        // 老库升级后 gcid 为空，需要重扫一轮才填上；填上之前照旧显示占位。
+        val gcidCovers = q.selectGcidCovers().executeAsList()
+            .groupBy({ it.work_code }, { it.gcid.orEmpty() })
+            .mapNotNull { (code, gcids) ->
+                gcids.firstOrNull { it.isNotBlank() }?.let { code to videoThumbnailUrlOf(it) }
+            }.toMap()
         // 搜索先用一条 UNION 查出候选番号，再在内存里过滤（数据量是几百条，比逐个 LIKE 简单）
         val matched = query?.trim()?.takeIf { it.isNotEmpty() }?.let { text ->
             q.searchCodes("%$text%").executeAsList().toSet()
@@ -411,10 +421,13 @@ class LibraryStore(
             else -> q.selectAllWorks().executeAsList()
                 .map { it.toRow(counts, actors) }
         }.applyOrigin().applySizeLimit().applyQuery().let { rows ->
-            val covered = if (vault != false) {
-                rows.map { row -> if (row.coverUrl.isNullOrBlank()) row.copy(coverUrl = vaultCovers[row.code]) else row }
-            } else {
-                rows
+            val covered = rows.map { row ->
+                if (!row.coverUrl.isNullOrBlank()) {
+                    row
+                } else {
+                    // 引用条目的清单 gcid 更准，优先用它
+                    row.copy(coverUrl = vaultCovers[row.code] ?: gcidCovers[row.code])
+                }
             }
             // 刮削状态在内存里过滤：它本来就是从 scraped_at 推出来的一个布尔，
             // 为它再写两条同构 SQL 不值当，几百条的量也不差这一步
@@ -481,7 +494,7 @@ class LibraryStore(
     suspend fun workDetail(code: String): WorkDetail? = withQueries { q ->
         val w = q.selectWork(code).executeAsOneOrNull() ?: return@withQueries null
         val files = q.selectFilesForWork(code).executeAsList().map {
-            ScannedWorkFile(it.file_id, it.name, it.size, it.folder_id, it.part)
+            ScannedWorkFile(it.file_id, it.name, it.size, it.folder_id, it.part, it.gcid)
         }
         val counts = q.selectFileCounts().executeAsList().firstOrNull { it.work_code == code }
         WorkDetail(
@@ -489,9 +502,12 @@ class LibraryStore(
                 code = w.code,
                 title = w.title,
                 titleZh = w.title_zh,
-                // 引用条目多半还没刮封面，这里退回清单里的 gcid 缩略图
+                // 没刮到封面时退回 gcid 缩略图：真实文件用扫描时存下的，引用条目用清单里的
                 coverUrl = w.cover_url?.takeIf { it.isNotBlank() } ?: files.asSequence()
-                    .mapNotNull { VaultEntry.resolvedFileOf(it.fileId)?.gcid?.takeIf(String::isNotBlank) }
+                    .mapNotNull { f ->
+                        f.gcid?.takeIf(String::isNotBlank)
+                            ?: VaultEntry.resolvedFileOf(f.fileId)?.gcid?.takeIf(String::isNotBlank)
+                    }
                     .firstOrNull()?.let(::videoThumbnailUrlOf),
                 releaseDate = w.release_date,
                 durationMinutes = w.duration?.toInt(),

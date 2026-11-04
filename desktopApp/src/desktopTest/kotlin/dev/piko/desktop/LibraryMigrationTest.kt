@@ -129,6 +129,37 @@ class LibraryMigrationTest {
     }
 
     @Test
+    fun v9ToV10AddsGcidToFiles() {
+        val driver = JdbcSqliteDriver(JdbcSqliteDriver.IN_MEMORY)
+        // 照 v9 的 work_files 结构建表：没有 gcid 这一列
+        driver.execute(
+            null,
+            """
+            CREATE TABLE work_files (
+                file_id TEXT NOT NULL PRIMARY KEY, work_code TEXT NOT NULL, name TEXT NOT NULL,
+                size INTEGER NOT NULL, folder_id TEXT NOT NULL, part TEXT)
+            """.trimIndent(),
+            0,
+        )
+        driver.execute(
+            null,
+            "INSERT INTO work_files (file_id, work_code, name, size, folder_id) VALUES ('f1', 'ABC-123', 'ABC-123.mp4', 100, 'root')",
+            0,
+        )
+
+        Library.Schema.migrate(driver, 9L, Library.Schema.version)
+        assertEquals(10, Library.Schema.version.toInt())
+
+        // 老行还在，只是还没有 gcid（要重扫一轮才会填）
+        assertEquals(1L, count(driver, "SELECT count(*) FROM work_files"))
+        assertEquals(0L, count(driver, "SELECT count(*) FROM work_files WHERE gcid IS NOT NULL"))
+
+        // 新列可写：重扫时按 gcid 写回去
+        driver.execute(null, "UPDATE work_files SET gcid = 'GCID1' WHERE file_id = 'f1'", 0)
+        assertEquals(1L, count(driver, "SELECT count(*) FROM work_files WHERE gcid = 'GCID1'"))
+    }
+
+    @Test
     fun rebuildSwapsMetaTubeBaseWithoutRescraping() {
         val driver = JdbcSqliteDriver(JdbcSqliteDriver.IN_MEMORY)
         Library.Schema.create(driver)

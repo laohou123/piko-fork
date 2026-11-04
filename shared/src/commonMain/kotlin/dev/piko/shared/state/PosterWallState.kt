@@ -358,6 +358,8 @@ class PosterWallState(
                 size = stat.size.toLongOrNull() ?: 0L,
                 folderId = stat.parentId,
                 part = av?.info?.part,
+                // 刮不到封面时用它拼缩略图。PikPak 的 hash 就是 gcid
+                gcid = stat.hash.takeIf { it.isNotBlank() },
             )
         }
         return byCode.map { (code, list) -> ScannedWork(code, list.sortedBy { it.name }) }
@@ -449,6 +451,7 @@ class PosterWallState(
                 size = entry.size,
                 folderId = folderId,
                 part = null,
+                gcid = entry.gcid.takeIf { it.isNotBlank() },
             )
         }
         val works = byCode.map { (code, files) -> ScannedWork(code, files.sortedBy { it.name }) }
