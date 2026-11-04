@@ -27,6 +27,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
@@ -59,6 +60,16 @@ class PosterWallState(
      * 每轮扫描现取一次才能拿到当前账号的。
      */
     private val vaultStore: () -> VaultStore? = { null },
+    /**
+     * 引用条目体积上限（字节），null 表示不过滤。传取值函数：设置与账号剩余空间都会变，
+     * 每轮回查一次现算，开了会员或清空回收站之后不用重启就能看到藏起来的条目。
+     */
+    private val vaultSizeLimitBytes: suspend () -> Long? = { null },
+    /**
+     * 上限可能变了（改设置、配额刷新）。收到就重查列表与统计，不必等用户切筛选或重进页面。
+     * 在 init 里收集，状态活多久就听多久。
+     */
+    private val vaultSizeFilterChanges: Flow<Unit>? = null,
     private val scope: CoroutineScope,
 ) {
     enum class Phase { IDLE, SCANNING, DONE, FAILED }
@@ -163,6 +174,10 @@ class PosterWallState(
     /** 引用保存的作品数：网盘里没有原文件、只记在归档清单里的那批。 */
     var vaultCount by mutableStateOf(0L)
         private set
+
+    /** 因超过体积上限没列出来的引用作品数。界面拿它提示一句，免得以为片子丢了。 */
+    var hiddenBySize by mutableStateOf(0L)
+        private set
     var loading by mutableStateOf(false)
         private set
 
@@ -213,6 +228,8 @@ class PosterWallState(
             workCount = store.workCount()
             scrapedCount = store.scrapedWorkCount()
             refresh()
+            // 体积上限变了（改设置、配额刷新）就重查一次：藏起来的条目该回来的自己回来
+            vaultSizeFilterChanges?.let { changes -> launch { changes.collect { refresh() } } }
             // 上一轮扫描有没刮到的作品（MetaTube 不通、查询失败）：进海报墙就补，
             // 不用等用户手动再扫一轮。没有待刮作品时 enrich 空转返回，不弹消息
             enrich(silent = true)
@@ -673,6 +690,7 @@ class PosterWallState(
 
     private suspend fun refresh() {
         loading = true
+        val maxVaultBytes = vaultSizeLimitBytes()
         works = store.works(
             actor = filterName.takeIf { filter == Filter.ACTOR },
             tag = filterName.takeIf { filter == Filter.TAG },
@@ -685,12 +703,19 @@ class PosterWallState(
             },
             // 只有顶部的引用库入口单独筛引用条目；其余筛选与「全部」一样两类都看
             vault = if (filter == Filter.VAULT) true else null,
+            // 超出上限的引用条目不列出来：点了播不了，还占着一张卡的位置
+            maxVaultFileBytes = maxVaultBytes,
         )
         actors = store.actors()
         tags = store.tags()
-        workCount = store.workCount()
-        scrapedCount = store.scrapedWorkCount()
-        vaultCount = store.vaultWorkCount()
+        // 统计行跟列表用同一套口径：藏起来的那批要从三个数里减掉，否则数字对不上
+        val hidden = maxVaultBytes?.let {
+            store.hiddenVaultWorkCount(it) to store.hiddenScrapedVaultWorkCount(it)
+        } ?: (0L to 0L)
+        hiddenBySize = hidden.first
+        workCount = (store.workCount() - hidden.first).coerceAtLeast(0)
+        scrapedCount = (store.scrapedWorkCount() - hidden.second).coerceAtLeast(0)
+        vaultCount = (store.vaultWorkCount() - hidden.first).coerceAtLeast(0)
         titlePending = store.titleTranslationPendingCount()
         loading = false
     }

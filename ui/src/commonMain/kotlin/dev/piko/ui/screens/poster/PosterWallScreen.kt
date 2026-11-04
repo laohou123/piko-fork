@@ -464,6 +464,15 @@ private fun ScanHeader(
                     else -> Unit
                 }
             }
+            if (state.hiddenBySize > 0) {
+                // 藏起来的条目要说一声：不然找不着片子会以为是丢了。数字与列表同一套口径
+                Text(
+                    text = "已隐藏 ${state.hiddenBySize} 部超出体积上限的引用视频（设置 → 文件 → 引用视频体积上限）",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 4.dp),
+                )
+            }
             if (state.phase == PosterWallState.Phase.SCANNING) {
                 LinearProgressIndicator(
                     modifier = Modifier.fillMaxWidth().padding(top = 8.dp),

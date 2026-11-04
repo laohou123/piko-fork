@@ -182,6 +182,25 @@ SELECT work_code, file_id FROM work_files WHERE file_id LIKE 'piko-vault:%';
 countVaultFilesForWork:
 SELECT COUNT(*) FROM work_files WHERE work_code = ? AND file_id LIKE 'piko-vault:%';
 
+-- 每个作品的引用文件最大体积。播放要按 gcid 在云端临时重建一整个文件，占的是单集的大小，
+-- 不是整部作品的总和：CD1+CD2 各 3 GB 时单个文件只算 3 GB。
+selectVaultMaxSizes:
+SELECT work_code, MAX(size) AS max_size FROM work_files WHERE file_id LIKE 'piko-vault:%' GROUP BY work_code;
+
+-- 因体积被隐藏的纯引用作品数。origin = 'vault' 才算：同番号另有真实文件的已合并成 scan，
+-- 那类仍能播真实版本，不该被藏。
+countVaultWorksOverSize:
+SELECT COUNT(*) FROM works w WHERE w.origin = 'vault' AND EXISTS (
+    SELECT 1 FROM work_files f
+    WHERE f.work_code = w.code AND f.file_id LIKE 'piko-vault:%' AND f.size > :maxBytes
+);
+
+countScrapedVaultWorksOverSize:
+SELECT COUNT(*) FROM works w WHERE w.origin = 'vault' AND w.scraped_at > 0 AND EXISTS (
+    SELECT 1 FROM work_files f
+    WHERE f.work_code = w.code AND f.file_id LIKE 'piko-vault:%' AND f.size > :maxBytes
+);
+
 -- 注意：不要用 NOT IN 一次传上千个番号。Android 的 SQLite 变量上限是 999，
 -- 超了就是「too many SQL variables」，整个扫描事务回滚、列表还是旧的。
 -- 调用方查出现有番号做差集，再按每批 ≤500 调这个语句。

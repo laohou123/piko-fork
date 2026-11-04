@@ -10,6 +10,8 @@ import dev.piko.shared.sync.VaultTreeSync
 import dev.piko.ui.components.SegmentSession
 import androidx.compose.runtime.staticCompositionLocalOf
 import dev.piko.data.auth.PikoUserPreferences
+import dev.piko.data.auth.VaultSizeFilter
+import dev.piko.data.auth.VaultSizeLimit
 import dev.piko.data.repository.DriveRepository
 import dev.piko.shared.data.VaultStore
 import dev.piko.shared.data.AccountScopedPreferences
@@ -60,6 +62,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
@@ -239,9 +242,24 @@ class PikoServices(
         TranslationGateway(platformPreferences) { http }
     }
 
+    /**
+     * 当前生效的引用条目体积上限，null 表示不过滤。
+     *
+     * 自动模式按账号剩余空间的九成算（与 SDK 借出对象时的预算同一口径），所以开了会员、清了回收站，
+     * 额度一变大，藏起来的条目下一轮查询就自己回来，不需要手动改设置。
+     * 配额取不到时不过滤：宁可多显示，也不要让人以为片子丢了。
+     */
+    private suspend fun vaultSizeLimitBytes(): Long? {
+        val filter = VaultSizeFilter.fromStorage(preferences.vaultSizeFilterFlow.first())
+        if (filter == VaultSizeFilter.OFF) return null
+        val manual = preferences.vaultSizeLimitGbFlow.first()
+        val remaining = driveRepository.quotaFlow.value?.quota?.remainingBytes
+            ?: driveRepository.getQuota().getOrNull()?.quota?.remainingBytes
+        return VaultSizeLimit.limitBytes(filter, manual, remaining)
+    }
+
     /** 海报墙页的进程级状态：扫描与补刮不随离开页面而停。 */
-    val posterWall: PosterWallState? = libraryStore?.let { store ->
-        PosterWallState(
+    val posterWall: PosterWallState? = libraryStore?.let { store ->        PosterWallState(
             clients = clientManager,
             store = store,
             scraper = libraryScraper,
@@ -250,6 +268,13 @@ class PikoServices(
             // 传取值函数：这个状态在启动时就建好，那时多半还没登录，
             // 直接存实例会一直拿着「未登录」占位对象
             vaultStore = { this.vaultStore },
+            // 引用条目多大才不列出来，每一轮列表都现算：设置改了、配额刷新了都算数
+            vaultSizeLimitBytes = { vaultSizeLimitBytes() },
+            vaultSizeFilterChanges = combine(
+                preferences.vaultSizeFilterFlow,
+                preferences.vaultSizeLimitGbFlow,
+                driveRepository.quotaFlow,
+            ) { _, _, _ -> Unit },
             scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate),
         )
     }

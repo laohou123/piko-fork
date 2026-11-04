@@ -1,6 +1,8 @@
 package dev.piko.ui.screens.settings
 
 import dev.piko.data.auth.AppLanguage
+import dev.piko.data.auth.VaultSizeLimit
+import dev.piko.data.auth.VaultSizeFilter
 import androidx.compose.material.icons.outlined.Language
 import dev.piko.shared.i18n.tr
 
@@ -38,6 +40,7 @@ import androidx.compose.material.icons.outlined.Dns
 import androidx.compose.material.icons.outlined.DriveFileRenameOutline
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.FolderOpen
+import androidx.compose.material.icons.outlined.FilterAlt
 import androidx.compose.material.icons.outlined.HighQuality
 import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.outlined.Info
@@ -204,6 +207,12 @@ fun SettingsScreen(
     val playbackMaxHeight by sessionManager.playbackMaxHeightFlow.collectAsStateWithLifecycle(initialValue = 0)
     var showDownloadQuality by remember { mutableStateOf(false) }
     val downloadMaxHeight by sessionManager.downloadMaxHeightFlow.collectAsStateWithLifecycle(initialValue = null)
+
+    // 引用视频体积上限：模式 + 手动值 + 当前剩余空间（自动模式要拿它算）
+    val vaultSizeFilter by sessionManager.vaultSizeFilterFlow.collectAsStateWithLifecycle(initialValue = VaultSizeFilter.OFF.name)
+    val vaultSizeLimitGb by sessionManager.vaultSizeLimitGbFlow.collectAsStateWithLifecycle(initialValue = VaultSizeLimit.DEFAULT_MANUAL_GB)
+    val quota by services.driveRepository.quotaFlow.collectAsStateWithLifecycle()
+    var showVaultSizeLimit by remember { mutableStateOf(false) }
 
     val metaTube = services.metaTube
     val metaTubeUrl by sessionManager.metaTubeUrlFlow.collectAsStateWithLifecycle(initialValue = "")
@@ -460,6 +469,17 @@ fun SettingsScreen(
                                 supporting = tr("为每个文件夹分别保存排序方式", "Save sort order independently for each folder", "フォルダーごとに並び順を個別に保存します", "폴더마다 정렬 방식을 개별적으로 저장합니다", "為每個資料夾分別儲存排序方式"),
                                 checked = isPerFolderSortEnabled,
                                 onCheckedChange = { scope.launch { sessionManager.setPerFolderSort(it) } },
+                            )
+                            SettingsNavigationRow(
+                                icon = Icons.Outlined.FilterAlt,
+                                title = tr("引用视频体积上限", "Referenced video size limit", "参照動画のサイズ上限", "참조 동영상 크기 한도", "引用影片大小上限"),
+                                supporting = vaultSizeFilterSummary(
+                                    filter = VaultSizeFilter.fromStorage(vaultSizeFilter),
+                                    manualGb = vaultSizeLimitGb,
+                                    remainingBytes = quota?.quota?.remainingBytes,
+                                ),
+                                onClick = { showVaultSizeLimit = true },
+                                trailingIcon = null,
                             )
                         }
                         SettingsGroup(tr("播放", "Play", "再生", "재생", "播放")) {
@@ -832,6 +852,24 @@ fun SettingsScreen(
             onDismiss = { showDownloadQuality = false },
             title = tr("默认下载画质", "Default download quality", "既定のダウンロード画質", "기본 다운로드 화질", "預設下載畫質"),
             description = tr("普通下载默认采用此画质，也可通过「下载指定画质」单次选择。优先选用不高于所选上限的最高画质，若均超出上限则选用最低画质；转码视频保存为 MP4 格式。", "Standard downloads use this quality by default; use Download at chosen quality to override per download. Selects the highest quality within the limit, or the lowest available if all exceed it. Transcoded videos are saved as MP4.", "通常のダウンロードではこの画質を使用し、「画質を指定してダウンロード」で個別に変更できます。上限以下で最も高い画質を選択し、すべて上限を超える場合は最低画質を選択します。変換動画はMP4形式で保存されます。", "일반 다운로드 시 기본적으로 이 화질을 사용하며 '화질을 선택하여 다운로드'로 개별 선택할 수 있습니다. 선택한 한도 이하의 최고 화질을 사용하며 모두 초과할 경우 최저 화질을 사용합니다. 변환 동영상은 MP4 형식으로 저장됩니다.", "一般下載預設採用此畫質，亦可透過「下載指定畫質」單次選擇。優先選用不高於所選上限的最高畫質，若均超出上限則選用最低畫質；轉碼影片儲存為 MP4 格式。"),
+        )
+    }
+
+    if (showVaultSizeLimit) {
+        VaultSizeLimitDialog(
+            filter = VaultSizeFilter.fromStorage(vaultSizeFilter),
+            manualGb = vaultSizeLimitGb,
+            remainingBytes = quota?.quota?.remainingBytes,
+            onSave = { mode, gb ->
+                scope.launch {
+                    sessionManager.setVaultSizeFilter(mode.name)
+                    sessionManager.setVaultSizeLimitGb(gb)
+                    // 海报墙订阅了这两个流，存下去就会重查；这里再叫一次，设置页刚关就能看到数字变了
+                    posterWall?.refreshList()
+                }
+                showVaultSizeLimit = false
+            },
+            onDismiss = { showVaultSizeLimit = false },
         )
     }
 

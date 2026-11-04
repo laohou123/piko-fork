@@ -123,6 +123,9 @@ class SessionManager(private val context: Context) : PikoUserPreferences {
         val NAME_PARSING_ENABLED = booleanPreferencesKey("name_parsing_enabled")
         val WATERFALL_VIEW_ENABLED = booleanPreferencesKey("waterfall_view_enabled")
         val DRIVE_VIEW_MODE = stringPreferencesKey("drive_view_mode")
+        /** 引用视频按体积过滤的模式（AUTO/MANUAL/OFF）与手动上限。 */
+        val VAULT_SIZE_FILTER = stringPreferencesKey("vault_size_filter")
+        val VAULT_SIZE_LIMIT_GB = intPreferencesKey("vault_size_limit_gb")
         fun driveTileSize(view: String) = stringPreferencesKey("drive_tile_size_$view")
         val CLIP_PANEL_OPEN = booleanPreferencesKey("clip_panel_open")
         val CLIP_PANEL_WIDTH = floatPreferencesKey("clip_panel_width")
@@ -410,6 +413,26 @@ class SessionManager(private val context: Context) : PikoUserPreferences {
     override suspend fun setDriveViewMode(mode: String) {
         context.dataStore.edit { preferences ->
             preferences[PreferencesKeys.DRIVE_VIEW_MODE] = mode
+        }
+    }
+
+    override val vaultSizeFilterFlow: Flow<String> = preference { preferences ->
+        preferences[PreferencesKeys.VAULT_SIZE_FILTER] ?: VaultSizeFilter.OFF.name
+    }
+
+    override suspend fun setVaultSizeFilter(mode: String) {
+        context.dataStore.edit { preferences ->
+            preferences[PreferencesKeys.VAULT_SIZE_FILTER] = mode
+        }
+    }
+
+    override val vaultSizeLimitGbFlow: Flow<Int> = preference { preferences ->
+        preferences[PreferencesKeys.VAULT_SIZE_LIMIT_GB] ?: VaultSizeLimit.DEFAULT_MANUAL_GB
+    }
+
+    override suspend fun setVaultSizeLimitGb(gb: Int) {
+        context.dataStore.edit { preferences ->
+            preferences[PreferencesKeys.VAULT_SIZE_LIMIT_GB] = gb.coerceIn(VaultSizeLimit.MIN_MANUAL_GB, VaultSizeLimit.MAX_MANUAL_GB)
         }
     }
 

@@ -7,6 +7,8 @@ import dev.piko.data.auth.AppLanguage
 import dev.piko.data.auth.PlayerGestureDefaults
 import dev.piko.data.auth.SidePanelPrefs
 import dev.piko.data.auth.SnailMode
+import dev.piko.data.auth.VaultSizeFilter
+import dev.piko.data.auth.VaultSizeLimit
 import dev.piko.shared.auth.SecretVault
 import dev.piko.shared.log.PikoLog
 import dev.piko.shared.net.ProxySetting
@@ -278,6 +280,23 @@ class DesktopPikoPreferences(
     override suspend fun setDriveViewMode(mode: String) {
         settings.set(KEY_DRIVE_VIEW_MODE, mode)
         driveViewMode.value = mode
+    }
+
+    private val vaultSizeFilter = MutableStateFlow(settings.get(KEY_VAULT_SIZE_FILTER).ifEmpty { VaultSizeFilter.OFF.name })
+    override val vaultSizeFilterFlow: Flow<String> = vaultSizeFilter.asStateFlow()
+    override suspend fun setVaultSizeFilter(mode: String) {
+        settings.set(KEY_VAULT_SIZE_FILTER, mode)
+        vaultSizeFilter.value = mode
+    }
+
+    private val vaultSizeLimitGb = MutableStateFlow(
+        settings.get(KEY_VAULT_SIZE_LIMIT_GB).toIntOrNull() ?: VaultSizeLimit.DEFAULT_MANUAL_GB,
+    )
+    override val vaultSizeLimitGbFlow: Flow<Int> = vaultSizeLimitGb.asStateFlow()
+    override suspend fun setVaultSizeLimitGb(gb: Int) {
+        val clamped = gb.coerceIn(VaultSizeLimit.MIN_MANUAL_GB, VaultSizeLimit.MAX_MANUAL_GB)
+        settings.set(KEY_VAULT_SIZE_LIMIT_GB, clamped.toString())
+        vaultSizeLimitGb.value = clamped
     }
 
     private val tileSizes = mutableMapOf<String, MutableStateFlow<String>>()
@@ -602,6 +621,8 @@ class DesktopPikoPreferences(
         const val KEY_NAME_PARSING = "ui.nameParsing"
         const val KEY_GRID_VIEW = "ui.gridView"
         const val KEY_DRIVE_VIEW_MODE = "ui.driveViewMode"
+        const val KEY_VAULT_SIZE_FILTER = "ui.vaultSizeFilter"
+        const val KEY_VAULT_SIZE_LIMIT_GB = "ui.vaultSizeLimitGb"
         fun tileSizeKey(view: String) = "ui.drive.tileSize.$view"
         const val KEY_CLIP_PANEL_OPEN = "ui.clipPanel.open"
         const val KEY_CLIP_PANEL_WIDTH = "ui.clipPanel.width"

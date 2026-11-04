@@ -11,6 +11,52 @@ data class QuotaSnapshot(val usageBytes: Long, val limitBytes: Long)
 data class SidePanelPrefs(val open: Boolean, val widthDp: Float?)
 
 /**
+ * 引用视频（网盘里只留清单、播放时按 gcid 秒传重建对象的条目）按体积过滤。
+ *
+ * 这类条目要播出去，云端得先临时放得下整个文件，账号装不下就报空间不足。列表里把它藏起来，
+ * 免得点进去才发现播不了。真实文件不受影响：它们已经在网盘里占着地方，播放不需要额外空间。
+ */
+enum class VaultSizeFilter {
+    /** 跟随账号剩余空间：空间变大（开会员、清回收站）后，藏起来的条目自己回来。 */
+    AUTO,
+
+    /** 固定上限，见 [VaultSizeLimit.manualBytes]。 */
+    MANUAL,
+
+    /** 不按体积过滤。默认。 */
+    OFF;
+
+    companion object {
+        fun fromStorage(raw: String?): VaultSizeFilter =
+            entries.firstOrNull { it.name.equals(raw?.trim(), ignoreCase = true) } ?: OFF
+    }
+}
+
+object VaultSizeLimit {
+    const val GIB = 1024L * 1024L * 1024L
+
+    /** 手动上限的默认值与允许范围（GB）。 */
+    const val DEFAULT_MANUAL_GB = 6
+    const val MIN_MANUAL_GB = 1
+    const val MAX_MANUAL_GB = 500
+
+    /**
+     * 自动模式只用剩余空间的九成：SDK 按 gcid 借对象时也是这么算的（见 PikoDriveRepository 的 LeaseBudget），
+     * 留一成给云盘自己的元数据与同时借出的别的条目。
+     */
+    const val AUTO_HEADROOM_PERCENT = 90
+
+    fun manualBytes(gb: Int): Long = gb.coerceIn(MIN_MANUAL_GB, MAX_MANUAL_GB) * GIB
+
+    /** 当前生效的上限；null 表示不过滤。[remainingBytes] 是账号剩余空间，取不到时自动模式退回不过滤。 */
+    fun limitBytes(filter: VaultSizeFilter, manualGb: Int, remainingBytes: Long?): Long? = when (filter) {
+        VaultSizeFilter.OFF -> null
+        VaultSizeFilter.MANUAL -> manualBytes(manualGb)
+        VaultSizeFilter.AUTO -> remainingBytes?.takeIf { it > 0 }?.let { it / 100 * AUTO_HEADROOM_PERCENT }
+    }
+}
+
+/**
  * 蜗牛模式，照 FDM：开着时下载与上传各自不超过设定的带宽，让出网络给别的用途。播放不受限。
  * 上限以 KiB/s 计；开关与上限分开存，关掉再开回到原来的上限。
  */
@@ -134,6 +180,17 @@ interface PikoUserPreferences {
      */
     val driveViewModeFlow: Flow<String>
     suspend fun setDriveViewMode(mode: String)
+
+    /**
+     * 引用视频按体积过滤的模式，见 [VaultSizeFilter]。每台设备各自的：空间够不够看的是这份账号，
+     * 而账号在另一台机器上可能是另一个。
+     */
+    val vaultSizeFilterFlow: Flow<String>
+    suspend fun setVaultSizeFilter(mode: String)
+
+    /** 手动上限，GB，仅在 [VaultSizeFilter.MANUAL] 下生效。 */
+    val vaultSizeLimitGbFlow: Flow<Int>
+    suspend fun setVaultSizeLimitGb(gb: Int)
 
     /**
      * 海报墙与图库各自的卡片大小，[view] 是 DriveViewMode 的名字，值是 ui 里 TileSize 的名字，没存过时为空串。

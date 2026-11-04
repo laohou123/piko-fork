@@ -222,6 +222,14 @@ class LibraryStore(
     /** 引用保存的作品数（网盘里没有原文件的那批）。 */
     suspend fun vaultWorkCount(): Long = withQueries { q -> q.selectVaultWorkCount().executeAsOne() } ?: 0L
 
+    /** 因体积超过 [maxBytes] 被 [works] 藏起来的引用作品数。口径与列表一致：只看纯引用作品。 */
+    suspend fun hiddenVaultWorkCount(maxBytes: Long): Long =
+        withQueries { q -> q.countVaultWorksOverSize(maxBytes).executeAsOne() } ?: 0L
+
+    /** 上一批里已刮到元数据的数量：统计行要减掉它，否则「已刮削」比列表里能看到的还多。 */
+    suspend fun hiddenScrapedVaultWorkCount(maxBytes: Long): Long =
+        withQueries { q -> q.countScrapedVaultWorksOverSize(maxBytes).executeAsOne() } ?: 0L
+
     /**
      * 引用保存的条目入库。
      *
@@ -343,12 +351,25 @@ class LibraryStore(
          * 单独筛它们；两类作品同在一张表里，靠 origin 区分。
          */
         vault: Boolean? = null,
+        /**
+         * 引用条目最大体积上限（字节），null 表示不过滤。按作品里最大的那一个引用文件算，
+         * 超过就不列出来——播放它要在云端临时放下整个文件，账号装不下只会白点一次。
+         * 同番号另有真实文件的作品不受影响：真实版本照样能播。
+         */
+        maxVaultFileBytes: Long? = null,
     ): List<WorkRow> = withQueries { q ->
         val counts = q.selectFileCounts().executeAsList().associate { it.work_code to (it.count to it.total) }
         // 卡片左下角的女优名：一次批量取出，不逐行查
         val actors = q.selectFirstActors().executeAsList().associate { it.work_code to it.actor }
         // 来源过滤在内存里做：四条列表查询结构不同，为它各写一份带 origin 的版本不划算
         val vaultCodes = q.selectVaultWorkCodes().executeAsList().toSet()
+        // 体积过滤同样在内存里做，只在这项功能打开时多查两张小表
+        val scanCodes = if (maxVaultFileBytes != null) q.selectScanWorkCodes().executeAsList().toSet() else emptySet()
+        val vaultMaxSizes = if (maxVaultFileBytes != null) {
+            q.selectVaultMaxSizes().executeAsList().associate { it.work_code to (it.max_size ?: 0L) }
+        } else {
+            emptyMap()
+        }
         // 引用条目还没刮到封面时，用清单里的 gcid 拼一张缩略图顶上：整墙空白卡片等于没有入口。
         // 「全部」里也混着引用条目，只要不是「只看扫描到的」，这张表就得备好
         val vaultCovers = if (vault != false) {
@@ -371,6 +392,14 @@ class LibraryStore(
             if (matched == null) this else filter { it.code in matched }
         fun List<WorkRow>.applyOrigin(): List<WorkRow> =
             if (vault == null) this else filter { (it.code in vaultCodes) == vault }
+        fun List<WorkRow>.applySizeLimit(): List<WorkRow> =
+            if (maxVaultFileBytes == null) {
+                this
+            } else {
+                filter { row ->
+                    row.code in scanCodes || (vaultMaxSizes[row.code] ?: 0L) <= maxVaultFileBytes
+                }
+            }
         // 四个查询各生成一个同构不同名的数据类，公共类型是 Any；逐个映射，不靠 when 推断
         when {
             favoriteOnly -> q.selectFavoriteWorks().executeAsList()
@@ -381,7 +410,7 @@ class LibraryStore(
                 .map { it.toRow(counts, actors) }
             else -> q.selectAllWorks().executeAsList()
                 .map { it.toRow(counts, actors) }
-        }.applyOrigin().applyQuery().let { rows ->
+        }.applyOrigin().applySizeLimit().applyQuery().let { rows ->
             val covered = if (vault != false) {
                 rows.map { row -> if (row.coverUrl.isNullOrBlank()) row.copy(coverUrl = vaultCovers[row.code]) else row }
             } else {
