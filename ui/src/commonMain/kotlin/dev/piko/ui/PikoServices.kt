@@ -247,7 +247,9 @@ class PikoServices(
             scraper = libraryScraper,
             metaTubeBase = { platformPreferences.metaTubeUrlFlow.first().trim() },
             translation = translation,
-            vaultStore = vaultStore,
+            // 传取值函数：这个状态在启动时就建好，那时多半还没登录，
+            // 直接存实例会一直拿着「未登录」占位对象
+            vaultStore = { this.vaultStore },
             scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate),
         )
     }

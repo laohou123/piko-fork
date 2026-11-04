@@ -53,8 +53,12 @@ class PosterWallState(
     /**
      * 归档清单：扫目录时收下的 `.piko-vault-*.json` 由它解析成条目。
      * 为空时引用库一直是空的（不影响普通扫描）。
+     *
+     * 传的是取值函数而不是实例：海报墙状态在 App 启动时就建好，那时往往还没登录，
+     * 仓库给的是一个「未登录」占位对象；把它存下来，登录后读清单永远是未登录。
+     * 每轮扫描现取一次才能拿到当前账号的。
      */
-    private val vaultStore: VaultStore? = null,
+    private val vaultStore: () -> VaultStore? = { null },
     private val scope: CoroutineScope,
 ) {
     enum class Phase { IDLE, SCANNING, DONE, FAILED }
@@ -345,7 +349,7 @@ class PosterWallState(
      * 删除时再把各处条目一起抹掉（[removeVaultWork]）。
      */
     private suspend fun syncVault(manifests: List<ScannedFile>, complete: Boolean = true) {
-        val vault = vaultStore ?: run {
+        val vault = vaultStore() ?: run {
             PikoLog.w(TAG, "引用库：归档存储未就绪，跳过")
             return
         }
@@ -441,7 +445,7 @@ class PosterWallState(
      * 每一处都抹掉，否则下次扫描它又会出现。
      */
     suspend fun removeVaultWork(code: String): Result<Unit> {
-        val vault = vaultStore ?: return Result.failure(IllegalStateException("归档清单未就绪"))
+        val vault = vaultStore() ?: return Result.failure(IllegalStateException("归档清单未就绪"))
         val files = store.workDetail(code)?.files.orEmpty()
         val byFolder = files.mapNotNull { file ->
             val id = VaultEntry.entryIdOf(file.fileId) ?: return@mapNotNull null
