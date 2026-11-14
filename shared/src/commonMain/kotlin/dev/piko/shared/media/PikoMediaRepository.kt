@@ -350,25 +350,36 @@ class PikoMediaRepository(
         client.openTransferDemand(initialIntent)
 
     /**
-     * 删除网盘文件（进回收站，可恢复）。
+     * 删除文件交给网盘仓库去办（[PikoDriveRepository.delete]），由它顺带更新本地索引与目录缓存。
      *
-     * 播放器「音轨与字幕」里的网盘字幕删除走这里：字幕文件是普通网盘文件，
-     * 删掉之后下次进播放器就不会再出现在外挂字幕列表里。
+     * 之前这里直接调 `client.batchDelete`：云端的文件是没了，可本地那份「列过的目录」缓存里还留着，
+     * 于是播放器里删掉字幕、再打开「网盘字幕选择」，那条字幕又从缓存里被列了出来。
+     * PikoServices 组装时接上（见 `driveRepository` 那段）。
+     */
+    var cloudFileDeleter: (suspend (List<String>) -> Result<Unit>)? = null
+
+    /** 移进回收站，同上：走仓库的 [PikoDriveRepository.trash]，才会同步目录缓存。 */
+    var cloudFileTrasher: (suspend (List<String>) -> Result<Unit>)? = null
+
+    /**
+     * 彻底删除网盘文件（不进回收站，删了就找不回来）。
+     *
+     * 播放器删字幕已改走 [trashFiles]（用户要求可恢复），这里留作确实要真删的场合。
      */
     suspend fun deleteFiles(ids: List<String>): Result<Unit> =
         withContext(Dispatchers.Default) {
-            runSuspendCatching { client.batchDelete(ids) }
+            cloudFileDeleter?.invoke(ids) ?: runSuspendCatching { client.batchDelete(ids) }
         }
 
     /**
      * 把网盘文件移进回收站（不是永久删除）。
      *
-     * 海报墙详情页的「删除原文件」走这里：片子是用户自己的收藏，删错了还能在网盘回收站里捞回来；
-     * 播放器删字幕用的是 [deleteFiles]，字幕是随时能重下的临时文件，两条路径不必同样谨慎。
+     * 海报墙详情页的「删除原文件」与播放器「音轨与字幕」里删网盘字幕都走这里：
+     * 删错了还能在网盘回收站里捞回来。
      */
     suspend fun trashFiles(ids: List<String>): Result<Unit> =
         withContext(Dispatchers.Default) {
-            runSuspendCatching { client.batchTrash(ids) }
+            cloudFileTrasher?.invoke(ids) ?: runSuspendCatching { client.batchTrash(ids) }
         }
 
     /**

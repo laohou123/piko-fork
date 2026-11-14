@@ -142,6 +142,9 @@ class PikoServices(
         }
         mediaRepository.localMounts = it.localMounts
         mediaRepository.metadataSink = it.metadataSink
+        // 播放器删字幕、详情页删原文件都从这里下去：带上索引更新，否则本地目录缓存会把删掉的文件继续列出来
+        mediaRepository.cloudFileDeleter = { ids -> repository.delete(ids) }
+        mediaRepository.cloudFileTrasher = { ids -> repository.trash(ids) }
     }
     internal val presentationStores = dev.piko.ui.workbench.AccountPresentationStores()
     val fileExecutionScopes = dev.piko.shared.state.AccountExecutionScopes(

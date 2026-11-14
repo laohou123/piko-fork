@@ -473,32 +473,33 @@ class PlayerScreenState(
     }
 
     /**
-     * 删掉一条已挂的网盘字幕：[fileId] 来自 [driveSubtitleFiles]。
+     * 把一条已挂的网盘字幕移进回收站：[fileId] 来自 [driveSubtitleFiles]。
      *
-     * 顺序有讲究——先卸轨道、再删文件：反过来会有一小段时间画面还在用已经取不到的流。
-     * 网盘的删除是进回收站，删错了能捞回来。
+     * 顺序有讲究——先卸轨道、再动文件：反过来会有一小段时间画面还在用已经取不到的流。
+     * 走回收站而不是彻底删除（[PikoDriveRepository.trash]）：字幕文件删错了能在网盘回收站里捞回来，
+     * 而且这条路会同步更新本地目录缓存，重开「网盘字幕选择」不会再列出它。
      */
     fun deleteDriveSubtitle(fileId: String) {
         val subtitleFileId = fileId
         val target = driveSubtitleFiles.firstOrNull { it.fileId == subtitleFileId } ?: return
-        PikoLog.i(TAG, "Delete drive subtitle ${logFile(subtitleFileId, target.title)} for ${logFile(fileId, title)}")
+        PikoLog.i(TAG, "Trash drive subtitle ${logFile(subtitleFileId, target.title)} for ${logFile(fileId, title)}")
         scope.launch {
             // 面板里的轨道靠标题对回文件；同名字幕挂过两次时按最后一条卸。
-            // 卸轨道失败不能拦住删文件：后端没实现或轨道已经不在时照样把文件删掉。
+            // 卸轨道失败不能拦住删文件：后端没实现或轨道已经不在时照样把文件挪走。
             runCatching {
                 backend.subtitleTracks.lastOrNull { it.isExternal && it.title == target.title }?.let { track ->
                     backend.removeSubtitle(track.id)
                 }
             }.onFailure { error ->
-                PikoLog.w(TAG, "Failed to detach subtitle track before deleting ${logFile(subtitleFileId, target.title)}", error)
+                PikoLog.w(TAG, "Failed to detach subtitle track before trashing ${logFile(subtitleFileId, target.title)}", error)
             }
             manualSubtitles = manualSubtitles.filterNot { it.fileId == subtitleFileId }
             driveSubtitleFiles = driveSubtitleFiles.filterNot { it.fileId == subtitleFileId }
-            repository.deleteFiles(listOf(subtitleFileId))
-                .onSuccess { _messages.tryEmit(tr("已删除字幕 ${target.title}", "Deleted subtitle ${target.title}", "字幕 ${target.title} を削除しました", "자막 ${target.title} 삭제됨", "已刪除字幕 ${target.title}")) }
+            repository.trashFiles(listOf(subtitleFileId))
+                .onSuccess { _messages.tryEmit(tr("已移入回收站：${target.title}", "Moved to trash: ${target.title}", "ゴミ箱に移動しました：${target.title}", "휴지통으로 이동됨: ${target.title}", "已移至資源回收筒：${target.title}")) }
                 .onFailure { error ->
-                    PikoLog.w(TAG, "Failed to delete drive subtitle ${logFile(subtitleFileId, target.title)}", error)
-                    _messages.tryEmit(tr("删除字幕失败：${error.message ?: "未知错误"}", "Failed to delete subtitle: ${error.message ?: "unknown error"}", "字幕の削除に失敗しました: ${error.message ?: "不明なエラー"}", "자막 삭제 실패: ${error.message ?: "알 수 없는 오류"}", "刪除字幕失敗：${error.message ?: "未知錯誤"}"))
+                    PikoLog.w(TAG, "Failed to trash drive subtitle ${logFile(subtitleFileId, target.title)}", error)
+                    _messages.tryEmit(tr("移入回收站失败：${error.message ?: "未知错误"}", "Failed to move subtitle to trash: ${error.message ?: "unknown error"}", "ゴミ箱への移動に失敗しました: ${error.message ?: "不明なエラー"}", "휴지통으로 이동 실패: ${error.message ?: "알 수 없는 오류"}", "移至資源回收筒失敗：${error.message ?: "未知錯誤"}"))
                 }
         }
     }
