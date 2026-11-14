@@ -1402,7 +1402,10 @@ private fun DriveScreenContent(
                     }
                 },
                 bottomBar = {
-                    if (!pathInTopBar && state.isSelectionMode) {
+                    // 触屏没有右键：宽屏（平板横放）虽按桌面布局走（路径在顶栏、批量菜单靠右键），
+                    // 但勾了项之后没有可达的批量入口——「选择建议清理」勾上一堆，却找不到删除。
+                    // 触屏上同一条底部批量栏也摆出来，桌面鼠标用户不受影响（仍用右键）。
+                    if (state.isSelectionMode && (!pathInTopBar || pointerSource.isTouchLike)) {
                         DriveCompactSelectionBar(
                             inTrash = inTrash,
                             hasTargets = commandTargets.isNotEmpty(),
