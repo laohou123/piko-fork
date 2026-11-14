@@ -59,6 +59,7 @@ import androidx.compose.ui.unit.toSize
 import dev.piko.data.auth.PlayerGestureDefaults
 import dev.piko.shared.i18n.tr
 import dev.piko.shared.media.player.MediaTrack
+import dev.piko.shared.media.player.DriveSubtitleFile
 import dev.piko.shared.media.player.PlaybackStatsSection
 import dev.piko.shared.media.player.PlayerAspectRatio
 import dev.piko.shared.media.player.PlaylistEntry
@@ -139,6 +140,18 @@ fun MobilePlayerControls(
     longPressSpeed: Float = PlayerGestureDefaults.BOOST_SPEED,
     onLongPressSpeedChange: ((Float) -> Unit)? = null,
     playbackStats: (() -> List<PlaybackStatsSection>)? = null,
+    /** 播放器内嵌的字幕搜索：三样齐全时「搜索字幕」就地打开面板 */
+    subtitleSearchTarget: SubtitleSearchTarget? = null,
+    onSearchedSubtitle: ((fileId: String, name: String) -> Unit)? = null,
+    /** AI 翻译字幕：这份片子的番号，为空说明没配置翻译模型或拿不到番号 */
+    subtitleTranslateCode: String? = null,
+    onTranslatedSubtitle: ((fileId: String, name: String) -> Unit)? = null,
+    /** 已挂的网盘字幕：给「音轨与字幕」里的字幕行配删除按钮 */
+    driveSubtitleFiles: List<DriveSubtitleFile> = emptyList(),
+    onDeleteDriveSubtitle: ((fileId: String) -> Unit)? = null,
+    /** 作品收藏（海报墙收藏夹）：顶栏心形，回调为 null 时不显示 */
+    isFavorite: Boolean = false,
+    onFavoriteClick: (() -> Unit)? = null,
     loadingSpeedText: String? = null,
     registerKeyFallback: (((KeyEvent) -> Boolean)?) -> Unit = {},
     positionMillisProvider: (() -> Long)? = null,
@@ -286,7 +299,7 @@ fun MobilePlayerControls(
 
     val hasPlaylist = playlist.size > 1
     val hasTracksEntry = subtitleTracks.isNotEmpty() || audioTracks.size > 1 ||
-        onPickLocalSubtitle != null || onPickDriveSubtitle != null
+        onPickLocalSubtitle != null || onPickDriveSubtitle != null || subtitleSearchTarget != null
     val episodeLabel = playlist.find { it.fileId == currentFileId }
         ?.takeIf { hasPlaylist && it.label.length <= SUBTITLE_LABEL_MAX_LENGTH }
         ?.label
@@ -444,6 +457,13 @@ fun MobilePlayerControls(
                         }.takeIf {
                             hasTracksEntry || fileActions.isNotEmpty() || playbackSpeed != null ||
                                 qualityOptions.isNotEmpty() || aspectRatio != null || onSeekStepChange != null
+                        },
+                        isFavorite = isFavorite,
+                        onFavoriteClick = onFavoriteClick?.let { callback ->
+                            {
+                                ui.interacted()
+                                callback()
+                            }
                         },
                         modifier = Modifier
                             .align(Alignment.TopCenter)
@@ -635,6 +655,12 @@ fun MobilePlayerControls(
                 onPickLocalSubtitle = onPickLocalSubtitle,
                 onPickDriveSubtitle = onPickDriveSubtitle,
                 playbackStats = playbackStats,
+                subtitleSearchTarget = subtitleSearchTarget,
+                onSearchedSubtitle = onSearchedSubtitle,
+                subtitleTranslateCode = subtitleTranslateCode,
+                onTranslatedSubtitle = onTranslatedSubtitle,
+                driveSubtitleFiles = driveSubtitleFiles,
+                onDeleteDriveSubtitle = onDeleteDriveSubtitle,
             )
         }
     }

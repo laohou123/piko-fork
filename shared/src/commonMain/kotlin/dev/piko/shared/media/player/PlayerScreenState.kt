@@ -217,6 +217,13 @@ class PlayerScreenState(
     // 用户手动挂上的字幕，只属于当前文件。换清晰度、重连、换到本地副本都要重开文件，每次 open 时一并带上
     private var manualSubtitles: List<ManualSubtitle> = emptyList()
 
+    /**
+     * 已挂上的网盘字幕：界面「音轨与字幕」里给这些行配删除按钮。
+     * 本机字幕没有文件 id，不在这里——它们没有可删的东西。
+     */
+    var driveSubtitleFiles: List<DriveSubtitleFile> by mutableStateOf(emptyList())
+        private set
+
     // 刚手动挂上、还没出现在轨道列表里的那条，出现后按用户亲手选择记下，见 init
     private var pendingManualTitle: String? = null
 
@@ -459,7 +466,34 @@ class PlayerScreenState(
             }
             subtitleStreams = subtitleStreams + stream
             manualSubtitles = manualSubtitles + ManualSubtitle(title = name, localPath = null, fileId = subtitleFileId)
+            driveSubtitleFiles = driveSubtitleFiles.filterNot { it.fileId == subtitleFileId } +
+                DriveSubtitleFile(title = name, fileId = subtitleFileId)
             attachManualSubtitle(ExternalSubtitle(url = stream.url, title = name, language = null), subtitleFileId = subtitleFileId)
+        }
+    }
+
+    /**
+     * 删掉一条已挂的网盘字幕：[fileId] 来自 [driveSubtitleFiles]。
+     *
+     * 顺序有讲究——先卸轨道、再删文件：反过来会有一小段时间画面还在用已经取不到的流。
+     * 网盘的删除是进回收站，删错了能捞回来。
+     */
+    fun deleteDriveSubtitle(fileId: String) {
+        val subtitleFileId = fileId
+        val target = driveSubtitleFiles.firstOrNull { it.fileId == subtitleFileId } ?: return
+        scope.launch {
+            // 面板里的轨道靠标题对回文件；同名字幕挂过两次时按最后一条卸
+            backend.subtitleTracks.lastOrNull { it.isExternal && it.title == target.title }?.let { track ->
+                backend.removeSubtitle(track.id)
+            }
+            manualSubtitles = manualSubtitles.filterNot { it.fileId == subtitleFileId }
+            driveSubtitleFiles = driveSubtitleFiles.filterNot { it.fileId == subtitleFileId }
+            repository.deleteFiles(listOf(subtitleFileId))
+                .onSuccess { _messages.tryEmit(tr("已删除字幕 ${target.title}", "Deleted subtitle ${target.title}", "字幕 ${target.title} を削除しました", "자막 ${target.title} 삭제됨", "已刪除字幕 ${target.title}")) }
+                .onFailure { error ->
+                    PikoLog.w(TAG, "Failed to delete drive subtitle ${logFile(subtitleFileId, target.title)}", error)
+                    _messages.tryEmit(tr("删除字幕失败：${error.message ?: "未知错误"}", "Failed to delete subtitle: ${error.message ?: "unknown error"}", "字幕の削除に失敗しました: ${error.message ?: "不明なエラー"}", "자막 삭제 실패: ${error.message ?: "알 수 없는 오류"}", "刪除字幕失敗：${error.message ?: "未知錯誤"}"))
+                }
         }
     }
 
@@ -730,6 +764,7 @@ class PlayerScreenState(
         lastKnownPositionMillis = 0L
         resumePositionVerified = true
         manualSubtitles = emptyList()
+        driveSubtitleFiles = emptyList()
         pendingManualTitle = null
         resetRecovery()
         reload()
@@ -1207,7 +1242,14 @@ class PlayerScreenState(
             }
         }
         val refs = currentEntry?.subtitles.orEmpty()
-        val subtitles = refs.mapNotNull { ref -> openPlaylistSubtitle(ref) }
+        val subtitles = refs.mapNotNull { ref ->
+            openPlaylistSubtitle(ref)?.also { track ->
+                // 播放列表自带的网盘字幕也记下来：面板里同样给删除按钮
+                if (driveSubtitleFiles.none { it.fileId == ref.fileId }) {
+                    driveSubtitleFiles = driveSubtitleFiles + DriveSubtitleFile(track.title, ref.fileId)
+                }
+            }
+        }
         val manual = manualSubtitles.mapNotNull { subtitle ->
             val url = subtitle.localPath
                 ?: subtitle.fileId?.let { id -> repository.prepareSubtitle(id)?.let(::registerSubtitleStream) }

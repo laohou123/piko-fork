@@ -40,6 +40,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import dev.piko.shared.media.player.MediaTrack
+import dev.piko.shared.media.player.DriveSubtitleFile
 import dev.piko.shared.media.player.PlaybackStatsSection
 import dev.piko.shared.media.player.PlayerAspectRatio
 import dev.piko.shared.media.player.PlaylistEntry
@@ -89,6 +90,15 @@ internal fun PlayerSheetsOverlay(
     onPickLocalSubtitle: (() -> Unit)?,
     onPickDriveSubtitle: ((FileStat) -> Unit)?,
     playbackStats: (() -> List<PlaybackStatsSection>)?,
+    /** 播放器内嵌的字幕搜索：三样齐全时「搜索字幕」就地打开面板 */
+    subtitleSearchTarget: SubtitleSearchTarget? = null,
+    onSearchedSubtitle: ((fileId: String, name: String) -> Unit)? = null,
+    /** AI 翻译字幕：这份片子的番号，为空说明没配置翻译模型或拿不到番号 */
+    subtitleTranslateCode: String? = null,
+    onTranslatedSubtitle: ((fileId: String, name: String) -> Unit)? = null,
+    /** 已挂的网盘字幕：给字幕行配删除按钮 */
+    driveSubtitleFiles: List<DriveSubtitleFile> = emptyList(),
+    onDeleteDriveSubtitle: ((fileId: String) -> Unit)? = null,
 ) {
     PlayerSheetHost(
         sheet = openSheet,
@@ -146,6 +156,14 @@ internal fun PlayerSheetsOverlay(
                 onSelectSubtitle = onSelectSubtitleTrack,
                 onPickLocalSubtitle = onPickLocalSubtitle,
                 onPickDriveSubtitle = onPickDriveSubtitle?.let { { onOpenSheet(PlayerSheet.DriveSubtitles) } },
+                onSearchSubtitle = if (subtitleSearchTarget != null) {
+                    { onOpenSheet(PlayerSheet.SearchSubtitle) }
+                } else {
+                    null
+                },
+                onTranslateSubtitle = subtitleTranslateCode?.let { { onOpenSheet(PlayerSheet.TranslateSubtitle) } },
+                driveSubtitleFiles = driveSubtitleFiles,
+                onDeleteSubtitle = onDeleteDriveSubtitle,
             )
             PlayerSheet.DriveSubtitles -> DriveSubtitlePanel(
                 videoFileId = currentFileId,
@@ -155,8 +173,31 @@ internal fun PlayerSheetsOverlay(
                 },
                 modifier = Modifier.weight(1f),
             )
-            PlayerSheet.TranslateSubtitle -> Unit
-            PlayerSheet.SearchSubtitle -> Unit
+            PlayerSheet.TranslateSubtitle -> subtitleTranslateCode?.let { code ->
+                SubtitleTranslatePanel(
+                    videoFileId = currentFileId,
+                    code = code,
+                    onUploaded = { fileId, name ->
+                        onTranslatedSubtitle?.invoke(fileId, name)
+                        // 翻完回到字幕列表：新挂的那条在那里亮着
+                        onOpenSheet(PlayerSheet.Tracks)
+                    },
+                    modifier = Modifier.weight(1f),
+                )
+            }
+            // 搜索字幕：与 AI 翻译同款内嵌面板，搜到并传完就回到字幕列表
+            PlayerSheet.SearchSubtitle -> subtitleSearchTarget?.let { target ->
+                SubtitleSearchPanel(
+                    code = target.code,
+                    targetFolderId = target.folderId,
+                    targetFolderName = target.folderName,
+                    onUploaded = { fileId, name ->
+                        onSearchedSubtitle?.invoke(fileId, name)
+                        onOpenSheet(PlayerSheet.Tracks)
+                    },
+                    modifier = Modifier.weight(1f),
+                )
+            }
             PlayerSheet.Stats -> playbackStats?.let { PlaybackStatsPanel(read = it) }
         }
     }
