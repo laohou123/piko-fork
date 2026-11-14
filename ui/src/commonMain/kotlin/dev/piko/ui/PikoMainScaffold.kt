@@ -231,6 +231,10 @@ fun PikoMainScaffold(
     // rememberSaveable 只在进程内（如转屏）保留当前页，进程重启就回到这个初始值。
     var currentTab by rememberSaveable { mutableStateOf(MainTab.POSTERS) }
     val backStack = rememberNavBackStack(NavKeyConfiguration, *workspaceModel.lastNavigation.toTypedArray())
+
+    // 详情页点演员/标签跳回海报墙时，记下来源详情页与其时的筛选。返回键据此先回详情页；
+    // 用户在海报墙上手动换了筛选，这个来源就作废，返回改为回「全部」。
+    var postersReturnDetail by remember { mutableStateOf<PosterWallJumpSource?>(null) }
     if (services.driveRepository.currentAccount != account) return
     val workspaceUiStates = rememberSaveableStateHolder()
     val workspaceContexts by workspaceModel.contexts.contextsFlow.collectAsStateWithLifecycle()
@@ -943,7 +947,11 @@ fun PikoMainScaffold(
                                             onOpenTransfers = ::openTransfers,
                                             onOpenDuplicateReport = ::openDuplicateReport,
                                             onOpenSpaceMap = ::openSpaceMapFromDrive,
-                                            onOpenPosterWork = { code -> backStack.add(Screen.WorkDetail(code)) },
+                                            onOpenPosterWork = {
+                                                // 手动从海报墙开详情页，之前跳转留下的来源作废
+                                                postersReturnDetail = null
+                                                backStack.add(Screen.WorkDetail(it))
+                                            },
                                             onLeaveLibrary = ::leaveLibrary,
                                             onFeedShownChange = { shown ->
                                                 when {
@@ -983,11 +991,13 @@ fun PikoMainScaffold(
                                             onPlay = { file -> playLocal(file.fileId, file.name, null) },
                                             onFilterActor = { actor ->
                                                 services.posterWall?.selectFilter(PosterWallState.Filter.ACTOR, actor)
+                                                postersReturnDetail = PosterWallJumpSource(screen, PosterWallState.Filter.ACTOR, actor)
                                                 while (backStack.size > 1) backStack.removeLastOrNull()
                                                 currentTab = MainTab.POSTERS
                                             },
                                             onFilterTag = { tag ->
                                                 services.posterWall?.selectFilter(PosterWallState.Filter.TAG, tag)
+                                                postersReturnDetail = PosterWallJumpSource(screen, PosterWallState.Filter.TAG, tag)
                                                 while (backStack.size > 1) backStack.removeLastOrNull()
                                                 currentTab = MainTab.POSTERS
                                             },
@@ -1076,6 +1086,28 @@ fun PikoMainScaffold(
             }
 
             BackHandler(enabled = drawerOpen) { drawerOpen = false }
+
+            // 海报墙主标签页的返回（仅在栈底生效，压了详情页等界面时由它们自己处理）：
+            // 1) 从详情页点演员/标签跳过来、筛选没被手动动过 → 返回回那个详情页；
+            // 2) 其余情况有筛选（手动选的演员/标签/收藏等）→ 返回回「全部」；
+            // 3) 都没有 → 不拦截，返回照旧退出 App。
+            // 搜索框开着时不抢：收搜索由 PosterWallScreen 自己的 BackHandler 处理。
+            val wallForBack = services.posterWall
+            val pendingWallReturn = postersReturnDetail
+            val wallReturnAlive = pendingWallReturn != null && wallForBack != null &&
+                wallForBack.filter == pendingWallReturn.filter && wallForBack.filterName == pendingWallReturn.name
+            BackHandler(
+                enabled = wallForBack != null && currentTab == MainTab.POSTERS && onHome && !wallForBack.searchActive &&
+                    (wallReturnAlive || wallForBack.filter != PosterWallState.Filter.ALL),
+            ) {
+                if (wallReturnAlive && pendingWallReturn != null) {
+                    postersReturnDetail = null
+                    backStack.add(pendingWallReturn.detail)
+                } else {
+                    postersReturnDetail = null
+                    wallForBack?.selectFilter(PosterWallState.Filter.ALL)
+                }
+            }
             val floatingSidebar = updateTransition(targetState = floatingDrawerTarget, label = "floatingSidebar")
             if (floatingSidebar.currentState || floatingSidebar.targetState) {
                 val motionScheme = MaterialTheme.motionScheme
@@ -1223,3 +1255,10 @@ private val DesktopTopLevelContentKeys = DesktopTopLevelScreens.mapTo(mutableSet
 private fun isDesktopTopLevelContentKey(key: Any?): Boolean =
     key in DesktopTopLevelContentKeys || key?.toString()?.startsWith("SpaceMap(") == true
 private val SettingsSubpages = setOf<NavKey?>(Screen.WebDav)
+
+/** 详情页点演员/标签跳回海报墙时留下的来源：返回键据此回详情页，手动换筛选后作废。 */
+private data class PosterWallJumpSource(
+    val detail: Screen.WorkDetail,
+    val filter: PosterWallState.Filter,
+    val name: String?,
+)
