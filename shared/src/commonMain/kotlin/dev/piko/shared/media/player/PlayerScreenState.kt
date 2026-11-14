@@ -481,10 +481,16 @@ class PlayerScreenState(
     fun deleteDriveSubtitle(fileId: String) {
         val subtitleFileId = fileId
         val target = driveSubtitleFiles.firstOrNull { it.fileId == subtitleFileId } ?: return
+        PikoLog.i(TAG, "Delete drive subtitle ${logFile(subtitleFileId, target.title)} for ${logFile(fileId, title)}")
         scope.launch {
-            // 面板里的轨道靠标题对回文件；同名字幕挂过两次时按最后一条卸
-            backend.subtitleTracks.lastOrNull { it.isExternal && it.title == target.title }?.let { track ->
-                backend.removeSubtitle(track.id)
+            // 面板里的轨道靠标题对回文件；同名字幕挂过两次时按最后一条卸。
+            // 卸轨道失败不能拦住删文件：后端没实现或轨道已经不在时照样把文件删掉。
+            runCatching {
+                backend.subtitleTracks.lastOrNull { it.isExternal && it.title == target.title }?.let { track ->
+                    backend.removeSubtitle(track.id)
+                }
+            }.onFailure { error ->
+                PikoLog.w(TAG, "Failed to detach subtitle track before deleting ${logFile(subtitleFileId, target.title)}", error)
             }
             manualSubtitles = manualSubtitles.filterNot { it.fileId == subtitleFileId }
             driveSubtitleFiles = driveSubtitleFiles.filterNot { it.fileId == subtitleFileId }

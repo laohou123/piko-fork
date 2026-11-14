@@ -481,6 +481,18 @@ internal class MpvPlaybackBackend(
         onMpv { mpv.command(mpvSubtitleSelectCommand(subtitle)) }
     }
 
+    /**
+     * 卸掉一条外挂字幕文件（sub-remove 接 track-list 里的 id）。
+     *
+     * 删字幕文件前必须先走这里：轨道还挂着时画面在用那份流，文件删了也白删，
+     * 面板里的字幕行也不会消失。track-list/count 变了会触发 [refreshTracks]，
+     * 列表与选中状态随之更新。
+     */
+    override fun removeSubtitle(trackId: String) {
+        if (released || preview) return
+        onMpv { mpv.command(arrayOf("sub-remove", trackId)) }
+    }
+
     override val supportsRotation: Boolean = true
 
     // video-rotate 会加进 video-params/rotate，画面比例经那里的观察自动换过来，这里不必另算
