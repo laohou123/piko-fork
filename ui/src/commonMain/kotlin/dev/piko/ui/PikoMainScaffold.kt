@@ -983,10 +983,12 @@ fun PikoMainScaffold(
                                             onPlay = { file -> playLocal(file.fileId, file.name, null) },
                                             onFilterActor = { actor ->
                                                 services.posterWall?.selectFilter(PosterWallState.Filter.ACTOR, actor)
+                                                while (backStack.size > 1) backStack.removeLastOrNull()
                                                 currentTab = MainTab.POSTERS
                                             },
                                             onFilterTag = { tag ->
                                                 services.posterWall?.selectFilter(PosterWallState.Filter.TAG, tag)
+                                                while (backStack.size > 1) backStack.removeLastOrNull()
                                                 currentTab = MainTab.POSTERS
                                             },
                                         )
