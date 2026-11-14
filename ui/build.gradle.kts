@@ -67,8 +67,6 @@ kotlin {
             implementation(libs.androidx.lifecycle.runtime.compose)
             implementation(libs.androidx.lifecycle.viewmodel.compose)
             implementation(libs.coil.compose)
-            // Coil 的 OkHttp 网络引擎（各端入口注册），封面从 MetaTube 取图靠它
-            implementation(libs.coil.network.okhttp)
             implementation(libs.zoomimage.compose.coil3)
             implementation(libs.kotlinx.coroutines.core)
             implementation(libs.kotlinx.serialization.json)
@@ -87,9 +85,17 @@ kotlin {
         // CMP 的 material3 在 Android 上重定向到 androidx 的构件，版本比 app 用的 BOM 旧；
         // 这里对齐到同一份 BOM，ui 模块编译时看到的就是 app 运行时的那套 API
         androidMain.dependencies {
+            // Coil 的 OkHttp 网络引擎（Android 入口注册），封面从 MetaTube 取图靠它。
+            // 只放 JVM 侧：这个构件没有 iOS 变体，放进 commonMain 会让 apple 目标解析失败
+            implementation(libs.coil.network.okhttp)
             implementation(project.dependencies.platform(libs.androidx.compose.bom))
             implementation(libs.androidx.navigation3.ui)
             implementation(libs.androidx.adaptive.navigation3)
+        }
+        val desktopMain by getting {
+            dependencies {
+                implementation(libs.coil.network.okhttp)
+            }
         }
         // 只测纯函数的规则（命令栏显隐这类 internal 的），界面行为的测试在 desktopApp
         val desktopTest by getting {

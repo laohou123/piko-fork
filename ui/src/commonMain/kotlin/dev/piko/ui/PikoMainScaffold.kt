@@ -30,6 +30,7 @@ import androidx.compose.foundation.layout.wrapContentWidth
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Folder
+import androidx.compose.material.icons.outlined.GridOn
 import androidx.compose.material.icons.outlined.Person
 import androidx.compose.material.icons.outlined.PieChart
 import androidx.compose.material.icons.outlined.Settings
@@ -713,6 +714,7 @@ fun PikoMainScaffold(
     fun tabDestinations(): List<PaletteItem> {
         val label = shortcutModifier::label
         return listOfNotNull(
+            PaletteItem(tr("海报墙", "Posters", "ポスター", "포스터", "海報牆"), Icons.Outlined.GridOn, tr("前往", "Go", "移動", "이동", "前往"), keywords = "posters library wall 影视 海报") { currentTab = MainTab.POSTERS; resetToHome() },
             PaletteItem(tr("文件", "Files", "ファイル", "파일", "檔案"), Icons.Outlined.Folder, tr("前往", "Go", "移動", "이동", "前往"), detail = label("1"), keywords = "files drive") { currentTab = MainTab.FILES; resetToHome() },
             PaletteItem(tr("任务", "Tasks", "タスク", "작업", "任務"), Icons.Outlined.SyncAlt, tr("前往", "Go", "移動", "이동", "前往"), detail = label("2"), keywords = "tasks transfers downloads uploads") { openTransfers() },
             if (desktop) null else PaletteItem(tr("我的", "Me", "マイページ", "내 정보", "我的"), Icons.Outlined.Person, tr("前往", "Go", "移動", "이동", "前往"), detail = label("3"), keywords = "profile me") { currentTab = MainTab.SETTINGS; resetToHome() },

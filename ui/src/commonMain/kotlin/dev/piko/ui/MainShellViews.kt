@@ -8,7 +8,6 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -16,7 +15,6 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -44,13 +42,10 @@ import androidx.compose.material.icons.outlined.PushPin
 import androidx.compose.material.icons.outlined.SwipeVertical
 import androidx.compose.material.icons.outlined.SwapVerticalCircle
 import androidx.compose.material3.Badge
-import androidx.compose.material3.ButtonGroupDefaults
 import androidx.compose.material3.Icon
-import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.TonalToggleButton
 import androidx.compose.material3.adaptive.navigationsuite.NavigationSuiteItem
 import androidx.compose.material3.adaptive.navigationsuite.NavigationSuiteScaffold
 import androidx.compose.material3.adaptive.navigationsuite.NavigationSuiteType
@@ -99,7 +94,6 @@ import dev.piko.ui.components.PikoDialog
 import dev.piko.ui.components.PikoDialogConfirm
 import dev.piko.ui.components.PikoEmptyState
 import dev.piko.ui.screens.poster.PosterWallScreen
-import dev.piko.ui.components.connectedToggleShapes
 import dev.piko.ui.components.TooltipIconButton
 import dev.piko.ui.i18n.stringResource
 import dev.piko.ui.navigation.MainTab
@@ -650,7 +644,6 @@ private fun MainSidebar(
                 MainTabSwitch(
                     currentTab = currentTab.takeIf { selectedPage == null },
                     onTabClick = onTabClick,
-                    collapsed = collapsed,
                 )
                 QuickAccessSection(
                     state = quickAccess,
@@ -678,18 +671,30 @@ private fun MainSidebar(
 }
 
 @Composable
-private fun MainTabSwitch(currentTab: MainTab?, onTabClick: (MainTab) -> Unit, collapsed: Boolean) {
-    val tabs = listOf(MainTab.FILES, MainTab.TRANSFERS)
-    val snail by LocalPikoServices.current.preferences.snailModeFlow.collectAsStateWithLifecycle(initialValue = SnailMode())
+private fun MainTabSwitch(currentTab: MainTab?, onTabClick: (MainTab) -> Unit) {
+    // 侧栏里也得有海报墙：宽屏（平板横放、桌面）只有这一个入口能切回去。
+    // 原来只列「文件」「任务」两项横排，一离开海报墙就再也进不来了。
+    // 三项竖排，与下面的「库」「快速访问」同一套行样式，展开时文字也放得下。
+    val tabs = listOf(MainTab.POSTERS, MainTab.FILES, MainTab.TRANSFERS)
     val shortcutModifier = LocalPikoPlatform.current.shortcutModifier
-    if (collapsed) {
+    val snail by LocalPikoServices.current.preferences.snailModeFlow.collectAsStateWithLifecycle(initialValue = SnailMode())
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(top = 2.dp, bottom = 6.dp),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
         tabs.forEach { tab ->
             val selected = tab == currentTab
+            // 数字快捷键只绑了「文件」「任务」「我的」，海报墙暂无
+            val shortcut = when (tab) {
+                MainTab.FILES -> shortcutModifier.label("1")
+                MainTab.TRANSFERS -> shortcutModifier.label("2")
+                else -> null
+            }
             if (tab == MainTab.TRANSFERS) {
-                CollapsedTransfersSidebarItem(
+                TransfersSidebarItem(
                     selected = selected,
                     snailed = snail.enabled,
-                    shortcut = shortcutModifier.label("2"),
+                    shortcut = shortcut,
                     onClick = { onTabClick(tab) },
                 )
             } else {
@@ -699,55 +704,21 @@ private fun MainTabSwitch(currentTab: MainTab?, onTabClick: (MainTab) -> Unit, c
                     label = tab.title,
                     selected = selected,
                     onClick = { onTabClick(tab) },
-                    shortcut = shortcutModifier.label("1"),
                 )
-            }
-        }
-        return
-    }
-    Row(
-        modifier = Modifier.fillMaxWidth().padding(top = 2.dp, bottom = 6.dp),
-        horizontalArrangement = Arrangement.spacedBy(ButtonGroupDefaults.ConnectedSpaceBetween),
-    ) {
-        tabs.forEachIndexed { index, tab ->
-            val selected = tab == currentTab
-            TonalToggleButton(
-                checked = selected,
-                onCheckedChange = { onTabClick(tab) },
-                shapes = connectedToggleShapes(index, tabs.size),
-                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
-                modifier = Modifier.weight(1f).height(48.dp),
-            ) {
-                val snailed = tab == MainTab.TRANSFERS && snail.enabled && !selected
-                CompositionLocalProvider(LocalContentColor provides if (snailed) MaterialTheme.colorScheme.tertiary else LocalContentColor.current) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(tab.icon(selected), contentDescription = null, modifier = Modifier.size(18.dp))
-                            Spacer(Modifier.width(6.dp))
-                            Text(
-                                tab.title,
-                                style = MaterialTheme.typography.labelLarge,
-                                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
-                                maxLines = 1,
-                            )
-                        }
-                        if (tab == MainTab.TRANSFERS) ExpandedTransfersReadout(selected = selected)
-                    }
-                }
             }
         }
     }
 }
 
 @Composable
-private fun CollapsedTransfersSidebarItem(
+private fun TransfersSidebarItem(
     selected: Boolean,
     snailed: Boolean,
-    shortcut: String,
+    shortcut: String?,
     onClick: () -> Unit,
 ) {
     val activity = rememberTransferActivity()
-    val showSpeedOnRail = activity.maxSpeed > 0L
+    val showSpeed = activity.maxSpeed > 0L
     val tab = MainTab.TRANSFERS
     SidebarItem(
         icon = tab.icon(false),
@@ -755,23 +726,15 @@ private fun CollapsedTransfersSidebarItem(
         label = if (snailed) tr("任务（蜗牛模式）", "Tasks (snail mode)", "タスク（低速モード）", "작업 (저속 모드)", "任務（蝸牛模式）") else tab.title,
         selected = selected,
         onClick = onClick,
-        trailing = if (showSpeedOnRail) {
-            { SidebarTransferReadout(activity, checked = selected, railCompact = true) }
+        trailing = if (showSpeed) {
+            { SidebarTransferReadout(activity, checked = selected, railCompact = LocalSidebarCollapsed.current) }
         } else null,
         accent = snailed,
         shortcut = shortcut,
         tooltipDetail = if (activity.hasReadout) activity.summaryText() else null,
-        badgeCount = if (!showSpeedOnRail) activity.attentionCount else 0,
-        badgeDot = !showSpeedOnRail && activity.attentionCount == 0 && activity.count > 0,
+        badgeCount = if (!showSpeed) activity.attentionCount else 0,
+        badgeDot = !showSpeed && activity.attentionCount == 0 && activity.count > 0,
     )
-}
-
-@Composable
-private fun ExpandedTransfersReadout(selected: Boolean) {
-    val activity = rememberTransferActivity()
-    if (activity.hasReadout) {
-        SidebarTransferReadout(activity, checked = selected, compact = true)
-    }
 }
 
 private class LibraryEntry(
