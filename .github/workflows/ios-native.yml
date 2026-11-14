@@ -1,0 +1,219 @@
+name: iOS Native validation
+
+# 可复用模拟器测试工作流：由 test.yml 在主干推送、PR 与发版门控中调用，也保留面板手动独立触发入口。
+on:
+  workflow_dispatch:
+    inputs:
+      sdk-main:
+        description: 使用 SDK main 源码（关闭则使用已发布版本）
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      sdk-main:
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-ios-native-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
+
+jobs:
+  simulator-tests:
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      GRADLE_OPTS: '-Dorg.gradle.daemon=false'
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/checkout@v5
+        if: format('{0}', inputs.sdk-main) != 'false'
+        with:
+          repository: NihilDigit/pikpak-kotlin
+          path: pikpak-kotlin
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Xcode and Kotlin version
+        id: xcode-ver
+        shell: bash
+        run: |
+          echo "build=$(xcodebuild -version | awk '/Build version/ {print $3}')" >> "$GITHUB_OUTPUT"
+          echo "kotlin=$(sed -n 's/^kotlin *= *"\([^"]*\)".*/\1/p' gradle/libs.versions.toml)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Locate Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}}"
+          test -d "$SDK"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          printf 'sdk.dir=%s\n' "$SDK" > local.properties
+          if [ -d pikpak-kotlin ]; then
+            printf 'pikpak.sdk.dir=pikpak-kotlin\n' >> local.properties
+            printf 'sdk.dir=%s\n' "$SDK" > pikpak-kotlin/local.properties
+          fi
+
+      # setup-gradle 只缓存 ~/.gradle，不缓存 ~/.konan（K/N 编译器、LLVM 与系统框架静态缓存）。
+      # 按系统架构、Xcode 构建号与依赖版本哈希缓存，避免每次重下工具链并重编平台库缓存。
+      - name: Cache Kotlin/Native
+        uses: actions/cache@v5
+        with:
+          path: ~/.konan
+          key: konan-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-ver.outputs.kotlin }}-${{ steps.xcode-ver.outputs.build }}-${{ hashFiles('gradle/libs.versions.toml', 'shared/src/nativeInterop/**', 'pikpak-kotlin/gradle/libs.versions.toml', 'pikpak-kotlin/src/**') }}
+          restore-keys: |
+            konan-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-ver.outputs.kotlin }}-${{ steps.xcode-ver.outputs.build }}-
+
+      - uses: gradle/actions/setup-gradle@v5
+
+      - name: Run iOS simulator tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew :shared:iosSimulatorArm64Test :ui:iosSimulatorArm64Test --build-cache --no-daemon --console=plain --stacktrace
+
+      - name: Build iOS 15 host
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v xcodegen >/dev/null || brew install xcodegen
+          cd iosApp
+          xcodegen generate
+          # 模拟器不能传 CODE_SIGNING_ALLOWED=NO：那会跳过 ProcessProductPackaging，导致二进制缺少
+          # __TEXT,__entitlements 段而在启动读 Keychain 时报 OSStatus=-34018；也不能事后用 codesign
+          # 直接写入受限受权（macOS AMFI 会以 error=162 拒绝启动）。显式指定模拟器原生 ad-hoc 签名
+          # （CODE_SIGN_IDENTITY="-" 且清空团队），由 Xcode 将模拟受权写入 __TEXT,__entitlements 段。
+          xcodebuild -project Piko.xcodeproj -scheme Piko -configuration Debug \
+            -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "$RUNNER_TEMP/piko-ios" \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="-" \
+            PROVISIONING_PROFILE_SPECIFIER="" DEVELOPMENT_TEAM="" PIKO_TEAM_ID="" \
+            build 2>&1 | tee "$RUNNER_TEMP/piko-ios-build.log"
+          APP="$RUNNER_TEMP/piko-ios/Build/Products/Debug-iphonesimulator/Piko.app"
+          test -f "$APP/Piko"
+          MIN_OS=$(/usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist")
+          test "$MIN_OS" = '15.0'
+          xcrun vtool -show-build "$APP/Piko" | tee "$RUNNER_TEMP/piko-ios-deployment.txt"
+          otool -l "$APP/Piko" | grep -A3 "__entitlements"
+          codesign --verify --deep --strict "$APP"
+
+      - name: Launch simulator host
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 释放前序构建与单测可能残留的 JVM/Kotlin 进程和已启动模拟器，避免 7GB runner 双开模拟器引发内存抖动。
+          ./gradlew --stop || true
+          pkill -f KotlinCompileDaemon || true
+          xcrun simctl shutdown all || true
+          {
+            echo "=== pre-boot memory ==="
+            vm_stat || true
+            sysctl vm.swapusage || true
+          } > "$RUNNER_TEMP/piko-sim-env.log"
+          python3 - <<'PY'
+          import json, os, subprocess
+          runtimes = json.loads(subprocess.check_output(['xcrun', 'simctl', 'list', 'runtimes', '--json']))['runtimes']
+          devices = json.loads(subprocess.check_output(['xcrun', 'simctl', 'list', 'devices', 'available', '--json']))['devices']
+          choices = []
+          for runtime in runtimes:
+              if not runtime.get('isAvailable') or not runtime['identifier'].startswith('com.apple.CoreSimulator.SimRuntime.iOS-'):
+                  continue
+              for device in devices.get(runtime['identifier'], []):
+                  if device.get('isAvailable') and device['name'].startswith('iPhone'):
+                      choices.append((tuple(int(x) for x in runtime['version'].split('.') if x.isdigit()), runtime, device))
+          assert choices, 'No available iPhone simulator'
+          _, runtime, device = min(choices, key=lambda item: item[0])
+          print('Selected simulator runtime:', runtime['version'], 'device:', device['name'], device['udid'])
+          with open(os.environ['GITHUB_ENV'], 'a') as output:
+              output.write(f"PIKO_SIMULATOR_ID={device['udid']}\n")
+          subprocess.run(['xcrun', 'simctl', 'boot', device['udid']], check=True)
+          PY
+
+      - name: Verify simulator launch
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcrun simctl bootstatus "$PIKO_SIMULATOR_ID" -b
+          {
+            echo "=== post-boot memory ==="
+            vm_stat || true
+            sysctl vm.swapusage || true
+          } >> "$RUNNER_TEMP/piko-sim-env.log"
+          xcrun simctl install "$PIKO_SIMULATOR_ID" "$RUNNER_TEMP/piko-ios/Build/Products/Debug-iphonesimulator/Piko.app"
+          LAUNCH_OUT=$(xcrun simctl launch --terminate-running-process \
+            --stdout="$RUNNER_TEMP/piko-sim-stdout.log" \
+            --stderr="$RUNNER_TEMP/piko-sim-stderr.log" \
+            "$PIKO_SIMULATOR_ID" dev.piko.pikpak.ios)
+          echo "$LAUNCH_OUT"
+          APP_PID=$(awk '{print $NF}' <<< "$LAUNCH_OUT" | tr -d '\r')
+          test -n "$APP_PID"
+          # 连续观察 18 秒确认同一次启动的进程持续存活，不因瞬时存活误判通过，也不自动重启掩盖崩溃。
+          for check in 1 2 3 4 5 6; do
+            sleep 3
+            ps -p "$APP_PID" -o pid=,etime=,rss=,command=
+            xcrun simctl spawn "$PIKO_SIMULATOR_ID" launchctl list | awk -v pid="$APP_PID" '$1 == pid && /dev\.piko\.pikpak\.ios/ { ok=1 } END { exit !ok }'
+          done
+          grep -q "App started:" "$RUNNER_TEMP/piko-sim-stdout.log"
+          grep -q "showing sign-in" "$RUNNER_TEMP/piko-sim-stdout.log"
+          ! grep -q "Uncaught exception" "$RUNNER_TEMP/piko-sim-stdout.log"
+          xcrun simctl io "$PIKO_SIMULATOR_ID" screenshot "$RUNNER_TEMP/piko-sim-screen.png" || true
+
+      - name: Collect simulator diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          DIAG="$RUNNER_TEMP/piko-sim-diag"
+          mkdir -p "$DIAG/host-crashes" "$DIAG/sim-crashes" "$DIAG/app-logs"
+          {
+            echo "=== failure memory & processes ==="
+            vm_stat || true
+            sysctl vm.swapusage || true
+            ps -axo pid,ppid,rss,%cpu,etime,command | head -n 80 || true
+            echo "=== simctl devices ==="
+            xcrun simctl list devices booted || true
+          } > "$DIAG/host-state.txt" 2>&1
+          if [ -n "${PIKO_SIMULATOR_ID:-}" ]; then
+            xcrun simctl spawn "$PIKO_SIMULATOR_ID" launchctl list | grep -Ei 'PID|piko' > "$DIAG/launchctl-piko.txt" 2>&1 || true
+            xcrun simctl spawn "$PIKO_SIMULATOR_ID" log show --last 3m --style compact \
+              --predicate 'process == "Piko" OR eventMessage CONTAINS[c] "dev.piko.pikpak.ios" OR process == "SpringBoard" OR process == "runningboardd"' \
+              > "$DIAG/sim-unified.log" 2>&1 || true
+            DATA_DIR=$(xcrun simctl get_app_container "$PIKO_SIMULATOR_ID" dev.piko.pikpak.ios data 2>/dev/null || true)
+            if [ -n "$DATA_DIR" ] && [ -d "$DATA_DIR/Library/Application Support/logs" ]; then
+              cp -R "$DATA_DIR/Library/Application Support/logs/." "$DIAG/app-logs/" 2>/dev/null || true
+            fi
+            SIM_CR="$HOME/Library/Developer/CoreSimulator/Devices/$PIKO_SIMULATOR_ID/data/Library/Logs/DiagnosticReports"
+            [ -d "$SIM_CR" ] && cp -R "$SIM_CR/." "$DIAG/sim-crashes/" 2>/dev/null || true
+          fi
+          [ -d "$HOME/Library/Logs/DiagnosticReports" ] && cp -R "$HOME/Library/Logs/DiagnosticReports/." "$DIAG/host-crashes/" 2>/dev/null || true
+
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ios-simulator-test-results
+          path: |
+            shared/build/reports/tests/
+            shared/build/test-results/
+            ui/build/reports/tests/
+            ui/build/test-results/
+            ${{ runner.temp }}/piko-ios-build.log
+            ${{ runner.temp }}/piko-ios-deployment.txt
+            ${{ runner.temp }}/piko-sim-*.log
+            ${{ runner.temp }}/piko-sim-screen.png
+            ${{ runner.temp }}/piko-sim-diag/**
+          if-no-files-found: ignore
+          retention-days: 7

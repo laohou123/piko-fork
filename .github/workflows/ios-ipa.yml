@@ -1,0 +1,313 @@
+name: ios-ipa
+
+# 可复用 iOS 打包工作流：由 release.yml 在发版与演练中调用，也保留面板手动独立构建入口。
+# - 未配置签名密钥时走无签名 archive 并打包 Payload/ 为 .ipa（侧载工具自签后安装）；
+# - 已配置签名密钥时走正式签名与 exportArchive，签名失败直接报错，绝不静默回退为无签名包。
+# - 先单独执行 :ui:link<Config>FrameworkIosArm64 直接输出无缓冲日志与内存心跳，随后 xcodebuild
+#   内嵌的 embedAndSignAppleFrameworkForXcode 直接命中 UP-TO-DATE 并完成资源同步与宿主链接。
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 版本号（MAJOR.MINOR.PATCH）
+        type: string
+        default: '9.9.9'
+      version-code:
+        description: 构建号（CFBundleVersion）
+        type: string
+        default: '9009009'
+      configuration:
+        description: 构建配置
+        type: choice
+        options: [Release, Debug]
+        default: Release
+      export-method:
+        description: 导出方式（有签名时生效）
+        type: choice
+        options: [ad-hoc, development, app-store]
+        default: ad-hoc
+      pikpak-ref:
+        description: 可选：用源码构建 pikpak-kotlin（仅手动调试用，留空用正式发布版）
+        type: string
+        default: ''
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: true
+      version-code:
+        type: string
+        required: true
+      artifact-name:
+        type: string
+        default: ios-dist
+    secrets:
+      APPLE_TEAM_ID:
+        required: false
+      APPLE_BUNDLE_ID:
+        required: false
+      APPLE_CERT_P12_BASE64:
+        required: false
+      APPLE_CERT_PASSWORD:
+        required: false
+      APPLE_PROVISION_PROFILE_BASE64:
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-ios-ipa-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
+
+jobs:
+  ipa:
+    # 标准 macOS M1 runner 仅 7 GiB 内存，Release 静态链接峰值超过 5 GiB 余量不足；使用 14 GiB 的 Intel runner。
+    runs-on: macos-15-intel
+    timeout-minutes: 120
+    env:
+      VERSION: ${{ inputs.version || '9.9.9' }}
+      VERSION_CODE: ${{ inputs.version-code || '9009009' }}
+      CONFIGURATION_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.configuration || 'Release' }}
+      EXPORT_METHOD: ${{ github.event_name == 'workflow_dispatch' && inputs.export-method || 'ad-hoc' }}
+      PIKPAK_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.pikpak-ref || '' }}
+      PIKO_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      PIKO_BUNDLE_ID: ${{ secrets.APPLE_BUNDLE_ID }}
+      HAS_SIGNING: ${{ secrets.APPLE_TEAM_ID != '' && secrets.APPLE_CERT_P12_BASE64 != '' }}
+      PIKO_SKIP_KOTLIN_BUILD: 'NO'
+      GRADLE_OPTS: '-Dorg.gradle.daemon=false'
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Xcode and Kotlin version
+        id: xcode-ver
+        shell: bash
+        run: |
+          echo "build=$(xcodebuild -version | awk '/Build version/ {print $3}')" >> "$GITHUB_OUTPUT"
+          echo "kotlin=$(sed -n 's/^kotlin *= *"\([^"]*\)".*/\1/p' gradle/libs.versions.toml)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      # KMP 模块配置阶段仅需 sdk.dir 指向存在的 Android SDK 目录；iOS link 不触发任何 Android 编译任务，
+      # 无需调用 sdkmanager 拉取特定预览版 compileSdk（如 37.1），与 ios-native.yml 保持一致。
+      - name: Locate Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Library/Android/sdk}}"
+          test -d "$SDK"
+          {
+            echo "ANDROID_SDK_ROOT=$SDK"
+            echo "ANDROID_HOME=$SDK"
+          } >> "$GITHUB_ENV"
+          printf 'sdk.dir=%s\n' "$SDK" > local.properties
+
+      - name: Use pikpak-kotlin from source
+        if: env.PIKPAK_REF != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/NihilDigit/pikpak-kotlin.git "$RUNNER_TEMP/pikpak-kotlin"
+          git -C "$RUNNER_TEMP/pikpak-kotlin" checkout "$PIKPAK_REF"
+          printf 'pikpak.sdk.dir=%s\n' "$RUNNER_TEMP/pikpak-kotlin" >> local.properties
+          printf 'sdk.dir=%s\n' "$ANDROID_SDK_ROOT" > "$RUNNER_TEMP/pikpak-kotlin/local.properties"
+
+      - name: Cache Kotlin/Native
+        uses: actions/cache@v5
+        with:
+          path: ~/.konan
+          key: konan-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-ver.outputs.kotlin }}-${{ steps.xcode-ver.outputs.build }}-${{ hashFiles('gradle/libs.versions.toml', 'shared/src/nativeInterop/**') }}
+          restore-keys: |
+            konan-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode-ver.outputs.kotlin }}-${{ steps.xcode-ver.outputs.build }}-
+
+      # KGP 默认在 Gradle JVM 进程内运行 Native link（kotlin.native.disableCompilerDaemon=false），
+      # 统一将堆分给 Gradle 主进程并限制单 worker，避免多套进程叠加争抢 14 GiB 物理内存。
+      - name: Configure native linker memory
+        shell: bash
+        run: |
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          path = Path("gradle.properties")
+          text = path.read_text()
+          overrides = {
+              "org.gradle.jvmargs": "-Xmx8192m -XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8",
+              "kotlin.daemon.jvmargs": "-Xmx3072m -XX:MaxMetaspaceSize=768m",
+              "org.gradle.workers.max": "1",
+              "org.gradle.caching": "true",
+          }
+          lines = [line for line in text.splitlines() if line.split("=", 1)[0] not in overrides]
+          lines.extend(f"{key}={value}" for key, value in overrides.items())
+          path.write_text("\n".join(lines) + "\n")
+          PYCODE
+
+      - uses: gradle/actions/setup-gradle@v5
+
+      # 提前单独跑完整 Framework 链接：直接输出实时任务进度与内存/Swap 采样，避免被 Xcode Run Script 吞日志；
+      # 后续 xcodebuild 内的 embedAndSignAppleFrameworkForXcode 直接命中 UP-TO-DATE 并完成资源同步。
+      - name: Link PikoKit framework
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          (
+            while true; do
+              sleep 60
+              echo "[heartbeat $(date -u +%H:%M:%SZ)] swap: $(sysctl -n vm.swapusage 2>/dev/null || echo n/a)"
+            done
+          ) &
+          HEARTBEAT_PID=$!
+          trap 'kill "$HEARTBEAT_PID" 2>/dev/null || true' EXIT
+          ./gradlew ":ui:link${CONFIGURATION_NAME}FrameworkIosArm64" \
+            --no-daemon --max-workers=1 --console=plain --stacktrace 2>&1 | tee "$RUNNER_TEMP/kotlin-link.log"
+
+      - name: Install XcodeGen and generate project
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v xcodegen >/dev/null || brew install xcodegen
+          cd iosApp
+          xcodegen generate
+          ls -d Piko.xcodeproj
+
+      - name: Import signing identity
+        if: env.HAS_SIGNING == 'true'
+        env:
+          CERT_P12: ${{ secrets.APPLE_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          PROFILE: ${{ secrets.APPLE_PROVISION_PROFILE_BASE64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/app-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          printf '%s' "$CERT_P12" | openssl base64 -d -A -out "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$CERT_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+          security list-keychain -d user -s "$KEYCHAIN" login.keychain-db
+          security find-identity -v -p codesigning "$KEYCHAIN"
+          if [ -n "${PROFILE:-}" ]; then
+            printf '%s' "$PROFILE" | openssl base64 -d -A -out "$RUNNER_TEMP/profile.mobileprovision"
+            UUID_VALUE="$(security cms -D -i "$RUNNER_TEMP/profile.mobileprovision" | plutil -extract UUID raw -)"
+            mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+            cp "$RUNNER_TEMP/profile.mobileprovision" "$HOME/Library/MobileDevice/Provisioning Profiles/$UUID_VALUE.mobileprovision"
+          fi
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+      - name: Archive and export signed IPA
+        if: env.HAS_SIGNING == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd iosApp
+            xcodebuild archive \
+              -project Piko.xcodeproj \
+              -scheme Piko \
+              -configuration "$CONFIGURATION_NAME" \
+              -destination "generic/platform=iOS" \
+              -archivePath "$RUNNER_TEMP/Piko.xcarchive" \
+              -allowProvisioningUpdates \
+              "MARKETING_VERSION=$VERSION" \
+              "CURRENT_PROJECT_VERSION=$VERSION_CODE" \
+              "PIKO_TEAM_ID=$PIKO_TEAM_ID" \
+              "PIKO_BUNDLE_ID=${PIKO_BUNDLE_ID:-dev.piko.pikpak.ios}" \
+              2>&1 | tee "$RUNNER_TEMP/archive-signed.log"
+          )
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>$EXPORT_METHOD</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>stripSwiftSymbols</key><true/>
+            <key>compileBitcode</key><false/>
+            <key>destination</key><string>export</string>
+            <key>teamID</key><string>$PIKO_TEAM_ID</string>
+          </dict>
+          </plist>
+          PLIST
+          plutil -lint "$RUNNER_TEMP/ExportOptions.plist"
+          rm -rf "$RUNNER_TEMP/export"
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/Piko.xcarchive" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -allowProvisioningUpdates \
+            2>&1 | tee "$RUNNER_TEMP/export.log"
+
+      - name: Archive unsigned app
+        if: env.HAS_SIGNING != 'true'
+        working-directory: iosApp
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild archive \
+            -project Piko.xcodeproj \
+            -scheme Piko \
+            -configuration "$CONFIGURATION_NAME" \
+            -destination "generic/platform=iOS" \
+            -archivePath "$RUNNER_TEMP/Piko-unsigned.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY= \
+            "MARKETING_VERSION=$VERSION" \
+            "CURRENT_PROJECT_VERSION=$VERSION_CODE" \
+            "PIKO_BUNDLE_ID=${PIKO_BUNDLE_ID:-dev.piko.pikpak.ios}" \
+            2>&1 | tee "$RUNNER_TEMP/archive-unsigned.log"
+
+      - name: Collect and verify IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          OUT="dist/piko-ios-arm64-$VERSION.ipa"
+          shopt -s nullglob
+          if [ "$HAS_SIGNING" = 'true' ]; then
+            signed_ipas=("$RUNNER_TEMP"/export/*.ipa)
+            test "${#signed_ipas[@]}" -gt 0
+            cp "${signed_ipas[0]}" "$OUT"
+          else
+            APP="$RUNNER_TEMP/Piko-unsigned.xcarchive/Products/Applications/Piko.app"
+            test -f "$APP/Piko"
+            rm -rf "$RUNNER_TEMP/unsigned"
+            mkdir -p "$RUNNER_TEMP/unsigned/Payload"
+            cp -R "$APP" "$RUNNER_TEMP/unsigned/Payload/"
+            (cd "$RUNNER_TEMP/unsigned" && zip -qry "$GITHUB_WORKSPACE/$OUT" Payload)
+          fi
+          test -s "$OUT"
+          unzip -l "$OUT" "Payload/Piko.app/Piko" > /dev/null
+          unzip -p "$OUT" "Payload/Piko.app/Info.plist" > "$RUNNER_TEMP/ipa-Info.plist"
+          test "$(plutil -extract MinimumOSVersion raw "$RUNNER_TEMP/ipa-Info.plist")" = "15.0"
+          test "$(plutil -extract CFBundleShortVersionString raw "$RUNNER_TEMP/ipa-Info.plist")" = "$VERSION"
+          ls -lh dist
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: ios-build-logs-${{ github.run_number }}
+          path: |
+            ${{ runner.temp }}/*.log
+            shared/build/reports/**
+            ui/build/reports/**
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: ${{ inputs.artifact-name || format('piko-ipa-{0}', github.run_number) }}
+          path: dist/*
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7

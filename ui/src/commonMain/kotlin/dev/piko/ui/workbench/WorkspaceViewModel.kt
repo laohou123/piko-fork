@@ -3,6 +3,8 @@ package dev.piko.ui.workbench
 import dev.piko.shared.i18n.tr
 
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelStore
+import androidx.lifecycle.ViewModelStoreOwner
 import androidx.lifecycle.viewModelScope
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.getValue
@@ -42,7 +44,7 @@ internal class WorkspaceViewModel(private val services: PikoServices, private va
     private var closed = false
     private val repository = services.driveRepository
     private val available: Boolean get() = !closed && repository.currentAccount == account
-    val fileCommands = dev.piko.shared.presentation.FileCommands(repository, services.fileWrites, account, services.trashSession, services.folderVaultSession, services.vaultEntryEdits, services.shareSaves, services.receivingActivity) {
+    val fileCommands = dev.piko.shared.presentation.FileCommands(repository, services.fileWrites, account, services.folderVaultSession, services.receivingActivity) {
         !closed && repository.currentAccount == account
     }
     init {
@@ -87,6 +89,41 @@ internal class WorkspaceViewModel(private val services: PikoServices, private va
     val importModels = mutableStateMapOf<Long, AddLinkViewModel>()
     private val importViews = mutableMapOf<Long, dev.piko.ui.screens.instant.ImportWorkspaceViewState>()
     fun importView(id: Long) = importViews.getOrPut(id) { dev.piko.ui.screens.instant.ImportWorkspaceViewState() }
+    private val tabViewModelStores = mutableMapOf<Long, ViewModelStore>()
+    fun tabViewModelOwner(tabId: Long): ViewModelStoreOwner {
+        val store = tabViewModelStores.getOrPut(tabId) { ViewModelStore() }
+        return object : ViewModelStoreOwner {
+            override val viewModelStore: ViewModelStore = store
+        }
+    }
+    var ongoingWorkShown by mutableStateOf(false)
+    var askingCloseFeed by mutableStateOf(false)
+    var shortcutsOpen by mutableStateOf(false)
+    var paletteOpen by mutableStateOf(false)
+    var pathLookup by mutableStateOf<Deferred<Result<List<PikoPathBreadcrumb>>>?>(null)
+        private set
+
+    suspend fun awaitPathLookup(fileId: String): Result<List<PikoPathBreadcrumb>>? {
+        val lookup = lookupPath(fileId)
+        pathLookup = lookup
+        return try {
+            lookup.await()
+        } catch (_: CancellationException) {
+            kotlinx.coroutines.currentCoroutineContext().let { ctx ->
+                if (ctx[Job]?.isActive == false) throw CancellationException("调用方已取消")
+            }
+            null
+        } finally {
+            lookup.cancel()
+            if (pathLookup === lookup) pathLookup = null
+        }
+    }
+
+    fun cancelPathLookup() {
+        pathLookup?.cancel()
+        pathLookup = null
+    }
+
     private val duplicateBrowsers = mutableMapOf<Long, DriveBrowserSession>()
     private val contextOrigins = mutableMapOf<Long, ExternalOrigin>()
     private val fileOrigins = mutableStateMapOf<Long, ExternalOrigin>()
@@ -166,6 +203,9 @@ internal class WorkspaceViewModel(private val services: PikoServices, private va
 
     fun activatePrimaryFileBrowser(): Long = driveWorkspace.activatePrimaryFileBrowser()
     fun canCloseContext(id: Long): Boolean = driveWorkspace.canCloseContext(id)
+    fun canPinContext(id: Long): Boolean = available && driveWorkspace.canPinTab(id)
+    fun isContextPinned(id: Long): Boolean = driveWorkspace.isTabPinned(id)
+    fun togglePinContext(id: Long): Boolean = available && driveWorkspace.togglePinTab(id)
 
     fun pushLibrary(library: DriveLibrary, tab: MainTab = lastMainTab, screens: List<Screen> = lastNavigation) {
         if (!available) return
@@ -236,7 +276,7 @@ internal class WorkspaceViewModel(private val services: PikoServices, private va
         val model = importModels[id]
         val draft = model?.state
         val unsubmittedInput = draft != null && !draft.isBlank && !draft.isSaving && draft.batch?.isSaving != true &&
-            !draft.hasRetainedInstantAttempt && !draft.hasRetainedShareWork && !draft.hasRetainedOfflineSubmission
+            !draft.hasRetainedInstantAttempt && !draft.hasRetainedOfflineSubmission
         val isDuplicateContext = contexts.contextsFlow.value.any { it.id == id && it is WorkspaceContext.Duplicate }
         val hasAddLinkOnTab = hasUncommittedAddLinkOnTab(id)
         val hasGalleryOnTab = hasGalleryOnTab(id)
@@ -270,6 +310,7 @@ internal class WorkspaceViewModel(private val services: PikoServices, private va
 
     private fun releaseContext(id: Long) {
         if (services.addLink.ownerTabId == id) services.addLink.forceDiscard()
+        tabViewModelStores.remove(id)?.clear()
         detailPanels.forgetWhere { it is dev.piko.shared.presentation.TabNavigation && it.tabId == id }
         pageSnapshots.remove(id)
         contextOrigins.remove(id)
@@ -315,7 +356,7 @@ internal class WorkspaceViewModel(private val services: PikoServices, private va
         check(!closed && services.driveRepository.currentAccount == account) { "工作区已释放或账号已改变" }
         return DriveBrowserSession(
             services.driveRepository, services.preferences, duplicates,
-            services.archiveBrowser, services.trashSession, viewModelScope, library, path,
+            services.archiveBrowser, viewModelScope, library, path,
             fileNavigation = navigation,
             clipboard = fileWorkspace.clipboard,
             operationScope = services.fileExecutionScopes.forAccount(account),
@@ -323,7 +364,6 @@ internal class WorkspaceViewModel(private val services: PikoServices, private va
             historyEdits = services.historyEdits,
             vaultEdits = services.vaultEntryEdits,
             folderVault = services.folderVaultSession,
-            shareSaves = services.shareSaves,
             receiving = services.receivingActivity,
             instantSession = services.instantSession,
             addLinkOwnerTabId = { services.addLink.ownerTabId },
@@ -355,21 +395,7 @@ internal class WorkspaceViewModel(private val services: PikoServices, private va
             }
         }
     }
-    val transfers: TransfersState by lazy {
-        check(!closed && services.driveRepository.currentAccount == account)
-        TransfersState(
-            services.downloadManager, services.taskRepository, services.offlinePacks,
-            viewModelScope, services.driveRepository, services.uploadManager,
-            services.instantSaveRecords, account, services.archiveExtractSession,
-            services.folderVaultSession, listsServerWork = true,
-            cleanup = services.trashSession,
-            fileWrites = services.fileWrites,
-            historyEdits = services.historyEdits,
-            vaultEdits = services.vaultEntryEdits,
-            shareSaves = services.shareSaves,
-            receiving = services.receivingActivity,
-        )
-    }
+    val transfers: TransfersState get() = services.taskCenter
     fun rememberContextOrigin(
         id: Long, tab: MainTab, screens: List<Screen>,
         sourceContextId: Long? = contexts.activeContextId.value.takeIf { it != id },
@@ -395,6 +421,9 @@ internal class WorkspaceViewModel(private val services: PikoServices, private va
         contexts.contextsFlow.value.filter { it !is WorkspaceContext.File }.toList().forEach { closeContext(it.id) }
         driveWorkspace.onContextClosed = {}
         releaseSaveTarget()
+        cancelPathLookup()
+        tabViewModelStores.values.forEach(ViewModelStore::clear)
+        tabViewModelStores.clear()
         tabs.close()
         detailPanels.clear()
         importViews.clear()
@@ -407,10 +436,3 @@ internal class WorkspaceViewModel(private val services: PikoServices, private va
 internal val LocalFileWorkspace = staticCompositionLocalOf<FileWorkspace> { error("文件工作区未提供") }
 
 internal val LocalWorkspaceContexts = staticCompositionLocalOf<WorkspaceViewModel?> { null }
-
-/** Minimizing an inactive view must not steal focus from another retained work item. */
-internal fun WorkspaceContexts.minimizeToFile(id: Long, fileId: Long) {
-    if (activeContextId.value == id && contextsFlow.value.any { it.id == fileId && it is WorkspaceContext.File }) {
-        activate(fileId)
-    }
-}

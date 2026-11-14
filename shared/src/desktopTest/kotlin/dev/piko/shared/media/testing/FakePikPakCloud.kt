@@ -56,12 +56,16 @@ internal class FakePikPakCloud(
     private val unreadableTranscodeHeight: Int? = null,
     /** 测试可挂起后续块，让暂停发生在确定的部分下载状态。 */
     private val beforeCdnResponse: (suspend () -> Unit)? = null,
+    private val beforeCdnRange: (suspend (Long) -> Unit)? = null,
+    private val beforeCdnChunk: (suspend (Long) -> Unit)? = null,
 ) {
     val detailCalls = AtomicInteger()
     val cdnRequests = AtomicInteger()
     val expiredResponses = AtomicInteger()
     val overBudgetResponses = AtomicInteger()
     val deliveredCdnBytes = java.util.concurrent.atomic.AtomicLong()
+    val activeCdnRequests: Int get() = inFlightByUrl.values.sumOf { it.get() }
+    val cdnRanges = java.util.concurrent.CopyOnWriteArrayList<LongRange>()
 
     private val generationLock = Any()
     private var generation = 1
@@ -96,7 +100,13 @@ internal class FakePikPakCloud(
                 json("""{"access_token":"AT","refresh_token":"RT","sub":"U","expires_in":3600}""")
             request.method == HttpMethod.Get && path.contains("/drive/v1/files/") -> {
                 detailCalls.incrementAndGet()
-                json(detailJson())
+                val full = detailJson()
+                val body = if (request.url.parameters["usage"] == io.github.nihildigit.pikpak.FILE_USAGE_FETCH) {
+                    val codec = kotlinx.serialization.json.Json
+                    val serializer = io.github.nihildigit.pikpak.FileDetail.serializer()
+                    codec.encodeToString(serializer, codec.decodeFromString(serializer, full).copy(medias = emptyList()))
+                } else full
+                json(body)
             }
             else -> respond("", HttpStatusCode.NotFound, headersOf(HttpHeaders.ContentType, "application/json"))
         }
@@ -160,19 +170,24 @@ internal class FakePikPakCloud(
             beforeCdnResponse?.invoke()
             currentCoroutineContext().ensureActive()
             val (start, endInclusive) = parseRange(request.headers[HttpHeaders.Range], body.size.toLong())
+            cdnRanges.add(start..endInclusive)
+            beforeCdnRange?.invoke(start)
+            currentCoroutineContext().ensureActive()
             val length = (endInclusive - start + 1).toInt()
             val channel = ByteChannel(autoFlush = true)
             streaming = true
-            streamScope.launch {
+            val producerJob = streamScope.launch {
                 try {
                     var offset = start.toInt()
                     val endExclusive = endInclusive.toInt() + 1
-                    while (offset < endExclusive && !channel.isClosedForWrite) {
-                        while (channel.availableForRead > 0 && !channel.isClosedForWrite) {
+                    while (offset < endExclusive && !channel.isClosedForWrite && !channel.isClosedForRead) {
+                        while (channel.availableForRead > 0 && !channel.isClosedForWrite && !channel.isClosedForRead) {
                             kotlinx.coroutines.yield()
                         }
-                        if (channel.isClosedForWrite) break
-                        val chunk = minOf(16 * 1024, endExclusive - offset)
+                        if (channel.isClosedForWrite || channel.isClosedForRead) break
+                        beforeCdnChunk?.invoke(offset.toLong())
+                        if (channel.isClosedForWrite || channel.isClosedForRead) break
+                        val chunk = minOf(STREAM_CHUNK_BYTES, endExclusive - offset)
                         channel.writeFully(body, offset, offset + chunk)
                         deliveredCdnBytes.addAndGet(chunk.toLong())
                         offset += chunk
@@ -184,6 +199,13 @@ internal class FakePikPakCloud(
                     inFlight.decrementAndGet()
                 }
             }
+            val completionHandle = request.executionContext.invokeOnCompletion { cause ->
+                if (cause != null) {
+                    channel.cancel(cause)
+                    producerJob.cancel()
+                }
+            }
+            producerJob.invokeOnCompletion { completionHandle.dispose() }
             return respond(
                 content = channel,
                 status = HttpStatusCode.PartialContent,
@@ -224,6 +246,7 @@ internal class FakePikPakCloud(
     )
 
     companion object {
+        const val STREAM_CHUNK_BYTES = 16 * 1024
         const val CDN_HOST = "cdn.test"
         const val PER_URL_CONNECTION_CAP = 8
         private const val UNREADABLE = "tunreadable"

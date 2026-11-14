@@ -29,12 +29,12 @@ import dev.piko.ui.components.PikoSheet
 import dev.piko.ui.components.TooltipIconButton
 import dev.piko.ui.components.pageFocusTarget
 
-// 桌面上添加链接的两种形态，由主界面按右栏放不放得下挑一种。移动端在网盘页底部的 TaskSheet 里，不经这里。
-// 预览一律不先收起面板：桌面的播放器是独立窗口，面板盖不住它，看完回来接着挑。
+// 宽窗口并列右栏容纳添加链接时的停靠容器（解析后的结果工作区见 ResolvedImportWorkspace）。
+// 预览一律不先收起面板：桌面播放器是独立窗口，面板盖不住它，看完回来接着挑。
 
 /**
- * 停在右栏里的添加链接，与信息流同一栏、同一时刻只放一样，见 ui/CLAUDE.md 的「右侧那一栏」。
- * 打开即取得焦点：下一步多半是粘贴链接，右栏里的 Esc 也要当场能收起它。
+ * 停在右栏里的添加链接，与信息流同一栏、同一时刻只放一样，见 ui/AGENTS.md。
+ * 打开即取得焦点：下一步多半是粘贴链接，右栏里的 Esc 也会触发当前草稿的关闭/放弃流程。
  */
 @Composable
 fun DockedAddLink(
@@ -77,7 +77,7 @@ fun rememberDiscardAddLink(session: AddLinkViewModel): () -> Unit {
         PikoDialog(
             onDismissRequest = { asking = false },
             title = { Text(stringResource(Res.string.text_close_add_link)) },
-            text = { Text(if (session.state?.saveIssue != null || session.state?.shareSave?.hasPendingResult == true || session.state?.batch?.rows?.any { it.state.saveIssue != null } == true)
+            text = { Text(if (session.state?.saveIssue != null || session.state?.batch?.rows?.any { it.state.saveIssue != null } == true)
                 tr("本次保存已有部分结果。已提交的请求不会取消，已保存文件保留；待确认的结果仍可在任务页查看。", "Some save results exist. Submitted requests continue and saved files are kept. Check unconfirmed results in Tasks.", "一部の保存結果があります。送信済みのリクエストは取り消されず、保存したファイルは保持します。未確認の結果はタスク画面で確認できます。", "일부 저장 결과가 있습니다. 제출된 요청은 취소되지 않으며 저장된 파일은 유지됩니다. 미확인 결과는 작업 페이지에서 확인할 수 있습니다.", "本次儲存已有部分結果。已提交的請求不會取消，已儲存的檔案將保留；待確認的結果仍可在任務頁查看。")
                 else tr("当前输入的链接和勾选的文件不会保存。", "Entered links and selected files will not be saved.", "入力したリンクと選択したファイルは保存されません。", "입력한 링크와 선택한 파일은 저장되지 않습니다.", "目前輸入的連結和勾選的檔案不會儲存。")) },
             confirmButton = {

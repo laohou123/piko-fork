@@ -2,6 +2,8 @@ package dev.piko.shared.data
 
 import dev.piko.shared.i18n.tr
 import dev.piko.shared.log.PikoLog
+import dev.piko.shared.log.logFailure
+import dev.piko.shared.log.logFolder
 import io.ktor.client.request.prepareRequest
 import io.ktor.http.decodeURLPart
 import io.ktor.http.encodedPath
@@ -86,9 +88,33 @@ internal fun httpResource(url: String, status: Int, headers: io.ktor.http.Header
     return MagnetResolutionResult(MagnetResource(name, listOf(file)), listOf(InstantFileItem(file, false)), 0, 1)
 }
 
+/**
+ * 从 `ed2k://|file|<文件名>|<字节数>|<MD4>|/` 本地零网络提取 URL 解码后的文件名与精确字节大小。
+ *
+ * 2026-11-01 实测 PikPak `POST /drive/v1/resource/list`：对 ed2k 链接一律返回 `resolver = "DIRECT"` 且无 `meta.hash`（GCID），
+ * 仅在提交离线下载任务（`createUrlFile`）后由服务端离线引擎按 MD4 命中云端缓存或拉取，因此直接本地解析展示条目并走离线提交。
+ */
+internal fun ed2kResource(uri: String): MagnetResolutionResult? {
+    val normalized = dev.piko.shared.state.normalizeEd2kUri(uri)
+    if (!normalized.startsWith("ed2k://|", ignoreCase = true)) return null
+    val parts = normalized.substring("ed2k://|".length).split('|')
+    if (parts.size < 4 || !parts[0].equals("file", ignoreCase = true)) return null
+    val rawName = parts[1]
+    val size = parts[2].toLongOrNull()?.coerceAtLeast(0L) ?: return null
+    val md4 = parts[3]
+    if (md4.length != 32 || !md4.all { it in '0'..'9' || it.lowercaseChar() in 'a'..'f' }) return null
+    val decodedName = runCatching { rawName.decodeURLPart() }.getOrDefault(rawName)
+        .substringAfterLast('/').substringAfterLast('\\').trim().ifBlank { "ed2k-$md4" }
+    val file = ResolvedFile(decodedName, size, null)
+    return MagnetResolutionResult(MagnetResource(decodedName, listOf(file)), listOf(InstantFileItem(file, false)), 0, 1)
+}
+
 internal class OfflinePruneBlocked(message: String) : IllegalStateException(message)
 
-class InstantMagnetRepository(private val clientManager: PikoClientProvider) {
+class InstantMagnetRepository(
+    private val clientManager: PikoClientProvider,
+    private val probeHttpClient: io.ktor.client.HttpClient? = null,
+) {
     private val savePermits = Semaphore(SAVE_CONCURRENCY)
     val offlineSubmissions = dev.piko.shared.state.OfflineSubmitSession(clientManager)
     private val client get() = clientManager.currentClient.value ?: error("Not logged in")
@@ -110,36 +136,42 @@ class InstantMagnetRepository(private val clientManager: PikoClientProvider) {
         val started = TimeSource.Monotonic.markNow()
         runSuspendCatching {
             val resource = client.resolveMagnet(magnet) ?: run {
-                PikoLog.i(TAG, "解析磁力：云端未收录，历时 ${started.elapsedNow().inWholeMilliseconds} ms")
+                PikoLog.i(TAG, "Magnet resolve: not indexed in cloud (elapsedMs=${started.elapsedNow().inWholeMilliseconds})")
                 return@withContext Result.success(null)
             }
             val items = resource.files.map { InstantFileItem(it, it.gcid != null) }
             MagnetResolutionResult(resource, items, items.count { it.isInstantReady }, items.size).also {
-                PikoLog.i(TAG, "解析磁力：${it.totalCount} 个文件，可秒传 ${it.instantReadyCount} 个，共 ${resource.files.sumOf { f -> f.size }} 字节，" +
-                    "历时 ${started.elapsedNow().inWholeMilliseconds} ms")
+                PikoLog.i(
+                    TAG,
+                    "Magnet resolved: files=${it.totalCount}, instantReady=${it.instantReadyCount}, bytes=${resource.files.sumOf { f -> f.size }}, elapsedMs=${started.elapsedNow().inWholeMilliseconds}",
+                )
             }
-        }.onFailure { PikoLog.d(TAG, "解析磁力失败，历时 ${started.elapsedNow().inWholeMilliseconds} ms，${it::class.simpleName}") }
+        }.logFailure(TAG, "Magnet resolve failed (elapsedMs=${started.elapsedNow().inWholeMilliseconds})")
     }
 
     /** 探测只读取响应头，不下载正文；普通网页和失败仍交给原有离线入口。 */
     suspend fun probeHttpResource(url: String): Result<MagnetResolutionResult?> = withContext(Dispatchers.Default) {
         runSuspendCatching {
+            val host = runCatching { io.ktor.http.Url(url).host.lowercase() }.getOrDefault("")
+            if (probeHttpClient == null && (host.isEmpty() || host == "example.com" || host == "example.org" || host == "example.net" ||
+                    host.endsWith(".invalid") || host.endsWith(".test") || host.endsWith(".example"))
+            ) {
+                return@withContext Result.success(null)
+            }
             kotlinx.coroutines.withTimeoutOrNull(4_000) {
-                val http = io.ktor.client.HttpClient()
-                try {
-                    var resource: MagnetResolutionResult? = null
-                    var needsRange = true
-                    http.prepareRequest(url) { method = io.ktor.http.HttpMethod.Head }.execute { response ->
-                        resource = httpResource(url, response.status.value, response.headers)
-                        needsRange = response.status.value !in 200..299 ||
-                            (resource != null && response.headers["Content-Length"]?.toLongOrNull() == null)
-                    }
-                    if (needsRange) http.prepareRequest(url) {
-                        method = io.ktor.http.HttpMethod.Get
-                        headers.append("Range", "bytes=0-0")
-                    }.execute { response -> resource = httpResource(url, response.status.value, response.headers) }
-                    resource
-                } finally { http.close() }
+                val http = probeHttpClient ?: defaultProbeClient
+                var resource: MagnetResolutionResult? = null
+                var needsRange = true
+                http.prepareRequest(url) { method = io.ktor.http.HttpMethod.Head }.execute { response ->
+                    resource = httpResource(url, response.status.value, response.headers)
+                    needsRange = response.status.value !in 200..299 ||
+                        (resource != null && response.headers["Content-Length"]?.toLongOrNull() == null)
+                }
+                if (needsRange) http.prepareRequest(url) {
+                    method = io.ktor.http.HttpMethod.Get
+                    headers.append("Range", "bytes=0-0")
+                }.execute { response -> resource = httpResource(url, response.status.value, response.headers) }
+                resource
             }
         }.fold({ Result.success(it) }, { Result.success(null) })
     }
@@ -238,16 +270,19 @@ class InstantMagnetRepository(private val clientManager: PikoClientProvider) {
         val files = readyItems.map { it.file }
         val reused = files.count { it.gcid in reuse }
         val renamed = files.count { names[it.path].let { name -> name != null && name != it.name } }
-        val summary = "${files.size} 个文件（跳过无 gcid 的 ${items.size - files.size} 个，移用预览副本 $reused 个，按番号改名 $renamed 个），" +
-            "${files.sumOf { it.size }} 字节，到文件夹 ${targetParentId.ifEmpty { "根目录" }}${if (keepStructure) "，保留目录结构" else ""}"
+        val summary = "files=${files.size}, skippedNoGcid=${items.size - files.size}, reusedPreview=$reused, renamed=$renamed, " +
+            "bytes=${files.sumOf { it.size }}, target=${logFolder(targetParentId)}, keepStructure=$keepStructure"
         val folderIds = existingFolders.toMutableMap().apply { put("", targetParentId) }
         val freshlyCreatedFolderIds = HashSet<String>().apply {
             if (targetIsFreshFolder && targetParentId.isNotEmpty()) add(targetParentId)
         }
         var creatingFolder: String? = null
         val directories = if (keepStructure) files.flatMap { ancestorsOf(it.path) }.distinct().sortedBy { it.count { c -> c == '/' } } else emptyList()
+        if (referenceVault != null) {
+            PikoLog.i(TAG, "Reference save started: $summary, subdirs=${directories.size}")
+        }
         val prepared = runSuspendCatching {
-            for (level in directories.groupBy { it.count { c -> c == '/' } }.toSortedMap().values) {
+            for (level in directories.groupBy { it.count { c -> c == '/' } }.entries.sortedBy { it.key }.map { it.value }) {
                 val results = coroutineScope {
                     level.filterNot { it in folderIds }.map { dir ->
                         async {
@@ -280,6 +315,12 @@ class InstantMagnetRepository(private val clientManager: PikoClientProvider) {
         onFoldersResolved(folderIds.toMap())
         if (prepared.isFailure) {
             val error = prepared.exceptionOrNull()!!
+            val mode = if (referenceVault != null) "reference save" else "instant save"
+            PikoLog.w(
+                TAG,
+                "Subfolder creation failed during $mode ($summary, createdFolders=${freshlyCreatedFolderIds.size}, unconfirmedFolder=${creatingFolder != null}, elapsedMs=${started.elapsedNow().inWholeMilliseconds})",
+                error,
+            )
             val receipt = InstantSaveReceipt(owner.account, targetParentId,
                 notAttempted = files.mapTo(HashSet()) { it.path }, folders = folderIds.toMap(),
                 unconfirmedFolder = creatingFolder)
@@ -346,9 +387,19 @@ class InstantMagnetRepository(private val clientManager: PikoClientProvider) {
                 if (freshlyCreatedFolderIds.isNotEmpty()) {
                     onFreshVaultFolders(freshlyCreatedFolderIds.toSet())
                 }
+                PikoLog.i(
+                    TAG,
+                    "Reference save completed: confirmed=${confirmed.size}, targetFolders=${batches.size}, freshFolders=${freshlyCreatedFolderIds.size}, target=${logFolder(targetParentId)}, elapsedMs=${started.elapsedNow().inWholeMilliseconds}",
+                )
                 Result.success(files.map { confirmed.getValue(it.path) })
             } else {
-                Result.failure(InstantSaveIncomplete(receipt, failure ?: IllegalStateException("引用保存待确认")))
+                val cause = failure ?: IllegalStateException("引用保存待确认")
+                PikoLog.w(
+                    TAG,
+                    "Reference save incomplete: confirmed=${confirmed.size}, unconfirmed=${unknown.size}, notAttempted=${remaining.size}, targetFolders=${batches.size}, target=${logFolder(targetParentId)}, elapsedMs=${started.elapsedNow().inWholeMilliseconds}",
+                    cause,
+                )
+                Result.failure(InstantSaveIncomplete(receipt, cause))
             }
         }
         val consumedPreviews = HashSet<String>()
@@ -393,9 +444,18 @@ class InstantMagnetRepository(private val clientManager: PikoClientProvider) {
             saved.size == 1 && receipt.confirmed.isEmpty() && receipt.failed.size == 1 && errors.single() is InstantContentUnavailableException -> Result.failure(errors.single())
             else -> Result.failure(InstantSaveIncomplete(receipt, errors.first()))
         }
-        return result.onSuccess { PikoLog.i(TAG, "秒传完成：$summary，历时 ${started.elapsedNow().inWholeMilliseconds} ms") }
-            // 堆栈由调用方连同给用户的提示一起记
-            .onFailure { PikoLog.w(TAG, "秒传失败：$summary，${it::class.simpleName}") }
+        return result
+            .onSuccess {
+                PikoLog.i(TAG, "Instant save completed: $summary, elapsedMs=${started.elapsedNow().inWholeMilliseconds}")
+            }
+            .onFailure { err ->
+                val cause = (err as? InstantSaveIncomplete)?.cause ?: err
+                PikoLog.w(
+                    TAG,
+                    "Instant save failed: $summary, confirmed=${receipt.confirmed.size}, failed=${receipt.failed.size}, unconfirmed=${receipt.unconfirmed.size}, namingUnconfirmed=${receipt.namingUnconfirmed.size}, elapsedMs=${started.elapsedNow().inWholeMilliseconds}",
+                    cause,
+                )
+            }
     }
 
     private data class InstantFileOutcome(val path: String, val id: String?, val error: Throwable?, val namingUnconfirmed: Boolean = false)
@@ -416,13 +476,19 @@ class InstantMagnetRepository(private val clientManager: PikoClientProvider) {
         requiresTask: Boolean = false): Result<CreateUrlResult> =
             offlineSubmissions.submit(magnet, PikoPathBreadcrumb(targetParentId, targetName), title, expectedAccount, requiresTask)
                 .onSuccess { result ->
-                    val kind = if (magnet.startsWith("magnet:", ignoreCase = true)) "磁力" else magnet.substringBefore("://", "其他").lowercase()
+                    val kind = if (magnet.startsWith("magnet:", ignoreCase = true)) "magnet" else magnet.substringBefore("://", "other").lowercase()
                     when (result) {
-                        is CreateUrlResult.Queued -> PikoLog.i(TAG, "已提交离线任务 ${result.task.id}（$kind），到文件夹 ${targetParentId.ifEmpty { "根目录" }}")
-                        is CreateUrlResult.InstantComplete -> PikoLog.i(TAG, "离线提交即完成，未建任务（$kind），产出 ${result.file?.id ?: "未知"}")
+                        is CreateUrlResult.Queued -> PikoLog.i(TAG, "Enqueued offline task ${result.task.id} (scheme=$kind, target=${logFolder(targetParentId)})")
+                        is CreateUrlResult.InstantComplete -> PikoLog.i(
+                            TAG,
+                            "Offline submission completed immediately without task (scheme=$kind, fileId=${result.file?.id ?: "unknown"}, target=${logFolder(targetParentId)})",
+                        )
                     }
                 }
-                .onFailure { PikoLog.w(TAG, "提交离线任务失败，到文件夹 ${targetParentId.ifEmpty { "根目录" }}，${it::class.simpleName}") }
+                .onFailure { err ->
+                    val cause = err.cause ?: err
+                    PikoLog.w(TAG, "Failed to enqueue offline task (target=${logFolder(targetParentId)}, error=${err::class.simpleName})", cause)
+                }
     suspend fun getTask(taskId: String): Result<DriveTask> = withContext(Dispatchers.Default) {
         runSuspendCatching { client.getTask(taskId) }
     }
@@ -441,7 +507,9 @@ class InstantMagnetRepository(private val clientManager: PikoClientProvider) {
                 owner.pruneOfflineOutput(task, keep)
             }
                 // 结果里是种子内的路径，只记条数
-                .onSuccess { PikoLog.i(TAG, "裁剪离线产出：任务 ${task.id}，保留 ${keep.size} 个，删除 ${it.deleted.size} 项，保留项缺失 ${it.missing.size} 个") }
+                .onSuccess {
+                    PikoLog.i(TAG, "Pruned offline output for task ${task.id}: keep=${keep.size}, deleted=${it.deleted.size}, missing=${it.missing.size}")
+                }
         }
 
     /** 删除任务记录。未完成任务的占位文件由服务端一并清掉，已完成任务的文件保留。 */
@@ -454,6 +522,7 @@ class InstantMagnetRepository(private val clientManager: PikoClientProvider) {
     private companion object {
         const val TAG = "Instant"
         const val SAVE_CONCURRENCY = 16
+        val defaultProbeClient by lazy { io.ktor.client.HttpClient() }
     }
 }
 

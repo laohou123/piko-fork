@@ -1,213 +1,486 @@
 package dev.piko.shared.state
 
 import dev.piko.shared.log.PikoLog
-import dev.piko.shared.log.logFailure
 import dev.piko.shared.log.logFile
+import dev.piko.shared.media.CLIP_SCAN_READ_AHEAD_BYTES
 import dev.piko.shared.media.PikoMediaRepository
 import dev.piko.shared.media.PreparedClip
+import dev.piko.shared.media.player.PlaybackBackend
+import dev.piko.shared.media.proxy.ProxyByteSource
+import io.github.nihildigit.pikpak.BufferBudget
+import io.github.nihildigit.pikpak.ConsumerIntent
+import io.github.nihildigit.pikpak.PlaybackBufferSnapshot
+import io.github.nihildigit.pikpak.ServiceIntent
 import io.github.nihildigit.pikpak.StreamRole
+import io.github.nihildigit.pikpak.TransferDemand
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
-import kotlinx.coroutines.cancelChildren
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.concurrent.Volatile
 import kotlin.time.Duration.Companion.seconds
 import kotlin.time.TimeSource
 
+/** 当前屏幕焦点片段的播放阶段。 */
+enum class FocusPlaybackState {
+    /** 正在等待首帧、缓冲恢复或定位落点。 */
+    Waiting,
+
+    /** 画面已在稳定推进播放。 */
+    Playing,
+
+    /** 用户在当前焦点页主动暂停。 */
+    Paused,
+}
+
 /**
- * 队列里各段的代理会话与预取。取流慢：查详情、取直链、连上 CDN、读到容器头与起点附近的数据，
- * 前后要好几秒，所以队列里的每一段都提前备好并预取，轮到播放器装它时读缓存；出了队列的关掉。
+ * 信息流屏幕的单一权威展示需求快照：
+ * 统一表达当前焦点页、冷启动/底部等待页正在等待的首个候补段，以及相邻预渲染页集合。
+ */
+data class ClipDisplayDemand(
+    val focusClip: Clip? = null,
+    val focusState: FocusPlaybackState = FocusPlaybackState.Waiting,
+    val awaitingClip: Clip? = null,
+    val prerenderingNeighbours: Set<Clip> = emptySet(),
+)
+
+/**
+ * 信息流各片段的流会话与预取调度器（仅在主线程调用，内部字典不加锁）。
  *
- * 候补里的段各自备会话、预取，取好的交给 [onReady] 接进翻页器，取不好的交给 [onDead]，见 [ripen]。
- * 翻页器里因此只有取好的段，翻到哪一段都有得放。
- *
- * 归 [ClipFeedSession] 所有，与进程同寿，换文件夹或关掉信息流时才清空，不随页面走：Android 上「看完整」是压在
- * 信息流之上的一页，信息流离开组合，原先挂在页面上的这份跟着关掉，回来时每段重备会话、重取开头，
- * 当前那段五秒多才重新走起来（2026-09-28）。播放器仍随页面，压栈页要用画面。
- *
- * 每段各自一个协程，不挂在会随翻页取消的任务上：连着快翻时每翻一页任务就重来，挂在上面的永远等不到取完。
- * 备会话要查详情，同时至多 [PREPARE_LANES] 个，几十段一起查容易被限流。
- * 空闲的会话不占连接，只占内存：每段的 reader 缓存着预取的与播过的部分。
- *
- * 主线程上的作用域，映射只在主线程上改，不必加锁。
+ * 每个 [Clip] 自始至终持有同一个 [TransferDemand]（跨详情查询、关键帧扫描、首尾预取与代理读取原地升降级）；
+ * 所有条目的 [ConsumerIntent] 均由单一权威 [ClipDisplayDemand] 快照与挂起态纯函数投影，不保留平行的前后台/急迫布尔开关。
  */
 class ClipStreams internal constructor(
     private val repository: PikoMediaRepository,
     private val onReady: (Clip) -> Unit,
     private val onDead: (Clip) -> Unit,
+    coroutineContext: kotlin.coroutines.CoroutineContext = Dispatchers.Main.immediate,
+    private val prepare: suspend (Clip, StreamRole, TransferDemand, ((ProxyByteSource) -> Unit)?) -> Result<PreparedClip> = { clip, role, owner, onByteSource ->
+        repository.prepareClip(clip.fileId, clip.startMs, clip.videoDurationMs, role, owner, onByteSource)
+    },
 ) {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    private val streams = mutableMapOf<Clip, Deferred<PreparedClip?>>()
-    private val ripening = mutableSetOf<Clip>()
-    private var foreground: Set<Clip> = emptySet()
-    private val preparing = Semaphore(PREPARE_LANES)
-    private val prefetching = Semaphore(PREFETCH_LANES)
+    internal constructor(
+        repository: PikoMediaRepository,
+        onReady: (Clip) -> Unit,
+        onDead: (Clip) -> Unit,
+        coroutineContext: kotlin.coroutines.CoroutineContext,
+        prepare: suspend (Clip, StreamRole, TransferDemand) -> Result<PreparedClip>,
+    ) : this(repository, onReady, onDead, coroutineContext, { clip, role, owner, _ -> prepare(clip, role, owner) })
 
-    @OptIn(ExperimentalCoroutinesApi::class)
-    private inline fun withPrepared(stream: Deferred<PreparedClip?>, crossinline action: (PreparedClip) -> Unit) {
-        if (stream.isCompleted) {
-            runCatching { stream.getCompleted() }.getOrNull()?.let(action)
-        } else {
-            scope.launch { runCatching { stream.await() }.getOrNull()?.let(action) }
+    private data class BoostWindow(val seconds: Int, val minBytes: Long)
+
+    private class Entry(val demand: TransferDemand) {
+        lateinit var result: Deferred<PreparedClip?>
+        @Volatile var byteSource: ProxyByteSource? = null
+        @Volatile var priorSourceBytes: Long = 0L
+        var prepared: PreparedClip? = null
+        var fetch: Job? = null
+        var wanted = false
+        var ready = false
+        var closed = false
+        var boostWindow: BoostWindow? = null
+        var feedbackOwner: Any? = null
+        var nativeGeneration = Long.MIN_VALUE
+        var epoch = 0L
+        var lastPlaybackSample: PlaybackBufferSnapshot? = null
+
+        fun attachSource(source: ProxyByteSource) {
+            val prev = byteSource
+            if (prev != null && prev !== source) {
+                priorSourceBytes += prev.receivedBytes
+            }
+            byteSource = source
+        }
+
+        fun receivedBytes(): Long =
+            priorSourceBytes + maxOf(byteSource?.receivedBytes ?: 0L, prepared?.receivedBytes ?: 0L)
+
+        fun isReactivating(): Boolean =
+            prepared?.isReactivating?.value == true || byteSource?.isReactivating?.value == true
+    }
+
+    private val scope = CoroutineScope(coroutineContext.minusKey(Job) + SupervisorJob())
+    private val preparing = PreparationQueue(backgroundSlots = 4)
+    private val prefetching = PreparationQueue(backgroundSlots = 2)
+    private val streams = mutableMapOf<Clip, Entry>()
+    private val ripenedOrder = ArrayList<Clip>()
+    private var retiredBytes = 0L
+    private var display = ClipDisplayDemand()
+    private val suspended = MutableStateFlow(false)
+
+    val displayDemand: ClipDisplayDemand get() = display
+
+    fun setSuspended(value: Boolean) {
+        if (suspended.value == value) return
+        suspended.value = value
+        for ((clip, entry) in streams) {
+            if (value) {
+                entry.fetch?.cancel()
+                entry.fetch = null
+            }
+            projectIntent(clip, entry)
+        }
+        if (!value) {
+            ripen(streams.filterValues { it.wanted && !it.ready }.keys.toList())
         }
     }
 
+    /** 原子更新信息流展示需求集合，并对全部活跃条目原地重投影 [ConsumerIntent]。 */
+    fun updateDisplayDemand(next: ClipDisplayDemand) {
+        if (display == next) return
+        display = next
+        reprojectAll()
+    }
+
+    /** 冷启动首段尚未刷出或停在底部等待页时，声明界面正在等待的候补片段。 */
+    fun setAwaitingClip(clip: Clip?) {
+        if (display.awaitingClip == clip) return
+        display = display.copy(awaitingClip = clip)
+        reprojectAll()
+    }
+
+    /** 更新当前焦点页的播放阶段（等待首帧/缓冲、稳定播放、用户暂停）。 */
+    fun updateFocusState(clip: Clip, state: FocusPlaybackState) {
+        if (display.focusClip != clip) {
+            display = display.copy(focusClip = clip, focusState = state)
+            reprojectAll()
+            return
+        }
+        if (display.focusState == state) return
+        display = display.copy(focusState = state)
+        streams[clip]?.let { projectIntent(clip, it) }
+    }
+
     /**
-     * 备好的会话一律以后台建起，装进播放器的由 [bringToFront] 升为前台。来源见 PikoMediaRepository.prepareClip。
-     *
-     * [forPlayer] 是播放器马上要装的，不跟候补排队备会话：接着上次看的那一段要现备，排在候补的二十几段后面
-     * 实测等了七八秒。这种至多三段，不至于招来限流。
+     * 将有序片段集合投影为「首项焦点页 + 其余相邻预渲染页」。
+     * 供无头基准工具与测试以集合形式一步声明前台焦点与邻居。
      */
-    fun get(clip: Clip, forPlayer: Boolean = false, urgent: Boolean = false): Deferred<PreparedClip?> =
-        streams.getOrPut(clip) {
-            // 要去取开头的段也以前台身份备会话：找关键帧读的就是开头，以后台身份读，槽满时排在所有预取之后
-            val role = if (clip in foreground || urgent) StreamRole.FOREGROUND else StreamRole.BACKGROUND
-            scope.async {
-                val started = TimeSource.Monotonic.markNow()
-                suspend fun prepare() = repository.prepareClip(clip.fileId, clip.startMs, clip.videoDurationMs, role)
-                    .logFailure(TAG, "备会话失败 ${logFile(clip.fileId, clip.name)}，${started.elapsedNow().inWholeMilliseconds} ms").getOrNull()
-                val prepared = (if (forPlayer) prepare() else preparing.withPermit { prepare() }) ?: return@async null
-                prepared.holdReadAhead()
-                PikoLog.d(
-                    TAG,
-                    "备好会话 ${logFile(clip.fileId, clip.name)}（${if (prepared.fromDisk) "磁盘切片" else if (prepared.sliced) "转码切片" else "原画"}，" +
-                        "${(prepared.streamBytes ?: 0) / 1024} KiB）：${started.elapsedNow().inWholeMilliseconds} ms，$role",
-                )
+    fun bringToFront(clips: Set<Clip>) {
+        val nextFocus = clips.firstOrNull()
+        val nextNeighbours = if (clips.size > 1 && nextFocus != null) clips - nextFocus else emptySet()
+        val preservedState = if (nextFocus != null && nextFocus == display.focusClip) {
+            display.focusState
+        } else {
+            val existing = nextFocus?.let { streams[it] }
+            if (existing != null && existing.result.isCompleted) FocusPlaybackState.Playing else FocusPlaybackState.Waiting
+        }
+        updateDisplayDemand(
+            display.copy(
+                focusClip = nextFocus,
+                focusState = preservedState,
+                prerenderingNeighbours = nextNeighbours,
+            ),
+        )
+    }
+
+    fun get(clip: Clip, forPlayer: Boolean = false, urgent: Boolean = false): Deferred<PreparedClip?> {
+        val existing = streams[clip]
+        val needsUrgent = urgent || (forPlayer && display.focusClip == null && existing?.result?.isCompleted != true)
+        if (needsUrgent && display.focusClip != clip) {
+            display = display.copy(focusClip = clip, focusState = FocusPlaybackState.Waiting)
+            reprojectAll()
+        } else if (urgent && display.focusClip == clip && display.focusState != FocusPlaybackState.Waiting) {
+            display = display.copy(focusState = FocusPlaybackState.Waiting)
+        } else if (forPlayer && display.focusClip != null && display.focusClip != clip && clip !in display.prerenderingNeighbours) {
+            display = display.copy(prerenderingNeighbours = display.prerenderingNeighbours + clip)
+        }
+        existing?.let {
+            projectIntent(clip, it)
+            return it.result
+        }
+        val initialDemand = repository.openTransferDemand(
+            ConsumerIntent(
+                epoch = 0L,
+                service = ServiceIntent.PREFETCH,
+                bufferBudget = BufferBudget.NONE,
+            ),
+        )
+        val entry = Entry(initialDemand)
+        streams[clip] = entry
+        projectIntent(clip, entry)
+        entry.result = scope.async(start = CoroutineStart.LAZY) {
+            preparing.run(entry.demand.priorityFlow) {
+                val role = if (entry.demand.intent.service == ServiceIntent.WAITING || entry.demand.intent.service == ServiceIntent.PLAYING) {
+                    StreamRole.FOREGROUND
+                } else {
+                    StreamRole.BACKGROUND
+                }
+                val prepared = prepare(
+                    clip,
+                    role,
+                    entry.demand,
+                    entry::attachSource,
+                ).getOrElse { error ->
+                    if (!entry.closed && error !is CancellationException) {
+                        PikoLog.w(
+                            TAG,
+                            "Failed to prepare clip stream for ${logFile(clip.fileId, clip.name)} " +
+                                "(startMs=${clip.startMs}, service=${entry.demand.intent.service}, priority=${entry.demand.priority})",
+                            error,
+                        )
+                    }
+                    return@run null
+                }
+                if (entry.closed) {
+                    prepared.close()
+                    return@run null
+                }
+                entry.prepared = prepared
+                projectIntent(clip, entry)
                 prepared
             }
         }
+        entry.result.start()
+        return entry.result
+    }
 
-    /**
-     * 让候补里还没开始的段各自去取：备会话、预取开头，取好了交给 [onReady]。
-     *
-     * 预取以前台身份发出，会话本身仍是后台：以后台身份，有段在放时每段只有两路在途，实测取好一段要五六秒，
-     * 连着翻就供不上。前台预取排在正在放的段之后，同一档里先提出的先取完（SDK 按需求先后排），
-     * 所以按队列顺序调用，最近要翻到的最先好，不必再自己限同时取几段。
-     * 取不到流的交给 [onDead]：会话打不开，或者 SDK 换过主机、重试过仍取不下来。
-     */
     fun ripen(upcoming: List<Clip>) {
+        ripenedOrder.clear()
+        ripenedOrder.addAll(upcoming)
         for (clip in upcoming) {
-            if (!ripening.add(clip)) continue
-            scope.launch {
-                val prepared = get(clip, urgent = true).await()
-                val fetched = prepared != null && fetchOnce(clip, prepared)
-                ripening -= clip
-                if (fetched) {
-                    onReady(clip)
-                } else {
-                    // 会话一并关掉：重取时重新备，拿新的直链。扔不扔由会话定，见 ClipFeedSession.drop
-                    PikoLog.d(TAG, "取不到 ${logFile(clip.fileId, clip.name)}")
-                    streams.remove(clip)?.let(::close)
-                    onDead(clip)
+            get(clip)
+            val entry = streams.getValue(clip)
+            entry.wanted = true
+        }
+        reprojectAll()
+        for (clip in upcoming) {
+            val entry = streams[clip] ?: continue
+            if (entry.ready || entry.fetch?.isActive == true || suspended.value) continue
+            entry.fetch = scope.launch {
+                try {
+                    val prepared = entry.result.await()
+                    if (prepared == null) {
+                        if (!entry.closed) {
+                            streams.remove(clip)
+                            ripenedOrder.remove(clip)
+                            close(entry)
+                            reprojectAll()
+                            onDead(clip)
+                        }
+                        return@launch
+                    }
+                    suspended.first { !it }
+                    prefetching.run(entry.demand.priorityFlow) {
+                        suspended.first { !it }
+                        val role = if (entry.demand.intent.service == ServiceIntent.WAITING) {
+                            StreamRole.FOREGROUND
+                        } else {
+                            StreamRole.BACKGROUND
+                        }
+                        withContext(entry.demand + Dispatchers.Default) { prepared.prefetch(role) }
+                    }
+                    entry.ready = true
+                    reprojectAll()
+                    if (!entry.closed) onReady(clip)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    if (!entry.closed) {
+                        PikoLog.w(
+                            TAG,
+                            "Failed to prefetch clip stream for ${logFile(clip.fileId, clip.name)} " +
+                                "(startMs=${clip.startMs}, receivedBytes=${entry.receivedBytes()})",
+                            e,
+                        )
+                        streams.remove(clip)
+                        ripenedOrder.remove(clip)
+                        close(entry)
+                        reprojectAll()
+                        onDead(clip)
+                    }
                 }
             }
         }
     }
 
-    private suspend fun fetchOnce(clip: Clip, prepared: PreparedClip): Boolean {
-        if (prepared.localPath != null) return true
-        var started = TimeSource.Monotonic.markNow()
-        val fetched = try {
-            prefetching.withPermit {
-                // 只对拿到预取车道后的真实网络下载计时，避免本地排队等待被误判为资源坏死踢出队列
-                started = TimeSource.Monotonic.markNow()
-                withTimeoutOrNull(RIPEN_TIMEOUT) {
-                    withContext(Dispatchers.Default) { prepared.prefetch(StreamRole.FOREGROUND) }
-                } != null
-            }
-        } catch (e: CancellationException) {
-            throw e
-        } catch (e: Exception) {
-            PikoLog.w(TAG, "预取 ${logFile(clip.fileId, clip.name)} 失败", e)
-            false
-        }
-        if (fetched) PikoLog.d(TAG, "取好 ${logFile(clip.fileId, clip.name)}：预取 ${started.elapsedNow().inWholeMilliseconds} ms")
-        else PikoLog.d(TAG, "预取 ${logFile(clip.fileId, clip.name)} 未完成：${started.elapsedNow().inWholeMilliseconds} ms，上限 ${RIPEN_TIMEOUT}")
-        return fetched
-    }
-
-    /**
-     * 装在播放器里的几段升为前台，其余降为后台。都不丢缓存。
-     *
-     * 不只当前段：下一段要在翻过去之前预渲染好第一帧，mpv 为此要依次读文件头、文件尾的索引与起点，
-     * 每一处都是一次新请求。以后台身份，它们与远处的预取同排在最后，只有两路在途，
-     * 实测一处要等 0.6 到 1.5 秒，几处串起来就赶不上翻页。
-     */
-    fun bringToFront(clips: Set<Clip>) {
-        val demoted = foreground - clips
-        foreground = clips
-        for ((clip, role) in demoted.map { it to StreamRole.BACKGROUND } + clips.map { it to StreamRole.FOREGROUND }) {
-            streams[clip]?.let { stream -> withPrepared(stream) { it.role = role } }
-        }
-    }
-
-    /** [clip] 真在看了，代理往后预读 [seconds] 秒（保底 [minBytes]），见 PreparedClip.extendReadAhead。 */
     fun boost(clip: Clip, seconds: Int, minBytes: Long = PreparedClip.MIN_AHEAD_BYTES) {
-        streams[clip]?.let { stream -> withPrepared(stream) { it.extendReadAhead(seconds, minBytes) } }
+        get(clip)
+        val entry = streams.getValue(clip)
+        entry.boostWindow = BoostWindow(seconds, minBytes)
+        projectIntent(clip, entry)
     }
 
-    /** 除 [clip] 外都压回只读开头，也不再算有人在等；升过档的段翻走后不该再往后取。 */
     fun holdAllBut(clip: Clip) {
-        for ((other, stream) in streams) {
-            if (other != clip) {
-                withPrepared(stream) {
-                    it.holdReadAhead()
-                    it.urgent = false
-                }
+        for ((other, entry) in streams) {
+            if (other != clip && entry.boostWindow != null) {
+                entry.boostWindow = null
+                projectIntent(other, entry)
             }
         }
     }
 
-    /** [clip] 是否有人正等着，见 PreparedClip.urgent。已就绪的会话当场同步写入，保证紧随其后的 seek 首块立享最高优先级。 */
-    fun setUrgent(clip: Clip, urgent: Boolean) {
-        streams[clip]?.let { stream -> withPrepared(stream) { it.urgent = urgent } }
+    fun bindPlayback(clip: Clip, owner: Any) {
+        get(clip, forPlayer = true)
+        val entry = streams.getValue(clip)
+        if (entry.feedbackOwner === owner) return
+        entry.feedbackOwner = owner
+        entry.nativeGeneration = Long.MIN_VALUE
+        entry.epoch++
+        entry.lastPlaybackSample = PlaybackBufferSnapshot(
+            generation = entry.epoch,
+            bufferedDuration = null,
+            sampledAt = TimeSource.Monotonic.markNow(),
+            mediaBytesPerSecond = entry.prepared?.estimatedBytesPerSecond,
+        )
+        projectIntent(clip, entry)
     }
 
-    /** 翻出 [window] 的段关掉会话；看过的在窗口里保留缓存，不再为它发请求。 */
+    fun reportPlaybackBuffer(clip: Clip, owner: Any, snapshot: PlaybackBufferSnapshot) {
+        val entry = streams[clip] ?: return
+        if (entry.feedbackOwner !== owner || snapshot.generation < entry.nativeGeneration) return
+        val wasUnset = entry.nativeGeneration == Long.MIN_VALUE
+        if (snapshot.generation > entry.nativeGeneration) {
+            entry.nativeGeneration = snapshot.generation
+            if (!wasUnset) {
+                entry.epoch++
+            }
+        }
+        val remapped = snapshot.copy(
+            generation = entry.epoch,
+            mediaBytesPerSecond = snapshot.mediaBytesPerSecond ?: entry.prepared?.estimatedBytesPerSecond,
+        )
+        entry.lastPlaybackSample = remapped
+        if (!wasUnset && entry.demand.intent.epoch != entry.epoch) {
+            projectIntent(clip, entry)
+        } else {
+            entry.demand.reportPlaybackBuffer(remapped)
+            entry.prepared?.reportPlaybackBuffer(remapped)
+        }
+    }
+
+    fun beginSeek(clip: Clip, backend: PlaybackBackend) {
+        bindPlayback(clip, backend)
+        val entry = streams[clip] ?: return
+        entry.nativeGeneration = backend.playbackGeneration + 1L
+        entry.epoch++
+        entry.lastPlaybackSample = PlaybackBufferSnapshot(
+            generation = entry.epoch,
+            bufferedDuration = null,
+            sampledAt = TimeSource.Monotonic.markNow(),
+            mediaBytesPerSecond = entry.prepared?.estimatedBytesPerSecond,
+        )
+        if (display.focusClip == clip && display.focusState != FocusPlaybackState.Waiting) {
+            display = display.copy(focusState = FocusPlaybackState.Waiting)
+        }
+        projectIntent(clip, entry)
+    }
+
+    private fun effectivePrimaryClip(): Pair<Clip?, FocusPlaybackState> {
+        display.focusClip?.let { return it to display.focusState }
+        val awaiting = display.awaitingClip?.takeIf { streams[it]?.ready != true }
+            ?: ripenedOrder.firstOrNull { streams[it]?.ready != true }
+        return awaiting to FocusPlaybackState.Waiting
+    }
+
+    private fun reprojectAll() {
+        for ((clip, entry) in streams) {
+            projectIntent(clip, entry)
+        }
+    }
+
+    private fun projectIntent(clip: Clip, entry: Entry) {
+        if (entry.closed || entry.demand.isClosed) return
+        val (primaryClip, primaryState) = effectivePrimaryClip()
+        val isPrimary = clip == primaryClip
+        val service = when {
+            suspended.value -> ServiceIntent.PAUSED
+            isPrimary -> when (primaryState) {
+                FocusPlaybackState.Waiting -> ServiceIntent.WAITING
+                FocusPlaybackState.Playing -> ServiceIntent.PLAYING
+                FocusPlaybackState.Paused -> ServiceIntent.PAUSED
+            }
+            else -> ServiceIntent.PREFETCH
+        }
+        val prep = entry.prepared
+        val budget = when {
+            suspended.value || service == ServiceIntent.PAUSED -> BufferBudget.NONE
+            prep == null -> if (service == ServiceIntent.WAITING) {
+                BufferBudget(maxReadAheadBytes = CLIP_SCAN_READ_AHEAD_BYTES)
+            } else {
+                BufferBudget.NONE
+            }
+            isPrimary && (service == ServiceIntent.WAITING || service == ServiceIntent.PLAYING) -> {
+                val boost = entry.boostWindow
+                if (boost != null) {
+                    BufferBudget(
+                        targetBuffer = boost.seconds.seconds,
+                        maxReadAheadBytes = prep.readAheadBytesFor(boost.seconds, boost.minBytes),
+                    )
+                } else {
+                    BufferBudget.NONE
+                }
+            }
+            else -> BufferBudget.NONE
+        }
+        val previous = entry.demand.intent
+        val sample = entry.lastPlaybackSample?.takeIf { it.generation == entry.epoch }
+        entry.demand.submitIntent(
+            ConsumerIntent(
+                epoch = entry.epoch,
+                service = service,
+                bufferBudget = budget,
+                playbackSample = sample,
+            ),
+        )
+        if (previous.bufferBudget.maxReadAheadBytes > 0L && budget.maxReadAheadBytes == 0L) {
+            entry.demand.withdrawSpeculation()
+        }
+    }
+
+    fun receivedBytes(clip: Clip): Long = streams[clip]?.receivedBytes() ?: 0L
+
+    fun isReactivating(clip: Clip): Boolean = streams[clip]?.isReactivating() ?: false
+
+    fun totalReceivedBytes(): Long = retiredBytes + streams.values.sumOf { it.receivedBytes() }
+
+    fun anyReactivating(): Boolean = streams.values.any { it.isReactivating() }
+
     fun sync(window: Set<Clip>) {
-        (streams.keys - window).forEach { clip -> close(streams.remove(clip)!!) }
+        (streams.keys - window).forEach { clip ->
+            ripenedOrder.remove(clip)
+            streams.remove(clip)?.let(::close)
+        }
+        val cleanedFocus = display.focusClip?.takeIf { it in window }
+        val cleanedAwaiting = display.awaitingClip?.takeIf { it in window }
+        val cleanedNeighbours = display.prerenderingNeighbours.intersect(window)
+        if (cleanedFocus != display.focusClip || cleanedAwaiting != display.awaitingClip || cleanedNeighbours != display.prerenderingNeighbours) {
+            display = ClipDisplayDemand(
+                focusClip = cleanedFocus,
+                focusState = display.focusState,
+                awaitingClip = cleanedAwaiting,
+                prerenderingNeighbours = cleanedNeighbours,
+            )
+            reprojectAll()
+        }
     }
 
     fun closeAll() {
-        scope.coroutineContext[Job]?.cancelChildren()
         streams.values.forEach(::close)
         streams.clear()
-        ripening.clear()
-        foreground = emptySet()
+        ripenedOrder.clear()
+        retiredBytes = 0L
+        display = ClipDisplayDemand()
     }
 
-    // 还没备好的先取消；取消前刚好备好的，照样关掉
-    private fun close(stream: Deferred<PreparedClip?>) {
-        stream.cancel()
-        scope.launch { runCatching { stream.await() }.getOrNull()?.close() }
+    private fun close(entry: Entry) {
+        if (entry.closed) return
+        entry.closed = true
+        retiredBytes += entry.receivedBytes()
+        entry.fetch?.cancel()
+        entry.result.cancel()
+        entry.demand.close()
+        entry.prepared?.close()
     }
 
     private companion object {
-        const val TAG = "Clips"
-
-        /** 同时备会话的段数。每段要查一次详情，再探一次转码流的长度。 */
-        const val PREPARE_LANES = 4
-
-        /**
-         * 同时下载预取字节的候补段数。HTTP/1.1 在途请求不可抢占，8 段齐发会瞬间吃满账号全部 16 个连接槽，
-         * 一旦撞上慢节点，当前段的用户拖动（seek）就要排队苦等；限制为 2 段既足够连翻供给，又常留 10+ 空闲槽给前台交互。
-         */
-        const val PREFETCH_LANES = 2
-
-        /**
-         * 候补的一段这么久还没取完开头，当它取不到，见 [ripen]。只兜住一直在慢慢出字节、不报错的主机；
-         * 坏主机与断流 SDK 自己会换、会报错。计时从请求起，而请求一齐发出、按先后取，排在第八段的要等前七段，
-         * 在 1 MB/s 的线路上约 16 秒，所以留得宽。
-         */
-        val RIPEN_TIMEOUT = 60.seconds
+        const val TAG = "ClipFeed"
     }
 }

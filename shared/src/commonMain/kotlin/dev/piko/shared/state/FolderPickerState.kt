@@ -9,9 +9,12 @@ import androidx.compose.runtime.setValue
 import dev.piko.shared.data.PikoDriveRepository
 import dev.piko.shared.log.PikoLog
 import dev.piko.shared.log.logFailure
+import dev.piko.shared.log.logFolder
 import dev.piko.shared.data.PikoPathBreadcrumb
+import io.github.nihildigit.pikpak.FileKind
 import io.github.nihildigit.pikpak.FileStat
 import dev.piko.shared.data.isPikoInternalFolder
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -20,10 +23,10 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.launch
 
 /**
- * 目录选择器：逐层浏览文件夹、按页加载、就地新建。
+ * 目录选择器：逐层浏览子目录、就地新建文件夹。
  *
- * 路径栈是自己的，不碰仓库层的 folderStackFlow：那是网盘主界面的全局位置，
- * 选择器里进出目录会把主界面一起带走。
+ * 维护自身独立的路径栈，不直接改动主工作区（[dev.piko.shared.presentation.DriveWorkspace]）的浏览路径栈，
+ * 避免在选择器里进出目录时改动主界面位置。
  */
 class FolderPickerState(
     private val driveRepo: PikoDriveRepository,
@@ -107,7 +110,7 @@ class FolderPickerState(
                         reload()
                     }
                 }
-                .logFailure("FolderPicker", tr("新建文件夹失败", "Failed to create folder", "フォルダーを作成できませんでした", "폴더를 만들지 못했습니다", "新增資料夾失敗"))
+                .logFailure(TAG, "Failed to create folder in ${logFolder(parent.id)}")
                 .onFailure { _messages.tryEmit(dev.piko.shared.notice.PikoErrorMapper.failure(tr("新建文件夹", "Create folder", "フォルダーを作成", "폴더 만들기", "新增資料夾"), it)) }
             isCreatingFolder = false
         }
@@ -117,31 +120,19 @@ class FolderPickerState(
         val parentId = current.id
         val generation = ++loadGeneration
         isLoadingMore = true
-        var token = pageToken
-        var added = 0
         try {
-            // 一页 100 条可能全是文件，只靠触底加载永远翻不到后面的文件夹，
-            // 因此本轮零收获时继续向后翻，直到拿到文件夹或翻完为止。
-            while (true) {
-                val (list, next) = driveRepo.listFiles(parentId = parentId, pageToken = token)
-                    .getOrElse { error ->
-                        PikoLog.w("FolderPicker", tr("读取目录失败", "Failed to load folder", "フォルダーを読み込めませんでした", "폴더를 불러오지 못했습니다", "讀取資料夾失敗"), error)
-                        loadError = dev.piko.shared.notice.PikoErrorMapper.message(error)
-                        return
-                    }
-                val childFolders = list.filter { it.isFolder && !isPikoInternalFolder(it, parentId) }
-                if (childFolders.isNotEmpty()) {
-                    folders = folders + childFolders
-                    added += childFolders.size
-                }
-                token = next
-                if (next.isEmpty()) {
-                    hasMore = false
-                    break
-                }
-                if (added > 0) break
+            val childFolders = try {
+                toFolderStats(driveRepo.subfolders(parentId), parentId)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: Throwable) {
+                PikoLog.w(TAG, "Failed to load subfolders in ${logFolder(parentId)}", error)
+                loadError = dev.piko.shared.notice.PikoErrorMapper.message(error)
+                return
             }
-            pageToken = token
+            folders = childFolders
+            hasMore = false
+            pageToken = ""
         } finally {
             // 被 reload 取消的旧加载会晚于新加载开始才走到这里，不能替新加载收尾
             if (generation == loadGeneration) {
@@ -149,5 +140,21 @@ class FolderPickerState(
                 isLoadingMore = false
             }
         }
+    }
+
+    @kotlin.jvm.JvmName("subfoldersFromBreadcrumbs")
+    private fun toFolderStats(result: Result<List<PikoPathBreadcrumb>>, parentId: String): List<FileStat> =
+        result.getOrThrow().map { FileStat(kind = FileKind.FOLDER, id = it.id, parentId = parentId, name = it.name) }
+
+    @kotlin.jvm.JvmName("subfoldersFromStatsResult")
+    private fun toFolderStats(result: Result<List<FileStat>>, parentId: String): List<FileStat> =
+        result.getOrThrow().filter { it.isFolder && !it.trashed && !isPikoInternalFolder(it, parentId) }
+
+    @kotlin.jvm.JvmName("subfoldersFromStats")
+    private fun toFolderStats(list: List<FileStat>, parentId: String): List<FileStat> =
+        list.filter { it.isFolder && !it.trashed && !isPikoInternalFolder(it, parentId) }
+
+    private companion object {
+        const val TAG = "FolderPicker"
     }
 }

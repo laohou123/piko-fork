@@ -12,16 +12,20 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import java.util.concurrent.ConcurrentHashMap
 
 /** 内存偏好。只有被测路径读写的几项有真实行为，其余给固定值。 */
 class MemoryPreferences : PikoUserPreferences {
+    override val saveAsReferenceFlow = MutableStateFlow(false)
+    override suspend fun setSaveAsReference(enabled: Boolean) { saveAsReferenceFlow.value = enabled }
+
     private val positions = ConcurrentHashMap<String, Long>()
 
     override suspend fun savePlaybackPosition(fileId: String, positionMs: Long) {
@@ -85,15 +89,9 @@ class MemoryPreferences : PikoUserPreferences {
     override suspend fun setPikpakDomain(root: String) = Unit
     override val snailModeFlow: Flow<SnailMode> = MutableStateFlow(SnailMode())
     override suspend fun setSnailMode(mode: SnailMode) = Unit
-    private val acceleration = MutableStateFlow(true)
-    override val concurrentAccelerationFlow: Flow<Boolean> = acceleration
-    override val concurrentConnectionsFlow: Flow<Int> = acceleration.map { if (it) 4 else 1 }
     override val downloadDirPathFlow: Flow<String> = MutableStateFlow("")
     override suspend fun setDownloadDirPath(path: String) = Unit
     override suspend fun getDownloadDirPath(): String = ""
-    override suspend fun setConcurrentAccelerationEnabled(enabled: Boolean) {
-        acceleration.value = enabled
-    }
     @Volatile var downloadTasks: String = ""
     override suspend fun loadDownloadTasks(): String = downloadTasks
     override suspend fun saveDownloadTasks(serialized: String) {
@@ -197,6 +195,14 @@ class MemorySessionStore : PikoSessionStore {
     override suspend fun clearCredentials(account: String) {
         passwords.remove(account)
     }
+    val syncSecrets = ConcurrentHashMap<String, String>()
+    override suspend fun loadSyncSecret(account: String): String? = syncSecrets[account]
+    override suspend fun saveSyncSecret(account: String, secret: String) {
+        if (secret.isEmpty()) syncSecrets.remove(account) else syncSecrets[account] = secret
+    }
+    override suspend fun clearSyncSecret(account: String) {
+        syncSecrets.remove(account)
+    }
     val archivePasswords = ConcurrentHashMap<String, String>()
     override suspend fun loadArchivePasswords(account: String): String = archivePasswords[account].orEmpty()
     override suspend fun saveArchivePasswords(account: String, serialized: String) {
@@ -208,14 +214,24 @@ class MemorySessionStore : PikoSessionStore {
  * 呈现状态与断言在同一个串行作用域执行，贴近生产环境的 Main 读写约束。
  * 仓库、SDK 与下载的 IO 仍在真实 Default/IO 调度器上运行，不使用虚拟时间。
  */
+private val smokeLogDirectory by lazy { java.nio.file.Files.createTempDirectory("piko-smoke-log").toString() }
+
 fun smoke(block: suspend CoroutineScope.(scope: CoroutineScope) -> Unit) {
-    val presentationDispatcher = Dispatchers.Default.limitedParallelism(1)
-    runBlocking(presentationDispatcher) {
-        val scope = CoroutineScope(SupervisorJob() + presentationDispatcher)
-        try {
-            withTimeout(30_000) { block(scope) }
-        } finally {
-            scope.cancel()
+    dev.piko.shared.log.PikoLog.install(smokeLogDirectory)
+    java.util.concurrent.Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "piko-smoke-presentation").apply { isDaemon = true }
+    }.asCoroutineDispatcher().use { presentationDispatcher ->
+        runBlocking(presentationDispatcher) {
+            val scope = CoroutineScope(SupervisorJob() + presentationDispatcher)
+            try {
+                withTimeout(30_000) { block(scope) }
+            } catch (error: Throwable) {
+                val logs = kotlinx.coroutines.withTimeoutOrNull(2_000) { dev.piko.shared.log.PikoLog.export() }
+                System.err.println(logs?.lines()?.takeLast(40)?.joinToString("\n"))
+                throw error
+            } finally {
+                withTimeout(30_000) { scope.coroutineContext[kotlinx.coroutines.Job]!!.cancelAndJoin() }
+            }
         }
     }
 }

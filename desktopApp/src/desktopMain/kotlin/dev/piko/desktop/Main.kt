@@ -10,6 +10,7 @@ import dev.piko.shared.i18n.tr
 import java.util.Locale
 import dev.piko.shared.i18n.PikoLocale
 
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -32,6 +33,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableIntStateOf
@@ -46,9 +48,11 @@ import androidx.compose.ui.input.pointer.PointerIcon
 import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.painter.BitmapPainter
+import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.res.loadImageBitmap
 import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.ApplicationScope
 import androidx.compose.ui.window.WindowPlacement
 import androidx.compose.ui.window.awaitApplication
 import dev.piko.desktop.motion.SystemReducedMotion
@@ -57,15 +61,18 @@ import androidx.compose.ui.window.Tray
 import dev.piko.desktop.ui.clips.ClipFeedWindow
 import dev.piko.desktop.ui.player.VideoPlayerWindow
 import dev.piko.desktop.ui.player.MpvLogBridge
+import dev.piko.desktop.update.DesktopAppUpdater
 import dev.piko.desktop.update.WindowsInstaller
 import dev.piko.desktop.winrt.WinRTSupport
 import dev.piko.desktop.winrt.WindowsLinkAssociation
 import dev.piko.download.DownloadStatus
 import dev.piko.download.DownloadTask
 import dev.piko.shared.data.FilePikoCacheStore
+import dev.piko.shared.data.streamingCodec
 import dev.piko.shared.library.SubtitleCatSource
 import dev.piko.shared.library.SubtitleSourceOption
 import dev.piko.shared.library.XunleiSubtitleSource
+import kotlinx.serialization.json.Json
 import dev.piko.shared.sync.JvmSyncCipher
 import dev.piko.shared.scrape.MetaTubeService
 import io.ktor.client.HttpClient
@@ -80,6 +87,8 @@ import dev.piko.shared.log.LogLevel
 import dev.piko.shared.log.PikoLog
 import dev.piko.shared.media.FileClipCache
 import dev.piko.shared.media.PikoMediaRepository
+import dev.piko.shared.memory.PikoMemoryGovernor
+import dev.piko.shared.memory.cacheBudget
 import dev.piko.shared.net.PikoProxySelector
 import dev.piko.shared.upload.UploadTask
 import dev.piko.ui.PikoApp
@@ -108,6 +117,8 @@ import kotlin.system.exitProcess
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -137,7 +148,12 @@ fun main(args: Array<String>) {
         Thread({ Thread.sleep(AOT_TRAINING_MILLIS); exitProcess(0) }, "Piko-Aot-Training")
             .apply { isDaemon = true; start() }
     }
-    System.getProperty(SELF_TEST_PROPERTY)?.let { exitProcess(runSelfTest(it)) }
+    System.getProperty(SELF_TEST_PROPERTY)?.let { name ->
+        installLog(isSelfTest = true)
+        val code = runSelfTest(name)
+        runBlocking { withTimeoutOrNull(2_000) { PikoLog.flush() } }
+        exitProcess(code)
+    }
     // 打包机上可能正开着一个 Piko，训练进程不能把自己当成后来者转交后退出
     val singleInstance = if (isAotTraining) null else SingleInstance.acquireOrForward(absoluteTorrentPaths(args.toList())) ?: return
     // 拿到单实例锁之后才装：转交完参数就退出的后来者不该和主实例写同一个文件
@@ -150,15 +166,21 @@ fun main(args: Array<String>) {
         // magnet 与种子的关联不在这里静默写入：那会每次启动都抢走别的下载工具的协议，改为首次启动时询问，
         // 见 LinkAssociationPrompt
         runCatching { WinRTSupport.ensureAppUserModelId() }
+            .onFailure { PikoLog.w("WinRT", "Failed to set process AppUserModelID", it) }
+            .onSuccess { ok -> if (!ok) PikoLog.w("WinRT", "SetCurrentProcessExplicitAppUserModelID returned false") }
         Thread(
             {
                 // 便携版同样有旧名缓存，放在只限安装版的登记之前
                 WindowsLinkAssociation.forgetStaleName()
                 // 只有 MSI 装的那份写登记：便携版、测试镜像与 gradle run 写的话，会盖掉安装版的通知图标
-                runCatching { WindowsInstaller.installedExecutable() }.getOrNull() ?: return@Thread
+                val installedExe = runCatching { WindowsInstaller.installedExecutable() }
+                    .onFailure { PikoLog.w("WinRT", "Failed to query MSI installed executable", it) }
+                    .getOrNull() ?: return@Thread
                 // 图标随安装包放在资源目录里，与窗口图标同源
                 val icon = System.getProperty("compose.application.resources.dir")?.let { File(it, "app-icon.png") }
                 runCatching { WinRTSupport.ensureNotificationRegistration(icon) }
+                    .onFailure { PikoLog.w("WinRT", "Failed to register AUMID for toast notifications (${installedExe.name})", it) }
+                    .onSuccess { ok -> if (!ok) PikoLog.w("WinRT", "Toast AUMID registration reported failure (${installedExe.name})") }
             },
             "Piko-Win32-Setup",
         ).apply { isDaemon = true; start() }
@@ -181,21 +203,30 @@ fun main(args: Array<String>) {
     CoroutineScope(Dispatchers.Default).launch { preferences.reduceMotionFlow.collect { motionScale.appReduced = it } }
     val platform = DesktopPikoPlatform(settings, motionScale)
     val services = createServices(settings, preferences)
+    val invalidTorrentNotices = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
     // 外面送来的链接交给添加链接面板，四条路进来：启动参数、后来的进程转交、macOS 的 openURI 与 openFiles。
     // 记一行日志，只记哪一类、从哪条路来，不记链接本身：安装冒烟据此确认系统真把链接交给了 Piko
     fun deliverIncoming(args: List<String>, via: String): Boolean {
-        val link = magnetIn(args) ?: return false
-        PikoLog.i("IncomingLink", "收到外部链接：${linkKindOf(args)}，经$via")
+        val torrentCount = args.count(::isTorrentPath)
+        val link = magnetIn(args)
+        if (link == null) {
+            if (torrentCount > 0) {
+                PikoLog.w("App", "Failed to parse $torrentCount incoming .torrent file(s) via $via (corrupted or BitTorrent v2-only)")
+                invalidTorrentNotices.tryEmit(Unit)
+            }
+            return false
+        }
+        PikoLog.i("IncomingLink", "Received incoming ${linkKindOf(args)} link via $via")
         services.instantMagnetRepository.onIncomingMagnet(link)
         return true
     }
     // magnet: 链接与种子经登记的关联唤起时，以启动参数进来；已在运行时由后来的进程转交过来
-    val launchedWithLink = deliverIncoming(args.toList(), "启动参数")
+    val launchedWithLink = deliverIncoming(args.toList(), "args")
     // 带着链接启动时添加链接面板正要弹出，不再叠一个询问框，留到下次普通启动再问；训练进程没人回答
     val askLinkAssociation = !launchedWithLink && !isAotTraining
     val activations = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
     singleInstance?.listen { forwarded ->
-        deliverIncoming(forwarded, "转交")
+        deliverIncoming(forwarded, "single-instance")
         activations.tryEmit(Unit)
     }
     val quitRequests = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
@@ -250,6 +281,7 @@ fun main(args: Array<String>) {
                 },
                 isClipFeedOpen = { clipFeed != null },
                 closeClipFeed = { clipFeed = null },
+                hasActivePlayer = { players.isNotEmpty() },
             )
         }
         // 播放器与信息流的窗口在主界面之外，换号时主界面重建、它们不会跟着走：放的是上一个账号的文件，
@@ -260,9 +292,6 @@ fun main(args: Array<String>) {
                 clipFeed = null
             }
         }
-        val downloads by services.downloadManager.tasks.collectAsState()
-        val uploads by services.uploadManager.tasks.collectAsState()
-        val account = services.clientManager.currentClient.collectAsState().value?.account
         val hasActiveTransfers by remember(services) { services.backgroundWorkChanges() }
             .collectAsState(initial = services.hasBackgroundWork())
         val keepSessionAlive by remember(services) { services.desktopSessionChanges() }
@@ -277,49 +306,67 @@ fun main(args: Array<String>) {
         WorkNotifications(services) { isInBackground || !isMainWindowFocused }
 
         val closeToTray = platform.closeToTray?.enabled?.collectAsState()?.value == true
+        var trayInstallFailed by remember { mutableStateOf(false) }
+        val isTraySupported = remember {
+            runCatching { java.awt.SystemTray.isSupported() }
+                .onFailure { PikoLog.w("Tray", "Failed to query SystemTray support", it) }
+                .getOrDefault(false)
+        } && !trayInstallFailed
+        var showInvalidTorrentDialog by remember { mutableStateOf(false) }
+        LaunchedEffect(Unit) {
+            invalidTorrentNotices.collect { showInvalidTorrentDialog = true }
+        }
+        val quitNow = remember(services, settings) {
+            {
+                runCatching { settings.flush() }
+                    .onFailure { PikoLog.w("Settings", "Failed to flush desktop settings before exit", it) }
+                runBlocking {
+                    withTimeoutOrNull(800) {
+                        services.downloadManager.flushPersistence()
+                        services.uploadManager.flushPersistence()
+                    }
+                }
+                exitApplication()
+            }
+        }
+        val hasDetachedWindows = players.isNotEmpty() || clipFeed != null
         LaunchedEffect(isInBackground) {
             if (!isInBackground) manualTraySession = false
         }
-        LaunchedEffect(isInBackground, manualTraySession, keepSessionAlive, closeToTray) {
-            if (isInBackground && !manualTraySession && !closeToTray && !keepSessionAlive && !services.hasBackgroundWork() && !services.hasDesktopResumeContext()) exitApplication()
+        LaunchedEffect(isInBackground, manualTraySession, keepSessionAlive, closeToTray, isTraySupported, hasDetachedWindows) {
+            if (isInBackground && !manualTraySession && !(closeToTray && isTraySupported) && !keepSessionAlive && !hasDetachedWindows && !services.hasBackgroundWork() && !services.hasDesktopResumeContext()) quitNow()
         }
         // 更新脚本等本进程退出后才替换文件。下载会被中断，更新对话框已先征得用户同意
         LaunchedEffect(Unit) {
-            platform.updater?.exitRequests?.collect { exitApplication() }
+            platform.updater?.exitRequests?.collect { quitNow() }
         }
 
-        if (isInBackground) {
-            val trayTooltip = if (hasActiveTransfers) backgroundTooltip(downloads.values, uploads.values.filter { it.account == account }) else "Piko"
-            val showLabel = tr("显示 Piko", "Show Piko", "Pikoを表示", "Piko 표시", "顯示 Piko")
-            val quitLabel = tr("立即退出", "Quit now", "今すぐ終了", "지금 종료", "立即結束")
-            if (WinRTSupport.isWindows && java.awt.SystemTray.isSupported()) {
-                dev.piko.desktop.winrt.WindowsSystemTray(
-                    tooltip = trayTooltip,
-                    darkTheme = appearance.isDark(),
-                    showLabel = showLabel,
-                    quitLabel = quitLabel,
-                    onShow = { isInBackground = false },
-                    onQuit = ::exitApplication,
-                )
-            } else {
-                Tray(
-                    icon = appIcon ?: BitmapPainter(ImageBitmap(16, 16)),
-                    tooltip = trayTooltip,
-                    onAction = { isInBackground = false },
-                    menu = {
-                        Item(showLabel, onClick = { isInBackground = false })
-                        Item(quitLabel, onClick = ::exitApplication)
-                    },
-                )
-            }
+        if (isInBackground && isTraySupported) {
+            BackgroundSystemTray(
+                services = services,
+                hasActiveTransfers = hasActiveTransfers,
+                darkTheme = appearance.isDark(),
+                appIcon = appIcon,
+                onShow = { isInBackground = false },
+                onOpenTransfers = {
+                    services.requestOpenTransfers()
+                    isInBackground = false
+                    mainWindow?.let(::bringToFront)
+                },
+                onQuit = quitNow,
+                onUnavailable = {
+                    trayInstallFailed = true
+                    isInBackground = false
+                },
+            )
         }
 
         val hideToTray: (manual: Boolean) -> Unit = { manual ->
-            manualTraySession = manual
+            manualTraySession = manual && isTraySupported
             isInBackground = true
             // 用户已主动开启「最小化到托盘」或在询问框中点击该选项时，不再每次关窗都弹通知打扰；
             // 仅当用户未开启常驻托盘、因后台仍有未完任务而首次自动转入后台时提示一次。
-            if (!closeToTray && !manual && settings.get(BACKGROUND_HINT_SHOWN_KEY) != "true") {
+            if (!(closeToTray && isTraySupported) && !(manual && isTraySupported) && settings.get(BACKGROUND_HINT_SHOWN_KEY) != "true") {
                 settings.set(BACKGROUND_HINT_SHOWN_KEY, "true")
                 Thread {
                     val reopenHint = when {
@@ -334,23 +381,29 @@ fun main(args: Array<String>) {
         }
 
         val closeMainWindow = {
-            if (services.hasBackgroundWork() || services.hasDesktopResumeContext() || closeToTray) {
-                hideToTray(closeToTray)
-            } else if (platform.closeToTray != null && settings.get(CLOSE_BEHAVIOR_ASKED_KEY) != "true") {
+            if (services.hasBackgroundWork() || services.hasDesktopResumeContext() || hasDetachedWindows || (closeToTray && isTraySupported)) {
+                hideToTray(closeToTray && isTraySupported)
+            } else if (isTraySupported && platform.closeToTray != null && settings.get(CLOSE_BEHAVIOR_ASKED_KEY) != "true") {
                 askCloseBehavior = true
             } else {
-                exitApplication()
+                quitNow()
             }
         }
         val currentCloseMainWindow by rememberUpdatedState(closeMainWindow)
         // macOS 的 Cmd+Q：窗口还开着时同关窗；已经藏进后台再退出，是明确要结束传输
         LaunchedEffect(Unit) {
-            quitRequests.collect { if (isInBackground) exitApplication() else currentCloseMainWindow() }
+            quitRequests.collect { if (isInBackground) quitNow() else currentCloseMainWindow() }
         }
 
         val mainWindowState = rememberRememberedWindowState(settings, "main", DpSize(1120.dp, 760.dp))
+        // Detached playback/feed windows keep the process visible even when the main window is hidden.
+        val memoryVisible = (!isInBackground && !mainWindowState.isMinimized) || players.isNotEmpty() || clipFeed != null
+        LaunchedEffect(memoryVisible) {
+            PikoMemoryGovernor.Shared.onVisibilityChanged(memoryVisible)
+        }
         PikoWindow(
             onCloseRequest = closeMainWindow,
+            onFatalClose = ::exitApplication,
             visible = !isInBackground,
             title = "Piko",
             icon = appIcon,
@@ -362,6 +415,12 @@ fun main(args: Array<String>) {
                 mainWindow = window
             }
             val focused = LocalWindowInfo.current.isWindowFocused
+            LaunchedEffect(focused) {
+                services.onWindowFocusChanged("main", focused)
+            }
+            DisposableEffect(Unit) {
+                onDispose { services.onWindowClosed("main") }
+            }
             SideEffect { isMainWindowFocused = focused }
             TitleBarThemeEffect(window, appearance.isDark())
             PixelAlignedContentEffect(window)
@@ -381,7 +440,7 @@ fun main(args: Array<String>) {
                 LocalAntiDiagonalResizeCursor provides AntiDiagonalResizeCursor,
             ) {
                 PikoTheme(appearance = appearance) {
-                    // 与侧边栏、网盘页页眉同为外框色：桌面主界面任何宽度都有侧边栏，见 FormFactor
+                    // 与侧边栏、网盘页顶栏同为外框色；窗口窄于 600dp 或矮于 480dp 时侧边栏收起为紧凑导航，见 FormFactor
                     val colors = MaterialTheme.colorScheme
                     // 开着也只在有侧边栏的界面上收起标题栏，由界面声明（WindowCaption.Host），窄窗口与登录页仍有标题栏
                     val compactTitleBar = platform.compactTitleBar?.enabled?.collectAsState()?.value == true
@@ -398,6 +457,7 @@ fun main(args: Array<String>) {
                             appearance = appearance,
                             onMagnet = services.instantMagnetRepository::onIncomingMagnet,
                             onUpload = services.uploadManager::request,
+                            onInvalidTorrent = { showInvalidTorrentDialog = true },
                         ) {
                             PikoApp(
                                 onLanguageChanged = { Locale.setDefault(Locale.forLanguageTag(it.tag)) },
@@ -454,11 +514,44 @@ fun main(args: Array<String>) {
                                             settings.set(CLOSE_BEHAVIOR_ASKED_KEY, "true")
                                             platform.closeToTray?.set(false)
                                         }
-                                        exitApplication()
+                                        quitNow()
                                     },
                                 ) {
                                     Text(stringResource(Res.string.text_quit))
                                 }
+                            },
+                        )
+                    }
+                    if (showInvalidTorrentDialog) {
+                        PikoDialog(
+                            onDismissRequest = { showInvalidTorrentDialog = false },
+                            title = {
+                                Text(
+                                    tr(
+                                        "无法解析种子文件",
+                                        "Cannot read torrent file",
+                                        "トレントファイルを読み取れません",
+                                        "토렌트 파일을 읽을 수 없습니다",
+                                        "無法解析種子檔案",
+                                    ),
+                                )
+                            },
+                            text = {
+                                Text(
+                                    tr(
+                                        "该 .torrent 文件已损坏，或仅包含暂不支持的 BitTorrent v2 信息字典。",
+                                        "The .torrent file is corrupted or uses a BitTorrent v2-only info dictionary that cannot be converted into a magnet link.",
+                                        "この .torrent ファイルは破損しているか、マグネットリンクに変換できない BitTorrent v2 専用の形式です。",
+                                        "이 .torrent 파일이 손상되었거나 마그넷 링크로 변환할 수 없는 BitTorrent v2 전용 형식입니다.",
+                                        "該 .torrent 檔案已損毀，或僅包含暫不支援的 BitTorrent v2 資訊字典。",
+                                    ),
+                                )
+                            },
+                            confirmButton = {
+                                PikoDialogConfirm(
+                                    label = tr("知道了", "OK", "OK", "확인", "知道了"),
+                                    onClick = { showInvalidTorrentDialog = false },
+                                )
                             },
                         )
                     }
@@ -474,8 +567,8 @@ fun main(args: Array<String>) {
         }
 
         if (mpvReady) clipFeed?.let { links ->
-            ClipFeedWindow(
-                links = ClipFeedLinks(
+            val windowLinks = remember(links) {
+                ClipFeedLinks(
                     playFull = links.playFull,
                     // 位置在主窗口里，主窗口可能被片段窗口盖着或藏在托盘
                     locate = { file ->
@@ -489,13 +582,17 @@ fun main(args: Array<String>) {
                         mainWindow?.let(::bringToFront)
                     },
                     close = links.close,
-                ),
+                )
+            }
+            ClipFeedWindow(
+                links = windowLinks,
                 raise = clipFeedRaises,
                 services = services,
                 platform = platform,
                 settings = settings,
                 appearance = appearance,
                 icon = appIcon,
+                pausedByHost = players.isNotEmpty(),
             )
         }
 
@@ -514,9 +611,89 @@ fun main(args: Array<String>) {
             }
         }
     } }
+    runCatching { settings.flush() }
+        .onFailure { PikoLog.w("Settings", "Failed to flush desktop settings on shutdown", it) }
     // 照 application {} 的默认做法当场结束进程，否则关窗后进程还要挂一到四秒才退
     exitProcess(0)
 }
+
+@Composable
+private fun ApplicationScope.BackgroundSystemTray(
+    services: PikoServices,
+    hasActiveTransfers: Boolean,
+    darkTheme: Boolean,
+    appIcon: Painter?,
+    onShow: () -> Unit,
+    onOpenTransfers: () -> Unit,
+    onQuit: () -> Unit,
+    onUnavailable: () -> Unit,
+) {
+    val downloadsState = services.downloadManager.tasks.collectAsState()
+    val uploadsState = services.uploadManager.tasks.collectAsState()
+    val clientState = services.clientManager.currentClient.collectAsState()
+    val hasActiveTransfersState = rememberUpdatedState(hasActiveTransfers)
+    val traySummary by remember {
+        derivedStateOf {
+            val downloads = downloadsState.value.values
+            val account = clientState.value?.account
+            val activeAccountUploads = uploadsState.value.values.filter { it.account == account }
+            val tooltip = if (hasActiveTransfersState.value) {
+                backgroundTooltip(downloads, activeAccountUploads)
+            } else {
+                "Piko"
+            }
+            val canPauseAll = downloads.any { it.status.isActive } || activeAccountUploads.any { it.status.isActive }
+            tooltip to canPauseAll
+        }
+    }
+    val (trayTooltip, canPauseAll) = traySummary
+    val showLabel = tr("显示 Piko", "Show Piko", "Pikoを表示", "Piko 표시", "顯示 Piko")
+    val transfersLabel = tr("打开任务页", "Open tasks", "タスクを開く", "작업 열기", "開啟任務頁")
+    val pauseAllLabel = if (canPauseAll) {
+        tr("全部暂停", "Pause all", "すべて一時停止", "모두 일시 중지", "全部暫停")
+    } else {
+        null
+    }
+    val quitLabel = tr("立即退出", "Quit now", "今すぐ終了", "지금 종료", "立即結束")
+    val pauseAllFromTray = remember(services) {
+        {
+            services.downloadManager.pauseAll()
+            services.uploadManager.pauseAll()
+        }
+    }
+    if (WinRTSupport.isWindows) {
+        dev.piko.desktop.winrt.WindowsSystemTray(
+            tooltip = trayTooltip,
+            darkTheme = darkTheme,
+            showLabel = showLabel,
+            quitLabel = quitLabel,
+            onShow = onShow,
+            onQuit = onQuit,
+            transfersLabel = transfersLabel,
+            onOpenTransfers = onOpenTransfers,
+            pauseAllLabel = pauseAllLabel,
+            onPauseAll = pauseAllFromTray.takeIf { pauseAllLabel != null },
+            onUnavailable = onUnavailable,
+        )
+    } else {
+        val fallbackIcon = remember { BitmapPainter(ImageBitmap(16, 16)) }
+        Tray(
+            icon = appIcon ?: fallbackIcon,
+            tooltip = trayTooltip,
+            onAction = onShow,
+            menu = {
+                Item(showLabel, onClick = onShow)
+                Item(transfersLabel, onClick = onOpenTransfers)
+                if (pauseAllLabel != null) {
+                    Item(pauseAllLabel, onClick = pauseAllFromTray)
+                }
+                Item(quitLabel, onClick = onQuit)
+            },
+        )
+    }
+}
+
+private val DesktopCacheJson = Json { ignoreUnknownKeys = true }
 
 // 侧栏拖宽处的悬停光标。公共代码里的 PointerIcon 没有调整大小这一种，见 LocalHorizontalResizeCursor
 private val HorizontalResizeCursor = PointerIcon(java.awt.Cursor(java.awt.Cursor.E_RESIZE_CURSOR))
@@ -585,18 +762,33 @@ internal fun bringToFront(window: java.awt.Frame) {
 private fun createServices(settings: DesktopSettingsStore, preferences: DesktopPikoPreferences): PikoServices {
     // 进程级作用域，与 Android 的 appScope 对应：下载与会话刷新不随某个窗口的组合结束
     val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-    val desktopTransportBudget = (Runtime.getRuntime().maxMemory() / 8L).coerceIn(128L * 1024 * 1024, 512L * 1024 * 1024)
+    val desktopTransportBudget = (Runtime.getRuntime().maxMemory() / 8L).coerceAtMost(512L * 1024 * 1024)
     val clientManager = PikoClientManager(
         sessionStore = desktopSessionStore(),
         scope = appScope,
-        transportMemoryBudgetBytes = desktopTransportBudget,
+        transportMemoryBudgetBytes = PikoMemoryGovernor.Shared.policy.value.cacheBudget(desktopTransportBudget),
     )
+    appScope.launch {
+        PikoMemoryGovernor.Shared.policy.collect { policy ->
+            clientManager.setTransportMemoryBudgetBytes(policy.cacheBudget(desktopTransportBudget))
+        }
+    }
+    appScope.launch {
+        val runtime = Runtime.getRuntime()
+        while (isActive) {
+            PikoMemoryGovernor.Shared.onHeapSample(runtime.totalMemory() - runtime.freeMemory(), runtime.maxMemory())
+            delay(5_000)
+        }
+    }
     val mediaRepository = PikoMediaRepository(
         clientManager,
         preferences,
         clipCache = FileClipCache(PikoHome.root.resolve("cache/clip-cache").toFile()),
     )
-    val cacheStore = FilePikoCacheStore(PikoHome.root.resolve("cache").toString())
+    val cacheStore = FilePikoCacheStore(
+        PikoHome.root.resolve("cache").toString(),
+        jsonCodec = DesktopCacheJson.streamingCodec(),
+    )
     return PikoServices(
         platformPreferences = preferences,
         clientManager = clientManager,
@@ -608,10 +800,12 @@ private fun createServices(settings: DesktopSettingsStore, preferences: DesktopP
             appScope,
             segmentDownloader = DesktopPikoSegmentDownloader(),
             mediaRepository = mediaRepository,
+            cacheStore = cacheStore,
         ),
         uploadSources = DesktopPikoUploadSources(),
         localFileAccess = { changed -> DesktopLocalFileAccess(appScope, changed) },
         cacheStore = cacheStore,
+        treeDatabaseFactory = dev.piko.shared.data.DesktopPikoTreeDatabaseFactory(),
         syncCipher = JvmSyncCipher(),
         metaTube = MetaTubeService(preferences, cacheStore = cacheStore, scope = appScope) {
             HttpClient(OkHttp) {
@@ -687,23 +881,41 @@ private fun WorkNotifications(services: PikoServices, shouldNotify: () -> Boolea
 }
 
 /** 日志在数据根目录的 logs 下（PikoHome）。警告以上同时进标准错误，gradle run 时看得到；安装版的标准错误无人读，代价只是一次写入。 */
-private fun installLog() {
-    PikoLog.install(PikoHome.root.resolve("logs").toString()) { level, tag, message, error ->
-        if (level >= LogLevel.WARN) System.err.println("Piko/$tag: $message" + (error?.let { "\n" + it.stackTraceToString() } ?: ""))
+private fun installLog(isSelfTest: Boolean = false) {
+    PikoLog.install(
+        directory = PikoHome.root.resolve("logs").toString(),
+        extraExport = DesktopAppUpdater::exportHistoryLog,
+        onClear = DesktopAppUpdater::clearHistoryLog,
+    ) { level, tag, message, error ->
+        if (level >= LogLevel.WARN) {
+            System.err.println(
+                PikoLog.redact("Piko/$tag: $message" + (error?.let { "\n" + it.stackTraceToString() } ?: "")),
+            )
+        }
     }
-    PikoHome.portableFallback?.let { PikoLog.w("App", "便携目录不可写（${it.problem.javaClass.simpleName}），数据改放用户目录") }
+    PikoHome.portableFallback?.let {
+        PikoLog.w("App", "Portable data directory is not writable; falling back to user home", it.problem)
+    }
     MpvLogBridge.install()
     val previous = Thread.getDefaultUncaughtExceptionHandler()
     Thread.setDefaultUncaughtExceptionHandler { thread, error ->
-        PikoLog.e("Crash", "线程 ${thread.name} 未捕获的异常", error)
+        PikoLog.e("Crash", "Uncaught exception on thread ${thread.name}", error)
         runBlocking { withTimeoutOrNull(1_000) { PikoLog.flush() } }
-        previous?.uncaughtException(thread, error) ?: error.printStackTrace()
+        if (javax.swing.SwingUtilities.isEventDispatchThread() || thread.name.startsWith("AWT-EventQueue")) {
+            // 绕过窗口处理器时无法可靠定位出事窗口；重建全部窗口，持续失败则真正退出，不留托盘僵尸窗口。
+            desktopWindowFaultCoordinator.report(error, isUiThread = true, onFatalClose = {
+                showWindowFault(null) { exitProcess(1) }
+            })
+        }
+        previous?.uncaughtException(thread, error) ?: System.err.println(PikoLog.redact(error.stackTraceToString()))
     }
-    PikoLog.i(
-        "App",
-        "启动 ${System.getProperty("jpackage.app-version") ?: "开发版"}，${System.getProperty("os.name")} ${System.getProperty("os.version")} ${System.getProperty("os.arch")}",
-    )
-    HardwareReport.logInBackground()
+    if (!isSelfTest) {
+        PikoLog.i(
+            "App",
+            "Starting ${System.getProperty("jpackage.app-version") ?: "dev"} on ${System.getProperty("os.name")} ${System.getProperty("os.version")} (${System.getProperty("os.arch")})",
+        )
+        HardwareReport.logInBackground()
+    }
 }
 
 private fun showSystemNotification(title: String, message: String): Boolean = when {

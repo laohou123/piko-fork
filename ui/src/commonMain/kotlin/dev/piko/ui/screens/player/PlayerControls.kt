@@ -1,5 +1,6 @@
 package dev.piko.ui.screens.player
 
+import dev.piko.ui.components.MediaLoadingCaption
 import dev.piko.ui.resources.*
 import dev.piko.ui.i18n.stringResource
 
@@ -31,7 +32,6 @@ import androidx.compose.ui.input.key.onKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
@@ -93,12 +93,15 @@ import androidx.compose.material3.TooltipBox
 import androidx.compose.material3.TooltipDefaults
 import androidx.compose.material3.rememberTooltipState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -106,6 +109,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Shadow
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.input.pointer.PointerEventType
@@ -115,6 +119,7 @@ import androidx.compose.ui.input.pointer.pointerHoverIcon
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.layout
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.style.TextAlign
@@ -149,11 +154,12 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.dp
 import dev.piko.ui.platform.LocalFramelessWindow
+import dev.piko.ui.platform.LocalPikoPlatform
 import dev.piko.ui.platform.windowDragArea
-import kotlinx.coroutines.delay
-import java.math.BigDecimal
-import java.math.RoundingMode
-import java.util.Locale
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withTimeoutOrNull
+import dev.piko.ui.format.formatDurationMillis
+import dev.piko.ui.format.formatPlaybackSpeed
 import kotlin.math.abs
 import dev.piko.data.auth.PlayerGestureDefaults
 import kotlin.math.roundToInt
@@ -248,7 +254,6 @@ fun PlayerTopBar(
                 label = tr("音轨与字幕", "Audio and subtitles", "音声と字幕", "오디오 및 자막", "音軌與字幕"),
                 onClick = onTracksClick,
                 tooltipBelow = true,
-                shortcut = "C",
             )
         }
         if (onStatsClick != null) {
@@ -257,6 +262,7 @@ fun PlayerTopBar(
                 label = tr("详细信息", "Details", "詳細情報", "세부 정보", "詳細資訊"),
                 onClick = onStatsClick,
                 tooltipBelow = true,
+                shortcut = "I",
             )
         }
         if (onSettingsClick != null) {
@@ -283,12 +289,14 @@ fun PlayerTopBar(
                 label = if (onTop) tr("取消置顶", "Unpin", "最前面表示を解除", "고정 해제", "取消置頂") else tr("置顶", "Pin on top", "最前面に表示", "항상 위에 표시", "置頂"),
                 onClick = { framelessWindow.setAlwaysOnTop(!onTop) },
                 tooltipBelow = true,
+                shortcut = "T",
             )
             PlayerIconButton(
                 icon = Icons.Filled.Close,
                 label = tr("关闭", "Close", "閉じる", "닫기", "關閉"),
                 onClick = framelessWindow::close,
                 tooltipBelow = true,
+                shortcut = LocalPikoPlatform.current.shortcutModifier.label("W"),
             )
         }
     }
@@ -323,12 +331,14 @@ internal fun PlayerCenterControls(
     indicator: CenterIndicator?,
     onPlayPause: () -> Unit,
     modifier: Modifier = Modifier,
+    loadingSpeedText: String? = null,
 ) {
     PlayPauseButton(
         visible = visible,
         isPlaying = isPlaying,
         isLoading = isLoading,
         indicator = indicator,
+        loadingSpeedText = loadingSpeedText,
         size = PlayContainerSize,
         iconSize = IconButtonDefaults.mediumIconSize,
         squareCorner = 16.dp,
@@ -406,6 +416,7 @@ private fun PlayPauseButton(
     pressedCorner: Dp,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
+    loadingSpeedText: String? = null,
 ) {
     val motion = MaterialTheme.motionScheme
     val colors = MaterialTheme.colorScheme
@@ -444,15 +455,15 @@ private fun PlayPauseButton(
         isPlaying -> squareCorner
         else -> roundCorner
     }
-    fun containerColorOf(face: CenterFace): Color = when (face) {
-        is CenterFace.Readout -> colors.tertiary
-        CenterFace.Loading -> colors.primaryContainer
-        CenterFace.Icon -> colors.primary
+    fun containerColorOf(face: CenterFace): Color = when {
+        face is CenterFace.Readout -> colors.tertiary
+        face == CenterFace.Loading -> colors.primaryContainer
+        else -> colors.primary
     }
-    fun contentColorOf(face: CenterFace): Color = when (face) {
-        is CenterFace.Readout -> colors.onTertiary
-        CenterFace.Loading -> colors.onPrimaryContainer
-        CenterFace.Icon -> colors.onPrimary
+    fun contentColorOf(face: CenterFace): Color = when {
+        face is CenterFace.Readout -> colors.onTertiary
+        face == CenterFace.Loading -> colors.onPrimaryContainer
+        else -> colors.onPrimary
     }
     // 按钮的标签只说点下去做什么：读数形态下点击照样是播放或暂停，标签换成读数的话，读屏念完读数却不知道这一下做了什么
     val actionLabel = when {
@@ -530,6 +541,12 @@ private fun PlayPauseButton(
                 }
             }
         }
+        if (visible && isLoading && indicator == null && !loadingSpeedText.isNullOrBlank()) {
+            MediaLoadingCaption(
+                anchorHalfHeight = size.height / 2,
+                subtitle = loadingSpeedText,
+            )
+        }
     }
 }
 
@@ -555,11 +572,11 @@ internal fun PlayerBottomBar(
     isLandscape: Boolean,
     isFullscreen: Boolean,
     thumbOnHoverOnly: Boolean,
-    positionMillis: Long,
+    positionMillisProvider: () -> Long,
     /** 画面上拖动进度的目标处，不为 null 时进度条与时间停在这里，见 PlayerSeekBar 的 previewMillis。 */
     previewPositionMillis: Long?,
     durationMillis: Long,
-    bufferedPositionMillis: Long,
+    bufferedPositionMillisProvider: () -> Long,
     playbackSpeed: Float?,
     showEpisodes: Boolean,
     /** 上一集、下一集两个快捷键。窄窗口不给，换集走选集面板。 */
@@ -587,7 +604,14 @@ internal fun PlayerBottomBar(
     onVolumeDraggingChange: (Boolean) -> Unit = {},
 ) {
     var scrubPositionMillis by remember { mutableStateOf<Long?>(null) }
-    val shownPosition = scrubPositionMillis ?: previewPositionMillis ?: positionMillis
+    val latestOnScrubbingChange by rememberUpdatedState(onScrubbingChange)
+    val handleScrub: (Long?) -> Unit = remember {
+        { target ->
+            val wasScrubbing = scrubPositionMillis != null
+            scrubPositionMillis = target
+            if (wasScrubbing != (target != null)) latestOnScrubbingChange(target != null)
+        }
+    }
 
     Column(
         modifier = modifier
@@ -598,21 +622,14 @@ internal fun PlayerBottomBar(
             )
             .padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = if (isLandscape) 8.dp else 12.dp),
     ) {
-        PlayerSeekBar(
-            positionMillis = positionMillis,
-            previewMillis = previewPositionMillis,
+        PlayerBottomSeekBar(
+            positionMillisProvider = positionMillisProvider,
+            previewPositionMillis = previewPositionMillis,
             durationMillis = durationMillis,
-            bufferedPositionMillis = bufferedPositionMillis,
+            bufferedPositionMillisProvider = bufferedPositionMillisProvider,
             onSeek = onSeek,
             thumbOnHoverOnly = thumbOnHoverOnly,
-            onScrub = { target ->
-                val wasScrubbing = scrubPositionMillis != null
-                scrubPositionMillis = target
-                if (wasScrubbing != (target != null)) onScrubbingChange(target != null)
-            },
-            modifier = Modifier
-                .fillMaxWidth()
-                .windowInsetsPadding(WindowInsets.safeGestures.only(WindowInsetsSides.Horizontal)),
+            onScrub = handleScrub,
         )
         Spacer(Modifier.height(4.dp))
         Row(
@@ -623,8 +640,8 @@ internal fun PlayerBottomBar(
             Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
                 // 换集在时间前面，照多数播放器底栏的排法。没有上一集或下一集时禁用而不是隐藏，时间不会左右跳
                 if (showEpisodeSkip) {
-                    PlayerIconButton(icon = Icons.Filled.SkipPrevious, label = tr("上一集", "Previous episode", "前のエピソード", "이전 에피소드", "上一集"), onClick = onPrevious, enabled = hasPrevious)
-                    PlayerIconButton(icon = Icons.Filled.SkipNext, label = tr("下一集", "Next episode", "次のエピソード", "다음 에피소드", "下一集"), onClick = onNext, enabled = hasNext)
+                    PlayerIconButton(icon = Icons.Filled.SkipPrevious, label = tr("上一集", "Previous episode", "前のエピソード", "이전 에피소드", "上一集"), onClick = onPrevious, enabled = hasPrevious, shortcut = "PageUp")
+                    PlayerIconButton(icon = Icons.Filled.SkipNext, label = tr("下一集", "Next episode", "次のエピソード", "다음 에피소드", "下一集"), onClick = onNext, enabled = hasNext, shortcut = "PageDown")
                     Spacer(Modifier.width(8.dp))
                 }
                 // 照 YouTube 放在换集之后、时间之前，右边一组的位置不变
@@ -639,16 +656,11 @@ internal fun PlayerBottomBar(
                     )
                     Spacer(Modifier.width(8.dp))
                 }
-                Text(
-                    text = formatTime(shownPosition),
-                    style = TimeTextStyle(),
-                    color = MaterialTheme.colorScheme.onSurface,
-                )
-                Text(
-                    text = " / ${formatTime(durationMillis)}",
-                    style = TimeTextStyle(),
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    maxLines = 1,
+                PlayerTimeReadout(
+                    positionMillisProvider = positionMillisProvider,
+                    scrubPositionMillis = scrubPositionMillis,
+                    previewPositionMillis = previewPositionMillis,
+                    durationMillis = durationMillis,
                 )
             }
 
@@ -658,6 +670,7 @@ internal fun PlayerBottomBar(
                     PlayerChipButton(
                         text = formatSpeed(playbackSpeed),
                         onClick = { onSpeedPopupOpenChange(!isSpeedPopupOpen) },
+                        tooltip = if (!isSpeedPopupOpen) tr("倍速 ([ / ]，Backspace 恢复原速)", "Speed ([ / ], Backspace resets)", "再生速度 ([ / ]、Backspace で等倍)", "재생 속도 ([ / ], Backspace 기본 속도)", "倍速 ([ / ]，Backspace 還原原速)") else null,
                         modifier = Modifier.semantics { contentDescription = tr("倍速 ${formatSpeed(playbackSpeed)}", "Speed ${formatSpeed(playbackSpeed)}", "再生速度 ${formatSpeed(playbackSpeed)}", "재생 속도 ${formatSpeed(playbackSpeed)}", "倍速 ${formatSpeed(playbackSpeed)}") },
                     )
                     if (isSpeedPopupOpen) {
@@ -681,15 +694,69 @@ internal fun PlayerBottomBar(
             // 一次转 90 度，与 R 键相同。原先在播放设置里列四个角度，要转画面得先开面板，
             // 桌面上转了窗口还跟着对调，这一步该是顺手就点的
             if (onRotate != null) {
-                PlayerIconButton(icon = Icons.Filled.Rotate90DegreesCw, label = tr("顺时针旋转 90 度", "Rotate 90° clockwise", "右に90度回転", "시계 방향으로 90도 회전", "順時針旋轉 90 度"), onClick = onRotate)
+                PlayerIconButton(icon = Icons.Filled.Rotate90DegreesCw, label = tr("顺时针旋转 90 度", "Rotate 90° clockwise", "右に90度回転", "시계 방향으로 90도 회전", "順時針旋轉 90 度"), onClick = onRotate, shortcut = "R")
             }
             PlayerIconButton(
                 icon = if (isFullscreen) Icons.Filled.FullscreenExit else Icons.Filled.Fullscreen,
                 label = if (isFullscreen) tr("退出全屏", "Exit fullscreen", "全画面を終了", "전체 화면 종료", "結束全螢幕") else tr("全屏", "Fullscreen", "全画面", "전체 화면", "全螢幕"),
                 onClick = onToggleFullscreen,
+                shortcut = "F",
             )
         }
     }
+}
+
+@Composable
+private fun PlayerBottomSeekBar(
+    positionMillisProvider: () -> Long,
+    previewPositionMillis: Long?,
+    durationMillis: Long,
+    bufferedPositionMillisProvider: () -> Long,
+    onSeek: (Long) -> Unit,
+    thumbOnHoverOnly: Boolean,
+    onScrub: (Long?) -> Unit,
+) {
+    PlayerSeekBar(
+        positionMillis = positionMillisProvider(),
+        previewMillis = previewPositionMillis,
+        durationMillis = durationMillis,
+        bufferedPositionMillis = bufferedPositionMillisProvider(),
+        onSeek = onSeek,
+        thumbOnHoverOnly = thumbOnHoverOnly,
+        onScrub = onScrub,
+        modifier = Modifier
+            .fillMaxWidth()
+            .windowInsetsPadding(WindowInsets.safeGestures.only(WindowInsetsSides.Horizontal)),
+    )
+}
+
+@Composable
+private fun PlayerTimeReadout(
+    positionMillisProvider: () -> Long,
+    scrubPositionMillis: Long?,
+    previewPositionMillis: Long?,
+    durationMillis: Long,
+) {
+    val latestPositionProvider by rememberUpdatedState(positionMillisProvider)
+    val latestScrub by rememberUpdatedState(scrubPositionMillis)
+    val latestPreview by rememberUpdatedState(previewPositionMillis)
+    val displayedSeconds by remember {
+        derivedStateOf {
+            val millis = latestScrub ?: latestPreview ?: latestPositionProvider()
+            millis.coerceAtLeast(0L) / 1_000L
+        }
+    }
+    Text(
+        text = formatTime(displayedSeconds * 1_000L),
+        style = TimeTextStyle(),
+        color = MaterialTheme.colorScheme.onSurface,
+    )
+    Text(
+        text = " / ${formatTime(durationMillis)}",
+        style = TimeTextStyle(),
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        maxLines = 1,
+    )
 }
 
 /**
@@ -926,29 +993,43 @@ private fun TimeTextStyle(): TextStyle =
  * 底栏的文字按钮。浮在视频上不能用无容器的 TextButton，改用 XS 高度的 tonal 按钮，
  * 与旁边的图标按钮同为半透明容器，按压时有形变。
  */
-@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class)
 @Composable
 private fun PlayerChipButton(
     text: String,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
     icon: ImageVector? = null,
+    tooltip: String? = null,
 ) {
-    FilledTonalButton(
-        onClick = onClick,
-        shapes = ButtonDefaults.shapes(),
-        colors = ButtonDefaults.filledTonalButtonColors(
-            containerColor = playerContainerColor(),
-            contentColor = MaterialTheme.colorScheme.onSurface,
-        ),
-        contentPadding = ButtonDefaults.ExtraSmallContentPadding,
-        modifier = modifier.heightIn(min = ButtonDefaults.ExtraSmallContainerHeight).handCursor(),
-    ) {
-        if (icon != null) {
-            Icon(icon, contentDescription = null, modifier = Modifier.size(ButtonDefaults.ExtraSmallIconSize))
-            Spacer(Modifier.width(ButtonDefaults.ExtraSmallIconSpacing))
+    val button: @Composable () -> Unit = {
+        FilledTonalButton(
+            onClick = onClick,
+            shapes = ButtonDefaults.shapes(),
+            colors = ButtonDefaults.filledTonalButtonColors(
+                containerColor = playerContainerColor(),
+                contentColor = MaterialTheme.colorScheme.onSurface,
+            ),
+            contentPadding = ButtonDefaults.ExtraSmallContentPadding,
+            modifier = modifier.heightIn(min = ButtonDefaults.ExtraSmallContainerHeight).handCursor(),
+        ) {
+            if (icon != null) {
+                Icon(icon, contentDescription = null, modifier = Modifier.size(ButtonDefaults.ExtraSmallIconSize))
+                Spacer(Modifier.width(ButtonDefaults.ExtraSmallIconSpacing))
+            }
+            Text(text, style = MaterialTheme.typography.labelLarge, maxLines = 1)
         }
-        Text(text, style = MaterialTheme.typography.labelLarge, maxLines = 1)
+    }
+    if (tooltip != null) {
+        TooltipBox(
+            positionProvider = TooltipDefaults.rememberTooltipPositionProvider(TooltipAnchorPosition.Above),
+            tooltip = { PlainTooltip { Text(tooltip) } },
+            state = rememberTooltipState(),
+        ) {
+            button()
+        }
+    } else {
+        button()
     }
 }
 
@@ -981,15 +1062,16 @@ internal fun PlayerSeekBar(
     var hoverFraction by remember { mutableStateOf<Float?>(null) }
     // 松手到新位置回报之间有一段延迟，这段时间里滑块停在目标处，不回跳到旧位置
     var pendingSeekMillis by remember { mutableStateOf<Long?>(null) }
+    var pendingSeekSeq by remember { mutableIntStateOf(0) }
+    val latestPositionMillis by rememberUpdatedState(positionMillis)
 
-    LaunchedEffect(pendingSeekMillis, positionMillis) {
+    LaunchedEffect(pendingSeekMillis, pendingSeekSeq) {
         val pending = pendingSeekMillis ?: return@LaunchedEffect
-        if (abs(positionMillis - pending) < SEEK_SETTLE_TOLERANCE_MILLIS) {
-            pendingSeekMillis = null
-        } else {
-            delay(SEEK_SETTLE_TIMEOUT_MILLIS)
-            pendingSeekMillis = null
+        withTimeoutOrNull(SEEK_SETTLE_TIMEOUT_MILLIS) {
+            snapshotFlow { latestPositionMillis }
+                .first { abs(it - pending) < SEEK_SETTLE_TOLERANCE_MILLIS }
         }
+        pendingSeekMillis = null
     }
 
     val enabled = durationMillis > 0
@@ -1020,8 +1102,6 @@ internal fun PlayerSeekBar(
         },
         motion.fastSpatialSpec(),
     )
-    val positionText = formatTime((fraction * durationMillis).toLong())
-    val durationText = formatTime(durationMillis)
     val currentDurationMillis by rememberUpdatedState(durationMillis)
     val currentOnSeek by rememberUpdatedState(onSeek)
     val currentOnScrub by rememberUpdatedState(onScrub)
@@ -1029,6 +1109,7 @@ internal fun PlayerSeekBar(
     fun commitSeek(target: Float) {
         val millis = (target * currentDurationMillis).toLong()
         pendingSeekMillis = millis
+        pendingSeekSeq += 1
         currentOnSeek(millis)
     }
 
@@ -1036,14 +1117,42 @@ internal fun PlayerSeekBar(
     // 连按时从上一步的目标接着算，位置回报还没跟上也不会原地打转
     fun stepBy(deltaMillis: Long): Boolean {
         if (!enabled) return false
-        val base = pendingSeekMillis ?: positionMillis
+        val base = pendingSeekMillis ?: latestPositionMillis
         commitSeek(fractionOf(base + deltaMillis))
         return true
     }
 
-    val focusRingColor = scheme.secondary
+    // 无障碍语义按整秒（1000ms）粒度量化，避免毫秒级进度每帧标脏 Windows UIA / Android 语义树；视觉绘制仍保持毫秒级平滑
+    val displayedMillis = if (!enabled) {
+        0L
+    } else {
+        when {
+            dragFraction != null -> (dragFraction!! * durationMillis).toLong().coerceIn(0L, durationMillis)
+            previewMillis != null -> previewMillis.coerceIn(0L, durationMillis)
+            else -> (pendingSeekMillis ?: positionMillis).coerceIn(0L, durationMillis)
+        }
+    }
+    val semanticsPositionMillis = (displayedMillis / 1_000L) * 1_000L
+    val semanticsFraction = fractionOf(semanticsPositionMillis)
+    val progressLabel = tr("播放进度", "Playback progress", "再生位置", "재생 위치", "播放進度")
+    val semanticsStateDescription = remember(semanticsPositionMillis, durationMillis) {
+        "${formatTime(semanticsPositionMillis)} / ${formatTime(durationMillis)}"
+    }
+    val setSemanticsProgress: (Float) -> Boolean = remember {
+        { target ->
+            commitSeek(target.coerceIn(0f, 1f))
+            true
+        }
+    }
 
-    BoxWithConstraints(modifier = modifier.height(SeekBarHeight)) {
+    val focusRingColor = scheme.secondary
+    var barWidthPx by remember { mutableIntStateOf(0) }
+
+    Box(
+        modifier = modifier
+            .height(SeekBarHeight)
+            .onSizeChanged { barWidthPx = it.width },
+    ) {
         Box(
             Modifier
                 .fillMaxWidth()
@@ -1114,14 +1223,11 @@ internal fun PlayerSeekBar(
                 }
                 .focusable(enabled, focusInteraction)
                 .semantics {
-                    contentDescription = tr("播放进度", "Playback progress", "再生位置", "재생 위치", "播放進度")
-                    stateDescription = "$positionText / $durationText"
-                    progressBarRangeInfo = ProgressBarRangeInfo(fraction, 0f..1f)
+                    contentDescription = progressLabel
+                    stateDescription = semanticsStateDescription
+                    progressBarRangeInfo = ProgressBarRangeInfo(semanticsFraction, 0f..1f)
                     if (enabled) {
-                        setProgress { target ->
-                            commitSeek(target.coerceIn(0f, 1f))
-                            true
-                        }
+                        setProgress(action = setSemanticsProgress)
                     }
                 },
         )
@@ -1130,8 +1236,6 @@ internal fun PlayerSeekBar(
         (scrubFraction ?: hoverFraction)?.let { shown ->
             val density = LocalDensity.current
             val inset = with(density) { SeekThumbDraggingRadius.toPx() }
-            val trackWidthPx = constraints.maxWidth - 2 * inset
-            val anchorPx = inset + shown * trackWidthPx
             val gapPx = with(density) { 2.dp.roundToPx() }
             val dragging = scrubFraction != null
             Surface(
@@ -1141,7 +1245,14 @@ internal fun PlayerSeekBar(
                 contentColor = if (dragging) scheme.onPrimary else scheme.inverseOnSurface,
                 modifier = Modifier.layout { measurable, constraints ->
                     val placeable = measurable.measure(constraints.copy(minWidth = 0, minHeight = 0))
-                    val maxX = (constraints.maxWidth - placeable.width).coerceAtLeast(0)
+                    val widthPx = when {
+                        barWidthPx > 0 -> barWidthPx
+                        constraints.hasBoundedWidth -> constraints.maxWidth
+                        else -> 0
+                    }
+                    val trackWidthPx = (widthPx - 2 * inset).coerceAtLeast(0f)
+                    val anchorPx = inset + shown * trackWidthPx
+                    val maxX = (widthPx - placeable.width).coerceAtLeast(0)
                     val x = (anchorPx - placeable.width / 2f).roundToInt().coerceIn(0, maxX)
                     layout(0, 0) { placeable.place(x, -placeable.height - gapPx) }
                 },
@@ -1161,7 +1272,8 @@ internal fun PlayerSeekBar(
 private fun seekFractionAt(x: Float, width: Float, inset: Float): Float =
     ((x - inset) / (width - 2 * inset).coerceAtLeast(1f)).coerceIn(0f, 1f)
 
-private class SeekTrackColors(val active: Color, val inactive: Color, val buffered: Color)
+@Immutable
+private data class SeekTrackColors(val active: Color, val inactive: Color, val buffered: Color)
 
 /**
  * 轨道从左到右：已播放段、手柄、缓冲段、未播放段。[inset] 是两端给手柄留的边，
@@ -1307,17 +1419,6 @@ internal fun formatSpeed(speed: Float): String = formatSpeedPreset(speed) + "x"
 internal fun formatSpeedMultiplier(speed: Float): String = formatSpeedPreset(speed) + "×"
 
 // 按两位小数取整后去掉末尾的 0：1.00 显示为 1，1.50 显示为 1.5
-internal fun formatSpeedPreset(speed: Float): String =
-    BigDecimal(speed.toDouble()).setScale(2, RoundingMode.HALF_UP).stripTrailingZeros().toPlainString()
+internal fun formatSpeedPreset(speed: Float): String = formatPlaybackSpeed(speed)
 
-internal fun formatTime(millis: Long): String {
-    val totalSeconds = (millis / 1000).coerceAtLeast(0)
-    val seconds = totalSeconds % 60
-    val minutes = (totalSeconds / 60) % 60
-    val hours = totalSeconds / 3600
-    return if (hours > 0) {
-        String.format(Locale.US, "%d:%02d:%02d", hours, minutes, seconds)
-    } else {
-        String.format(Locale.US, "%02d:%02d", minutes, seconds)
-    }
-}
+internal fun formatTime(millis: Long): String = formatDurationMillis(millis)

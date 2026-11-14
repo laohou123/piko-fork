@@ -29,8 +29,16 @@ kotlin {
         }
     }
     jvm("desktop")
+    listOf(iosArm64(), iosSimulatorArm64()).forEach { target ->
+        target.binaries.configureEach {
+            freeCompilerArgs += "-Xoverride-konan-properties=minVersion.ios=15.0"
+        }
+        target.compilations.getByName("main").cinterops.create("pikoSqlite") {
+            defFile = project.file("src/nativeInterop/cinterop/pikoSqlite.def")
+        }
+    }
 
-    // 两个目标都是 JVM：用得到 java.net 的代码（代理选择）放在 jvmShared，只写一份
+    // Android 与 Desktop 都是 JVM：用得到 java.net 的代码（代理选择）放在 jvmShared，只写一份
     @OptIn(org.jetbrains.kotlin.gradle.ExperimentalKotlinGradlePluginApi::class)
     applyDefaultHierarchyTemplate {
         common {
@@ -71,8 +79,17 @@ kotlin {
         }
         // SQLDelight 的驱动在各端入口实现（AndroidSqliteDriver / JdbcSqliteDriver），
         // 见 app 与 desktopApp 的 LibraryDriverFactory
+        val desktopMain by getting {
+            dependencies {
+                implementation(libs.sqlite.jdbc)
+            }
+        }
         commonTest.dependencies {
             implementation(kotlin("test"))
+            implementation(libs.ktor.client.mock)
+        }
+        iosMain.dependencies {
+            implementation(libs.ktor.client.darwin)
         }
         // 冒烟测试用 MockEngine 顶替 PikPak 的 API 与 CDN，SDK 的请求、鉴权与解析仍走真实代码
         val desktopTest by getting {
@@ -83,5 +100,12 @@ kotlin {
                 implementation(libs.ktor.client.okhttp)
             }
         }
+    }
+}
+
+if (providers.gradleProperty("pikoTestLowHeap").isPresent) {
+    tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
+        maxHeapSize = "256m"
+        systemProperty("piko.test.lowheap", "true")
     }
 }

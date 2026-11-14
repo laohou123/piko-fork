@@ -6,6 +6,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
+import dev.piko.shared.log.PikoLog
 import java.awt.Image
 import java.awt.SystemTray
 import java.awt.TrayIcon
@@ -35,6 +36,8 @@ import javax.swing.SwingUtilities
  * 宽字符 Tooltip）配合 FFM 直调 user32.dll 的宽字符菜单接口（CreatePopupMenu + AppendMenuW +
  * TrackPopupMenu），彻底消除编码乱码并保留 Windows 11 原生圆角与深浅色菜单样式。
  */
+private const val TAG = "Tray"
+
 @Composable
 internal fun WindowsSystemTray(
     tooltip: String,
@@ -43,16 +46,28 @@ internal fun WindowsSystemTray(
     quitLabel: String,
     onShow: () -> Unit,
     onQuit: () -> Unit,
+    transfersLabel: String? = null,
+    onOpenTransfers: (() -> Unit)? = null,
+    pauseAllLabel: String? = null,
+    onPauseAll: (() -> Unit)? = null,
+    onUnavailable: () -> Unit = {},
 ) {
     val currentShowLabel by rememberUpdatedState(showLabel)
     val currentQuitLabel by rememberUpdatedState(quitLabel)
     val currentDarkTheme by rememberUpdatedState(darkTheme)
     val currentOnShow by rememberUpdatedState(onShow)
     val currentOnQuit by rememberUpdatedState(onQuit)
+    val currentTransfersLabel by rememberUpdatedState(transfersLabel)
+    val currentOnOpenTransfers by rememberUpdatedState(onOpenTransfers)
+    val currentPauseAllLabel by rememberUpdatedState(pauseAllLabel)
+    val currentOnPauseAll by rememberUpdatedState(onPauseAll)
+    val currentOnUnavailable by rememberUpdatedState(onUnavailable)
 
     val awtImage: Image = remember {
         runCatching {
             object {}.javaClass.getResourceAsStream("/app-icon.png")?.use(ImageIO::read)
+        }.onFailure {
+            PikoLog.w(TAG, "Failed to decode tray icon resource; using blank fallback", it)
         }.getOrNull() ?: BufferedImage(16, 16, BufferedImage.TYPE_INT_ARGB)
     }
 
@@ -72,11 +87,15 @@ internal fun WindowsSystemTray(
                         val showText = currentShowLabel
                         val quitText = currentQuitLabel
                         val dark = currentDarkTheme
+                        val transfersText = currentTransfersLabel.takeIf { currentOnOpenTransfers != null }
+                        val pauseText = currentPauseAllLabel.takeIf { currentOnPauseAll != null }
                         Thread({
                             try {
-                                when (Win32PopupMenu.show(showText, quitText, dark)) {
+                                when (Win32PopupMenu.show(showText, quitText, dark, transfersText, pauseText)) {
                                     ID_SHOW -> SwingUtilities.invokeLater { currentOnShow() }
                                     ID_QUIT -> SwingUtilities.invokeLater { currentOnQuit() }
+                                    ID_TRANSFERS -> SwingUtilities.invokeLater { currentOnOpenTransfers?.invoke() }
+                                    ID_PAUSE_ALL -> SwingUtilities.invokeLater { currentOnPauseAll?.invoke() }
                                 }
                             } finally {
                                 menuShowing.set(false)
@@ -96,13 +115,26 @@ internal fun WindowsSystemTray(
     }
 
     DisposableEffect(trayIcon) {
-        val tray = runCatching { SystemTray.getSystemTray() }.getOrNull()
-        SwingUtilities.invokeLater {
-            runCatching { tray?.add(trayIcon) }
+        val tray = runCatching { SystemTray.getSystemTray() }
+            .onFailure {
+                PikoLog.w(TAG, "Failed to obtain Windows SystemTray", it)
+                currentOnUnavailable()
+            }
+            .getOrNull()
+        if (tray != null) {
+            SwingUtilities.invokeLater {
+                runCatching { tray.add(trayIcon) }
+                    .onFailure {
+                        PikoLog.w(TAG, "Failed to install Windows system tray icon", it)
+                        SwingUtilities.invokeLater { currentOnUnavailable() }
+                    }
+            }
         }
         onDispose {
-            SwingUtilities.invokeLater {
-                runCatching { tray?.remove(trayIcon) }
+            if (tray != null) {
+                SwingUtilities.invokeLater {
+                    runCatching { tray.remove(trayIcon) }
+                }
             }
         }
     }
@@ -110,6 +142,8 @@ internal fun WindowsSystemTray(
 
 private const val ID_SHOW = 1001
 private const val ID_QUIT = 1002
+private const val ID_TRANSFERS = 1003
+private const val ID_PAUSE_ALL = 1004
 
 private object Win32PopupMenu {
     private const val WS_POPUP = 0x80000000.toInt()
@@ -198,7 +232,7 @@ private object Win32PopupMenu {
         }.getOrNull()
     }
 
-    fun show(showLabel: String, quitLabel: String, darkTheme: Boolean): Int = runCatching {
+    fun show(showLabel: String, quitLabel: String, darkTheme: Boolean, transfersLabel: String?, pauseAllLabel: String?): Int = runCatching {
         runCatching {
             val mode = if (darkTheme) PREFERRED_APP_MODE_FORCE_DARK else PREFERRED_APP_MODE_FORCE_LIGHT
             setPreferredAppMode?.invokeWithArguments(mode)
@@ -223,6 +257,8 @@ private object Win32PopupMenu {
                 if (hMenu == MemorySegment.NULL) return 0
                 try {
                     appendMenuW.invokeWithArguments(hMenu, MF_STRING, ID_SHOW.toLong(), arena.utf16Z(showLabel))
+                    transfersLabel?.let { appendMenuW.invokeWithArguments(hMenu, MF_STRING, ID_TRANSFERS.toLong(), arena.utf16Z(it)) }
+                    pauseAllLabel?.let { appendMenuW.invokeWithArguments(hMenu, MF_STRING, ID_PAUSE_ALL.toLong(), arena.utf16Z(it)) }
                     appendMenuW.invokeWithArguments(hMenu, MF_SEPARATOR, 0L, MemorySegment.NULL)
                     appendMenuW.invokeWithArguments(hMenu, MF_STRING, ID_QUIT.toLong(), arena.utf16Z(quitLabel))
                     setMenuDefaultItem.invokeWithArguments(hMenu, ID_SHOW, 0)
@@ -251,7 +287,7 @@ private object Win32PopupMenu {
                 destroyWindow.invokeWithArguments(hwnd)
             }
         }
-    }.getOrDefault(0)
+    }.onFailure { PikoLog.w(TAG, "Failed to show Win32 tray popup menu", it) }.getOrDefault(0)
 
     private fun Arena.utf16Z(text: String): MemorySegment {
         val chars = text.toCharArray()

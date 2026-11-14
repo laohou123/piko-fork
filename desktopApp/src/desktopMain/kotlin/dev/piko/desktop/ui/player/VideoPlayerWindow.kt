@@ -13,18 +13,31 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.Stable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.snapshots.Snapshot
 import dev.piko.data.auth.PlayerGestureDefaults
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.painter.Painter
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEvent
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.isAltPressed
+import androidx.compose.ui.input.key.isCtrlPressed
+import androidx.compose.ui.input.key.isMetaPressed
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.PointerIcon
+import androidx.compose.ui.platform.LocalWindowInfo
 import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.WindowPlacement
@@ -53,10 +66,12 @@ import dev.piko.ui.PikoServices
 import dev.piko.ui.VideoPlayerRequest
 import dev.piko.ui.components.LocalPointerSource
 import dev.piko.ui.components.PointerSource
+import dev.piko.ui.components.trackInputModality
 import dev.piko.ui.components.trackPointerSource
 import dev.piko.ui.platform.LocalPikoPlatform
 import dev.piko.ui.platform.PikoPlatform
 import dev.piko.ui.screens.player.MobilePlayerControls
+import dev.piko.ui.workbench.ShortcutsDialog
 import dev.piko.desktop.AwtDialogs
 import dev.piko.ui.screens.player.rememberPlayerFileActions
 import kotlinx.coroutines.launch
@@ -88,7 +103,10 @@ import java.awt.image.BufferedImage
 import java.io.File
 import org.openani.mediamp.ExperimentalMediampApi
 import org.openani.mediamp.compose.MediampPlayerSurface
-import org.openani.mediamp.compose.rememberMediampPlayer
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import org.openani.mediamp.MediampPlayer
 
 /**
  * 独立的视频播放窗口。取流、续播与重连在共用的 [PlayerScreenState]，控件是与 Android 共用的
@@ -121,21 +139,68 @@ fun VideoPlayerWindow(
         isBorderlessFullscreen = { isFullscreen },
         sizeToSave = { size -> if (windowTurned) DpSize(size.height, size.width) else size },
     )
+    val closeScope = rememberCoroutineScope()
+    var closeRequested by remember { mutableStateOf(false) }
+    val requestClose: () -> Unit = {
+        if (!closeRequested) {
+            closeRequested = true
+            if (isMacOs && windowState.placement == WindowPlacement.Fullscreen) {
+                // 先退出 AppKit 原生全屏空间，再移除窗口组合。
+                windowState.placement = WindowPlacement.Floating
+                closeScope.launch {
+                    delay(220)
+                    onClose()
+                }
+            } else {
+                onClose()
+            }
+        }
+    }
     // 换集后标题跟着当前这集走
     var title by remember { mutableStateOf(request.fileName) }
+    var shortcutsOpen by remember { mutableStateOf(false) }
+    var fallbackKeyHandler by remember { mutableStateOf<((KeyEvent) -> Boolean)?>(null) }
+    val shortcutModifier = platform.shortcutModifier
 
     PikoWindow(
-        onCloseRequest = onClose,
+        onCloseRequest = requestClose,
         title = tr("$title - Piko 播放器", "$title - Piko Player", "$title - Pikoプレーヤー", "$title - Piko 플레이어", "$title - Piko 播放器"),
         icon = icon,
         state = windowState,
+        onPreviewKeyEvent = { event ->
+            if (event.type == KeyEventType.KeyDown &&
+                (event.key == Key.F1 || (shortcutModifier.isPressed(event) && event.key == Key.Slash))
+            ) {
+                shortcutsOpen = !shortcutsOpen
+                true
+            } else if (event.type == KeyEventType.KeyDown && shortcutModifier.isPressed(event) && event.key == Key.W) {
+                requestClose()
+                true
+            } else if (shortcutsOpen && event.type == KeyEventType.KeyDown && event.key == Key.Escape) {
+                shortcutsOpen = false
+                true
+            } else {
+                false
+            }
+        },
+        onKeyEvent = { event ->
+            if (shortcutsOpen) false else fallbackKeyHandler?.invoke(event) == true
+        },
     ) {
         // 画面四周是黑的，窗口外框不随应用主题，始终用深色
         TitleBarThemeEffect(window, dark = true)
         PixelAlignedContentEffect(window)
+        val windowId = remember(request) { "player-${request.hashCode()}" }
+        val focused = LocalWindowInfo.current.isWindowFocused
+        LaunchedEffect(windowId, focused) {
+            services.onWindowFocusChanged(windowId, focused)
+        }
+        DisposableEffect(windowId) {
+            onDispose { services.onWindowClosed(windowId) }
+        }
         val fullscreen = remember(window) { WindowsFullscreen(window) }
-        // 播放窗口是独立的组合树，主窗口根部的输入来源追踪管不到这里
-        val pointerSource = remember { PointerSource() }
+        // 播放窗口是独立的组合树，主窗口根部的输入来源追踪管不到这里；桌面端初始按鼠标/键盘落点就绪
+        val pointerSource = remember { PointerSource(initialTouchLike = false) }
         val effectiveLanguage by PikoLocale.effectiveLanguageState
         CompositionLocalProvider(
             LocalAppLanguage provides effectiveLanguage,
@@ -153,7 +218,7 @@ fun VideoPlayerWindow(
                     colors = PlayerTitleBarColors,
                     showTitleBar = !inFullscreen,
                     // 播放器顶栏已有标题，Windows 上不再叠一条标题栏，关窗按钮放进顶栏
-                    onCloseInContent = onClose,
+                    onCloseInContent = requestClose,
                 ) {
                     VideoPlayerContent(
                         request = request,
@@ -180,9 +245,13 @@ fun VideoPlayerWindow(
                         onQuarterTurn = {
                             if (!inFullscreen && turnWindow(window, windowState)) windowTurned = !windowTurned
                         },
-                        onClose = onClose,
-                        modifier = Modifier.trackPointerSource(pointerSource),
+                        onClose = requestClose,
+                        registerKeyFallback = { fallbackKeyHandler = it },
+                        modifier = Modifier.trackInputModality().trackPointerSource(pointerSource),
                     )
+                    if (shortcutsOpen) {
+                        ShortcutsDialog(shortcutModifier, onDismiss = { shortcutsOpen = false })
+                    }
                 }
             }
         }
@@ -234,14 +303,19 @@ private fun VideoPlayerContent(
     onTitleChange: (String) -> Unit,
     onQuarterTurn: () -> Unit,
     onClose: () -> Unit,
+    registerKeyFallback: (((KeyEvent) -> Boolean)?) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val scope = rememberCoroutineScope()
-    val player = rememberMediampPlayer()
+    // 不使用 rememberMediampPlayer：其 RememberObserver 会在 EDT 同步销毁原生播放器。
+    // 按 request 隔离生命周期，避免窗口内切换打开新视频时旧 state 的异步销毁回调误杀新请求正在使用的 backend/player。
+    val playerJob = remember(request) { SupervisorJob() }
+    val playerScope = remember(playerJob) { CoroutineScope(Dispatchers.Main.immediate + playerJob) }
+    val player = remember(playerScope) { MediampPlayer(Unit, playerScope.coroutineContext) }
     // 偏好是 StateFlow，first() 当场返回
     val hardwareDecoding = remember { runBlocking { services.preferences.hardwareDecodingFlow.first() } }
     val backend = remember(player) {
-        MediampPlaybackBackend(player, scope, hardwareDecoding = hardwareDecoding).also { created ->
+        MediampPlaybackBackend(player, playerScope, hardwareDecoding = hardwareDecoding).also { created ->
             // mpv 的音量在换文件时保留，只需在开窗时设一次
             settings.get(KEY_PLAYER_VOLUME).toFloatOrNull()?.let(created::setVolume)
         }
@@ -277,7 +351,7 @@ private fun VideoPlayerContent(
             defaultMaxHeight = { services.preferences.playbackMaxHeightFlow.first() },
         )
     }
-    val volume = remember(backend) { backend.volume?.let { BackendVolume(backend) } }
+    val volume = remember(backend) { Snapshot.withoutReadObservation { backend.volume }?.let { BackendVolume(backend) } }
     val isSpoilerBlurEnabled by services.preferences.spoilerBlurFlow.collectAsState(initial = true)
     val seekStepSeconds by services.preferences.playerSeekStepSecondsFlow
         .collectAsState(initial = PlayerGestureDefaults.SEEK_STEP_SECONDS)
@@ -308,7 +382,7 @@ private fun VideoPlayerContent(
         LaunchedEffect(window) {
             delay(1_000)
             if (window.renderApi.name.startsWith("SOFTWARE")) {
-                PikoLog.w("Player", "Skiko 以 ${window.renderApi} 渲染，Linux 上播放器画面出不来")
+                PikoLog.w("Player", "Skiko is using ${window.renderApi}; hardware OpenGL video rendering is unavailable on Linux")
                 snackbarHostState.showSnackbar(tr("未检测到可用的硬件 OpenGL，无法渲染视频画面。请检查显卡驱动程序。", "Hardware OpenGL is unavailable; unable to render video. Check your graphics driver.", "利用可能なハードウェアOpenGLがないため映像を描画できません。グラフィックスドライバーを確認してください。", "사용 가능한 하드웨어 OpenGL이 없어 동영상을 렌더링할 수 없습니다. 그래픽 드라이버를 확인해 주세요.", "未偵測到可用的硬體 OpenGL，無法繪製影片畫面。請檢查顯示卡驅動程式。"), withDismissAction = true)
             }
         }
@@ -325,15 +399,59 @@ private fun VideoPlayerContent(
         onDispose { displayLease?.close() }
     }
 
-    DisposableEffect(state) {
-        onDispose { state.release() }
-    }
-    DisposableEffect(player) {
-        onDispose { player.close() }
+    DisposableEffect(state, backend, player) {
+        onDispose {
+            // release 的回调在 retireScope 的 IO 线程执行，代理流已全部关闭。
+            state.release {
+                backend.markClosing()
+                playerJob.cancel()
+                runCatching { player.close() }.onFailure { PikoLog.w("Player", "Failed to close native player", it) }
+            }
+        }
     }
 
     Box(modifier.fillMaxSize().background(Color.Black)) {
         if (state.isImage) {
+            val frameless = dev.piko.ui.platform.LocalFramelessWindow.current
+            val latestFullscreen by rememberUpdatedState(isFullscreen)
+            val latestToggleFullscreen by rememberUpdatedState(onToggleFullscreen)
+            val latestFrameless by rememberUpdatedState(frameless)
+            val heldImageKeys = remember { HashSet<Key>() }
+            val windowFocused = LocalWindowInfo.current.isWindowFocused
+            LaunchedEffect(windowFocused) {
+                if (!windowFocused) heldImageKeys.clear()
+            }
+            DisposableEffect(Unit) {
+                registerKeyFallback { event ->
+                    when (event.type) {
+                        KeyEventType.KeyUp -> {
+                            heldImageKeys.remove(event.key)
+                            false
+                        }
+                        KeyEventType.KeyDown -> {
+                            if (event.isCtrlPressed || event.isAltPressed || event.isMetaPressed) false
+                            else when (event.key) {
+                                Key.F, Key.F11 -> {
+                                    if (heldImageKeys.add(event.key)) latestToggleFullscreen()
+                                    true
+                                }
+                                Key.Escape -> if (latestFullscreen) {
+                                    if (heldImageKeys.add(Key.Escape)) latestToggleFullscreen()
+                                    true
+                                } else false
+                                Key.T -> {
+                                    val fw = latestFrameless ?: return@registerKeyFallback false
+                                    if (heldImageKeys.add(Key.T)) fw.setAlwaysOnTop(!fw.isAlwaysOnTop)
+                                    true
+                                }
+                                else -> false
+                            }
+                        }
+                        else -> false
+                    }
+                }
+                onDispose { registerKeyFallback(null) }
+            }
             AsyncImage(
                 model = state.mediaInfo?.currentUrl,
                 contentDescription = state.title,
@@ -351,14 +469,51 @@ private fun VideoPlayerContent(
         } else {
             MediampPlayerSurface(backend.player, Modifier.fillMaxSize())
 
+            val positionMillisProvider = remember(state) { { state.positionMillis } }
+            val bufferedPositionMillisProvider = remember(state) { { state.bufferedPositionMillis } }
+            val handleSeekStepChange: (Int) -> Unit = remember(scope, services.preferences) {
+                { scope.launch { services.preferences.setPlayerSeekStepSeconds(it) } }
+            }
+            val handleLongPressSpeedChange: (Float) -> Unit = remember(scope, services.preferences) {
+                { scope.launch { services.preferences.setPlayerBoostSpeed(it) } }
+            }
+            val handleRotationChange: (Int) -> Unit = remember(state, onQuarterTurn) {
+                { degrees ->
+                    // 只在用户转的时候动窗口；换集时 mpv 自己保留旋转，窗口本就是转过的样子
+                    val turned = (degrees - state.rotationDegrees) % 180 != 0
+                    state.setRotation(degrees)
+                    if (turned) onQuarterTurn()
+                }
+            }
+            val pickLocalSubtitle: () -> Unit = remember(state, scope, snackbarHostState) {
+                {
+                    // 属主要在点击的当下取，launch 之后焦点可能已经变了
+                    val owner = KeyboardFocusManager.getCurrentKeyboardFocusManager().activeWindow
+                    // 文件框开着时照常播放，可能已连播到下一集
+                    val videoFileId = state.fileId
+                    scope.launch {
+                        val file = chooseSubtitleFile(owner) ?: return@launch
+                        if (isPlayerSubtitleName(file.name)) {
+                            state.addLocalSubtitle(videoFileId, file.absolutePath, file.name)
+                        } else {
+                            snackbarHostState.showSnackbar(tr("不支持此字幕格式", "Unsupported subtitle format", "未対応の字幕形式です", "지원하지 않는 자막 형식입니다", "不支援此字幕格式"), withDismissAction = true)
+                        }
+                    }
+                }
+            }
+            val pickDriveSubtitle: (FileStat) -> Unit = remember(state) {
+                { file -> state.addDriveSubtitle(file.id, file.name) }
+            }
+
             MobilePlayerControls(
                 title = state.title,
                 isLocalPlayback = state.isLocalPlayback,
                 isPlaying = state.isPlaying,
                 isLoading = state.isLoading,
-                positionMillis = state.positionMillis,
+                loadingSpeedText = state.loadingSpeedText,
                 durationMillis = state.durationMillis,
-                bufferedPositionMillis = state.bufferedPositionMillis,
+                positionMillisProvider = positionMillisProvider,
+                bufferedPositionMillisProvider = bufferedPositionMillisProvider,
                 playbackSpeed = state.playbackSpeed,
                 aspectRatio = state.aspectRatio,
                 cropRegion = state.cropRegion,
@@ -388,9 +543,9 @@ private fun VideoPlayerContent(
                 onSelectEntry = state::playEntry,
                 hideEpisodeThumbnails = isSpoilerBlurEnabled,
                 seekStepSeconds = seekStepSeconds,
-                onSeekStepChange = { scope.launch { services.preferences.setPlayerSeekStepSeconds(it) } },
+                onSeekStepChange = handleSeekStepChange,
                 longPressSpeed = longPressSpeed,
-                onLongPressSpeedChange = { scope.launch { services.preferences.setPlayerBoostSpeed(it) } },
+                onLongPressSpeedChange = handleLongPressSpeedChange,
                 playbackStats = state::stats,
                 audioTracks = state.audioTracks,
                 selectedAudioTrackId = state.selectedAudioTrackId,
@@ -406,28 +561,10 @@ private fun VideoPlayerContent(
                     scope.launch { snackbarHostState.showSnackbar(message, withDismissAction = true) }
                 },
                 rotationDegrees = state.rotationDegrees.takeIf { state.supportsRotation },
-                onRotationChange = { degrees ->
-                    // 只在用户转的时候动窗口；换集时 mpv 自己保留旋转，窗口本就是转过的样子
-                    val turned = (degrees - state.rotationDegrees) % 180 != 0
-                    state.setRotation(degrees)
-                    if (turned) onQuarterTurn()
-                },
-                onPickLocalSubtitle = fun() {
-                    // 属主要在点击的当下取，launch 之后焦点可能已经变了
-                    val owner = KeyboardFocusManager.getCurrentKeyboardFocusManager().activeWindow
-                    // 文件框开着时照常播放，可能已连播到下一集
-                    val videoFileId = state.fileId
-                    scope.launch {
-                        val file = chooseSubtitleFile(owner) ?: return@launch
-                        if (isPlayerSubtitleName(file.name)) {
-                            state.addLocalSubtitle(videoFileId, file.absolutePath, file.name)
-                        } else {
-                            snackbarHostState.showSnackbar(tr("不支持此字幕格式", "Unsupported subtitle format", "未対応の字幕形式です", "지원하지 않는 자막 형식입니다", "不支援此字幕格式"), withDismissAction = true)
-                        }
-                    }
-                }.takeIf { state.canAddSubtitle },
-                onPickDriveSubtitle = { file: FileStat -> state.addDriveSubtitle(file.id, file.name) }
-                    .takeIf { state.canAddSubtitle },
+                onRotationChange = handleRotationChange,
+                onPickLocalSubtitle = pickLocalSubtitle.takeIf { state.canAddSubtitle },
+                onPickDriveSubtitle = pickDriveSubtitle.takeIf { state.canAddSubtitle },
+                registerKeyFallback = registerKeyFallback,
             )
         }
     }
@@ -448,6 +585,7 @@ private const val KEY_PLAYER_VOLUME = "player.volume"
 private const val VOLUME_SAVE_DEBOUNCE_MILLIS = 500L
 
 /** 桌面没有系统媒体音量可借，音量手势、方向键与底栏滑块调的是 mpv 自身的音量。 */
+@Stable
 private class BackendVolume(private val backend: PlaybackBackend) : PlayerLevelControl {
     override fun current(): Float = backend.volume ?: 1f
 

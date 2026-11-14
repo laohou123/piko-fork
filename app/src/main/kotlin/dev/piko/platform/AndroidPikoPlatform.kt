@@ -8,6 +8,7 @@ import android.content.pm.ActivityInfo
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.res.Configuration
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
@@ -24,13 +25,16 @@ import androidx.compose.material3.ColorScheme
 import androidx.compose.material3.dynamicDarkColorScheme
 import androidx.compose.material3.dynamicLightColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.key
 import androidx.compose.runtime.rememberCoroutineScope
 import kotlinx.coroutines.launch
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.window.Dialog
@@ -40,10 +44,15 @@ import androidx.core.content.FileProvider
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
-import androidx.documentfile.provider.DocumentFile
 import dev.piko.BuildConfig
+import dev.piko.data.auth.AppLanguage
+import dev.piko.data.auth.SessionManager
+import dev.piko.shared.log.PikoLog
+import java.util.concurrent.ConcurrentHashMap
 import dev.piko.shared.media.player.PlaybackBackend
+import kotlinx.coroutines.CancellationException
 import dev.piko.ui.LocalPikoServices
+import dev.piko.ui.platform.BackgroundTransferAccess
 import dev.piko.ui.platform.DownloadLocationPicker
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
@@ -64,6 +73,16 @@ import dev.piko.ui.screens.player.MpvVideoSurface
 import dev.piko.ui.screens.player.findActivity
 import dev.piko.update.AppUpdateService
 import java.io.File
+import android.graphics.Bitmap
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import coil3.BitmapImage
+import coil3.SingletonImageLoader
+import coil3.request.CachePolicy
+import coil3.request.ImageRequest
+import coil3.request.allowHardware
+import coil3.size.Precision
+import dev.piko.ui.screens.clips.BackdropBlurKernel
 import android.os.StatFs
 import dev.piko.ui.platform.DiskSpace
 import kotlinx.coroutines.Dispatchers
@@ -138,14 +157,19 @@ class AndroidPikoPlatform(
             if (uri != null) {
                 scope.launch {
                     val picked = withContext(Dispatchers.IO) {
-                        runCatching {
+                        try {
                             context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
                             val document = android.provider.DocumentsContract.buildDocumentUriUsingTree(uri, android.provider.DocumentsContract.getTreeDocumentId(uri))
                             val name = context.contentResolver.query(document, arrayOf(android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null)?.use {
                                 if (it.moveToFirst()) it.getString(0) else null
-                            } ?: "本地文件夹"
+                            } ?: tr("本地文件夹", "Local folder", "ローカルフォルダー", "로컬 폴더", "本機資料夾")
                             uri.toString() to name
-                        }.getOrNull()
+                        } catch (cancel: CancellationException) {
+                            throw cancel
+                        } catch (e: Exception) {
+                            PikoLog.w(TAG, "Failed to persist permission or query local folder tree (authority=${uri.authority})", e)
+                            null
+                        }
                     }
                     picked?.let { onPicked(it.first, it.second) }
                 }
@@ -159,6 +183,26 @@ class AndroidPikoPlatform(
     // 清单里的 intent-filter 已让 Piko 出现在磁力链接与种子文件的选择器里，默认由用户在选择器里点「始终」。
     // 应用没有接口替用户设定：RoleManager 只管浏览器、电话、短信这类角色，「默认打开」页只管验证过的 http 链接
     override val linkAssociation: LinkAssociation? = null
+
+    override val backgroundTransferAccess: BackgroundTransferAccess = object : BackgroundTransferAccess {
+        override fun isUnrestricted(): Boolean {
+            val pm = context.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager ?: return true
+            return pm.isIgnoringBatteryOptimizations(context.packageName)
+        }
+
+        override fun requestUnrestricted() {
+            val packageUri = Uri.parse("package:${context.packageName}")
+            val requested = runCatching {
+                context.startActivity(
+                    Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, packageUri)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                )
+            }.isSuccess
+            if (!requested) {
+                startActivity(Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            }
+        }
+    }
 
     override val openAppLinkSettings: (() -> Unit) = {
         val packageUri = Uri.parse("package:${context.packageName}")
@@ -181,17 +225,22 @@ class AndroidPikoPlatform(
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return false
         val prefs = context.getSharedPreferences("piko_app_links", Context.MODE_PRIVATE)
         if (prefs.getBoolean("prompt_dismissed", false)) return false
-        return runCatching {
+        return try {
             val manager = context.getSystemService(android.content.pm.verify.domain.DomainVerificationManager::class.java)
-                ?: return@runCatching false
-            val userState = manager.getDomainVerificationUserState(context.packageName) ?: return@runCatching false
-            if (!userState.isLinkHandlingAllowed) return@runCatching true
+                ?: return false
+            val userState = manager.getDomainVerificationUserState(context.packageName) ?: return false
+            if (!userState.isLinkHandlingAllowed) return true
             val hostStates = userState.hostToStateMap
             // 只要用户还没有在「默认打开」里把核心分享域名（mypikpak.com）勾上，就提示
             val mainState = hostStates["mypikpak.com"]
             mainState != android.content.pm.verify.domain.DomainVerificationUserState.DOMAIN_STATE_SELECTED &&
                 mainState != android.content.pm.verify.domain.DomainVerificationUserState.DOMAIN_STATE_VERIFIED
-        }.getOrDefault(false)
+        } catch (cancel: CancellationException) {
+            throw cancel
+        } catch (e: Exception) {
+            PikoLog.w(TAG, "Failed to query domain verification state", e)
+            false
+        }
     }
 
     override fun dismissAppLinkPrompt() {
@@ -217,6 +266,8 @@ class AndroidPikoPlatform(
             .putExtra("title", fileName)
         runCatching {
             context.startActivity(Intent.createChooser(view, tr("选择播放器", "Choose player", "プレーヤーを選択", "플레이어 선택", "選擇播放器")).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        }.onFailure { e ->
+            PikoLog.w("ExternalPlayer", "Failed to launch external video player chooser (mimeType=$mimeType)", e)
         }.isSuccess
     }
 
@@ -274,18 +325,87 @@ class AndroidPikoPlatform(
     }
 
     @Composable
+    override fun ProvideLocalizedEnvironment(
+        language: AppLanguage,
+        content: @Composable () -> Unit,
+    ) {
+        val locale = remember(language) { java.util.Locale.forLanguageTag(language.tag) }
+        if (java.util.Locale.getDefault() != locale) {
+            java.util.Locale.setDefault(locale)
+        }
+        val baseConfig = LocalConfiguration.current
+        val localizedConfig = remember(baseConfig, locale) {
+            Configuration(baseConfig).apply { setLocale(locale) }
+        }
+        val currentContext = LocalContext.current
+        @Suppress("DEPRECATION")
+        if (currentContext.resources.configuration.locales.get(0) != locale) {
+            currentContext.resources.updateConfiguration(localizedConfig, currentContext.resources.displayMetrics)
+            currentContext.applicationContext.resources.updateConfiguration(
+                localizedConfig,
+                currentContext.applicationContext.resources.displayMetrics,
+            )
+        }
+        CompositionLocalProvider(LocalConfiguration provides localizedConfig) {
+            key(language) {
+                content()
+            }
+        }
+    }
+
+    @Composable
     override fun ListScrollbar(state: LazyListState, modifier: Modifier) = Unit
 
     @Composable
     override fun ListScrollbar(state: LazyGridState, modifier: Modifier) = Unit
 
-    override val deviceSummary: String =
-        "Android ${Build.VERSION.RELEASE}（API ${Build.VERSION.SDK_INT}），${Build.MANUFACTURER} ${Build.MODEL}，${Build.SUPPORTED_ABIS.firstOrNull()}"
+    override suspend fun loadPreblurredBackdrop(
+        model: Any,
+        containerWidthPx: Int,
+        containerHeightPx: Int,
+        targetBlurPx: Float,
+    ): ImageBitmap? = withContext(Dispatchers.Default) {
+        try {
+            val request = ImageRequest.Builder(context)
+                .data(model)
+                .size(BackdropBlurKernel.DECODE_MAX_SIDE_PX)
+                .precision(Precision.INEXACT)
+                .allowHardware(false)
+                .memoryCachePolicy(CachePolicy.DISABLED)
+                .build()
+            val rawBitmap = (SingletonImageLoader.get(context).execute(request).image as? BitmapImage)?.bitmap
+                ?: return@withContext null
+            val readable = if (rawBitmap.config == Bitmap.Config.ARGB_8888) {
+                rawBitmap
+            } else {
+                rawBitmap.copy(Bitmap.Config.ARGB_8888, false) ?: return@withContext null
+            }
+            val w = readable.width
+            val h = readable.height
+            if (w <= 0 || h <= 0) return@withContext null
+            val pixels = IntArray(w * h)
+            readable.getPixels(pixels, 0, w, 0, 0, w, h)
+            if (readable !== rawBitmap) readable.recycle()
+            val radius = BackdropBlurKernel.equivalentRadiusPx(w, h, containerWidthPx, containerHeightPx, targetBlurPx)
+            val blurred = BackdropBlurKernel.blurArgb(pixels, w, h, radius)
+            Bitmap.createBitmap(blurred, w, h, Bitmap.Config.ARGB_8888).asImageBitmap()
+        } catch (cancel: CancellationException) {
+            throw cancel
+        } catch (_: Exception) {
+            null
+        }
+    }
 
-    override suspend fun exportLog(fileName: String, content: String): Boolean = runCatching {
-        // 放在缓存目录的 logs 下，由 file_paths.xml 单独授权给 FileProvider；下次导出时覆盖
+    override val deviceSummary: String =
+        "Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT}), ${Build.MANUFACTURER} ${Build.MODEL}, ${Build.SUPPORTED_ABIS.firstOrNull()}"
+
+    override suspend fun exportLog(fileName: String, content: String): Boolean = try {
+        // 放在缓存目录的 logs 下，由 file_paths.xml 单独授权给 FileProvider；每次导出前先清理旧的 .txt 导出副本，避免堆积
         val file = withContext(Dispatchers.IO) {
-            File(context.cacheDir, "logs").apply { mkdirs() }.resolve(fileName).apply { writeText(content) }
+            val dir = File(context.cacheDir, "logs").apply { mkdirs() }
+            dir.listFiles { existing -> existing.isFile && existing.extension.equals("txt", ignoreCase = true) }
+                ?.forEach { it.delete() }
+            dir.resolve(fileName).apply { writeText(content) }
         }
         val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
         val send = Intent(Intent.ACTION_SEND).apply {
@@ -297,10 +417,16 @@ class AndroidPikoPlatform(
         }
         context.startActivity(Intent.createChooser(send, tr("导出日志", "Export logs", "ログをエクスポート", "로그 내보내기", "匯出日誌")).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
         true
-    }.getOrDefault(false)
+    } catch (cancel: CancellationException) {
+        throw cancel
+    } catch (e: Exception) {
+        PikoLog.w(TAG, "Failed to export logs ($fileName)", e)
+        false
+    }
 
     private fun startActivity(intent: Intent) {
         runCatching { context.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+            .onFailure { PikoLog.w(TAG, "Failed to start Activity (action=${intent.action})", it) }
     }
 
     private inner class AndroidLocalFiles : LocalFileActions {
@@ -340,7 +466,9 @@ class AndroidPikoPlatform(
             val uri = if (path.startsWith("content:")) {
                 val fileUri = Uri.parse(path)
                 val authority = fileUri.authority ?: return
-                val documentId = runCatching { DocumentsContract.getDocumentId(fileUri) }.getOrNull() ?: return
+                val documentId = runCatching { DocumentsContract.getDocumentId(fileUri) }
+                    .onFailure { PikoLog.w(TAG, "Failed to resolve SAF document ID for containing folder (authority=$authority)", it) }
+                    .getOrNull() ?: return
                 val parentId = documentId.substringBeforeLast('/', documentId)
                 DocumentsContract.buildTreeDocumentUri(authority, parentId)
             } else {
@@ -357,7 +485,19 @@ class AndroidPikoPlatform(
 
         private fun isDirectory(path: String): Boolean =
             if (path.startsWith("content:")) {
-                DocumentFile.fromSingleUri(context, Uri.parse(path))?.isDirectory == true
+                runCatching {
+                    val uri = Uri.parse(path)
+                    context.contentResolver.query(
+                        uri,
+                        arrayOf(DocumentsContract.Document.COLUMN_MIME_TYPE),
+                        null,
+                        null,
+                        null,
+                    )?.use { cursor ->
+                        cursor.moveToFirst() && !cursor.isNull(0) &&
+                            cursor.getString(0) == DocumentsContract.Document.MIME_TYPE_DIR
+                    } == true
+                }.getOrDefault(false)
             } else {
                 File(path).isDirectory
             }
@@ -366,7 +506,9 @@ class AndroidPikoPlatform(
             val uri = if (path.startsWith("content:")) {
                 val folderUri = Uri.parse(path)
                 val authority = folderUri.authority ?: return
-                val documentId = runCatching { DocumentsContract.getDocumentId(folderUri) }.getOrNull() ?: return
+                val documentId = runCatching { DocumentsContract.getDocumentId(folderUri) }
+                    .onFailure { PikoLog.w(TAG, "Failed to resolve SAF directory document ID (authority=$authority)", it) }
+                    .getOrNull() ?: return
                 DocumentsContract.buildTreeDocumentUri(authority, documentId)
             } else {
                 FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", File(path))
@@ -390,12 +532,32 @@ class AndroidPikoPlatform(
 
     /** 下载位置是 SAF 目录树，选中后持久化授权，偏好里存 content: URI。 */
     private inner class AndroidDownloadLocation : DownloadLocationPicker {
+        private val cachedDisplayNames = ConcurrentHashMap<String, String>()
+
         override val description: String
             get() = tr("默认保存至应用私有目录。选择公共目录后，文件将保存至已授权的文件夹。", "Saved to app-private storage by default. Choose a public folder to save to an authorized location.", "既定ではアプリ専用領域に保存されます。共有フォルダーを選択すると、許可した場所に保存されます。", "기본적으로 앱 전용 폴더에 저장됩니다. 공용 폴더를 선택하면 권한을 허용한 폴더에 저장됩니다.", "預設儲存至應用程式專用目錄。選擇共用目錄後，檔案將儲存至已授權的資料夾。")
 
         override fun displayName(storedPath: String): String {
             if (storedPath.startsWith("content:")) {
-                return DocumentFile.fromTreeUri(context, Uri.parse(storedPath))?.name ?: tr("已选择的文件夹", "Selected folder", "選択したフォルダー", "선택한 폴더", "已選擇的資料夾")
+                cachedDisplayNames[storedPath]?.let { return it }
+                val resolved = runCatching {
+                    val tree = Uri.parse(storedPath)
+                    val docUri = DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree))
+                    context.contentResolver.query(
+                        docUri,
+                        arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME),
+                        null,
+                        null,
+                        null,
+                    )?.use { cursor ->
+                        if (cursor.moveToFirst() && !cursor.isNull(0)) cursor.getString(0) else null
+                    }
+                }.getOrNull()
+                if (!resolved.isNullOrEmpty()) {
+                    cachedDisplayNames[storedPath] = resolved
+                    return resolved
+                }
+                return tr("已选择的文件夹", "Selected folder", "選択したフォルダー", "선택한 폴더", "已選擇的資料夾")
             }
             return storedPath.ifBlank {
                 context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS)?.absolutePath
@@ -423,7 +585,10 @@ class AndroidPikoPlatform(
                 val selected = result.data?.data ?: return@rememberLauncherForActivityResult
                 val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
                 runCatching { context.contentResolver.takePersistableUriPermission(selected, flags) }
-                onPicked(selected.toString())
+                    .onFailure { PikoLog.w(TAG, "Failed to persist download folder URI permission (authority=${selected.authority})", it) }
+                val serialized = selected.toString()
+                cachedDisplayNames.remove(serialized)
+                onPicked(serialized)
             }
             return {
                 val initialUri = DocumentsContract.buildTreeDocumentUri(
@@ -468,6 +633,7 @@ class AndroidPikoPlatform(
 
         private fun persistReadPermission(uri: Uri) {
             runCatching { context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+                .onFailure { PikoLog.w(TAG, "Failed to persist upload read URI permission (authority=${uri.authority})", it) }
         }
     }
 
@@ -508,8 +674,9 @@ class AndroidPikoPlatform(
         override fun rememberPreviewBackend(keyframeStart: Boolean): PreviewBackend {
             val preferences = LocalPikoServices.current.preferences
             return remember {
-                // 启动时已读过偏好，DataStore 有缓存，first() 不等磁盘
-                val hardwareDecoding = runBlocking { preferences.hardwareDecodingFlow.first() }
+                // 启动时已预加载主偏好内存快照，优先零阻塞直取，仅非标准实现时回退协程首帧读取
+                val hardwareDecoding = (preferences as? SessionManager)?.currentHardwareDecoding()
+                    ?: runBlocking { preferences.hardwareDecodingFlow.first() }
                 MpvPreviewBackend(MpvPlaybackBackend(context, preview = true, keyframeStart = keyframeStart, hardwareDecoding = hardwareDecoding))
             }
         }
@@ -526,6 +693,10 @@ class AndroidPikoPlatform(
         override fun setBufferAhead(seconds: Int) = mpv.setBufferAhead(seconds)
 
         override fun bufferReport(): String? = mpv.bufferReport()
+    }
+
+    private companion object {
+        const val TAG = "Platform"
     }
 }
 

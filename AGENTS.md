@@ -61,8 +61,8 @@ gh workflow run release.yml -f version=9.9.9      # 发版演练：完整执行�
 
 ### 测试、构建来源证明与草稿公开
 
-1. `release.yml` 通过前置校验后，首先调用 `test.yml` 在真实系统环境运行全套单元测试与安装包冒烟测试（含 Windows、macOS、Linux 全新安装与应用内更新，固定使用已发布的 SDK）。修改发版脚本或工作流后，须先通过 `gh workflow run release.yml -f version=9.9.9` 执行一次演练（完整运行测试、打包与汇总并保留 workflow 产物，跳过创建 Release 与构建来源证明）。
-2. 全量测试通过后，Android、Windows（x64、arm64）、macOS（arm64）与 Linux（x64）并行构建正式包并执行 JVM 字节码校验（`VerifyClasses.java`），汇总至 `release` job 生成 Windows zstd 差分包、计算 `SHA256SUMS.txt`、生成 `release.json`，并出具两份构建来源证明：GitHub 原生 `attest-build-provenance` 与隔离上下文 `slsa-github-generator` 生成的 SLSA Build L3 证明（`multiple.intoto.jsonl`）。
+1. `release.yml` 通过前置校验后，同时并行启动 `test.yml` 全量测试（在真实系统环境运行全套单元测试与安装包冒烟测试，含 Windows、macOS、Linux 全新安装与应用内更新及 iOS 模拟器原生测试，固定使用已发布的 SDK）与各平台正式包构建。修改发版脚本或工作流后，须先通过 `gh workflow run release.yml -f version=9.9.9` 执行一次演练（完整运行测试、打包与汇总并保留 workflow 产物，跳过创建 Release 与构建来源证明）。
+2. Android、Windows（x64、arm64）、macOS（arm64）、Linux（x64）与 iOS（arm64，调用可复用工作流 `ios-ipa.yml`）并行构建正式包并执行 JVM 字节码校验（`VerifyClasses.java`），`windows` 完成后紧接在 `windows-deltas` job 生成 Windows zstd 差分包；待 `test` 与全部平台构建均通过后汇总至 `release` job 计算 `SHA256SUMS.txt`、生成 `release.json`，并出具两份构建来源证明：GitHub 原生 `attest-build-provenance` 与隔离上下文 `slsa-github-generator` 生成的 SLSA Build L3 证明（`multiple.intoto.jsonl`）。
 3. `release` job 将 `# zh-Hans` 段落拼接在 `.github/release-notes.md`（自 `## 下载` 起的设备附件表与校验说明）之前作为 GitHub Release 页面正文，同时将 `zh-Hans` 写入 `release.json` 的 `body` 字段，并将全部五种语言写入 `release.json` 的 `localized_notes` 字段，最终创建**草稿（Draft）** Release。草稿对 `releases/latest` 不可见，应用内更新在草稿公开前不会触发提示。应用内更新弹窗读取 GitHub Release 正文时在 `## 下载` 处截断（`GithubReleases.kt` 的 `updateNotesOf`，由 `ReleaseNotesTest` 守护），修改该标题须同步更新代码与模板；客户端同时按 `PikoLocale.effectiveLanguage` 优先展示匹配语言的更新说明（详见 `shared/src/commonMain/kotlin/dev/piko/shared/update/AGENTS.md`）。
 4. 核对草稿附件与正文无误后，执行 `gh release edit <tag> --draft=false` 正式公开。按 tag 查询的 GitHub REST 接口不返回草稿；若 `gh` 按 tag 无法定位草稿，可通过 `gh api repos/NihilDigit/piko/releases` 列表接口按 `tag_name` 取得 Release ID。若需手动执行 `gh release edit --notes-file` 修改正文，必须先读回原正文再写入，因为 `--notes-file` 会整段替换正文，直接覆盖会导致附件表丢失。
 
@@ -90,9 +90,9 @@ Windows 触摸与手写笔接入 Compose Desktop 的桥接库独立发布于 `de
 
 所有平台共用同一套自适应工作区模型（详见 `docs/development/adaptive-frontend-framework.md`、`docs/development/interaction-refactor.md` 与 `ui/AGENTS.md`）：
 
-- **工作区与上下文集合**：`PikoDriveRepository` 不持有导航栈或剪贴板。所有平台共享 `shared/presentation/DriveWorkspace` 维护文件标签的位置、历史、最近访问文件夹（`recentFoldersFlow`）与文件剪贴板；`WorkspaceContexts` 在同一有序集合中按稳定 ID 管理文件标签、查重报告与独立导入草稿。`WorkspaceViewModel` 由账号级 `AccountPresentationStores` 持有，不随主界面重组或宽窄布局切换而销毁。宽窗口（至少 `840×480dp`）在顶部常驻显示标签栏（`DriveTabBar`），窄窗口或低高度窗口通过顶栏数字入口打开双列页面缩略图总览切换同一组工作上下文。
+- **工作区与上下文集合**：`PikoDriveRepository` 不持有导航栈或剪贴板。所有平台共享 `shared/presentation/DriveWorkspace` 维护文件标签的位置、历史、固定状态（`DriveTab.pinId`）、最近访问文件夹（`recentFoldersFlow`）与文件剪贴板；`WorkspaceContexts` 在同一有序集合中按稳定 ID 管理文件标签、查重报告与独立导入草稿。已固定的文件标签始终排在上下文集合前部且禁止直接关闭（需先取消固定），侧边栏与外部定位跳转优先复用未固定标签或自动新建标签，不覆盖固定标签；固定标签目录按账号经 `PinnedTabs`（带 90 天取消固定墓碑的 LWW 账本）与 `PinnedTabSync` 跨设备同步至 `.piko/pinned-tabs-<时间戳>.json`。`WorkspaceViewModel` 由账号级 `AccountPresentationStores` 持有，不随主界面重组或宽窄布局切换而销毁。宽窗口（至少 `600×480dp`）在顶部常驻显示标签栏（`DriveTabBar`），窄窗口或低高度窗口通过顶栏数字入口打开双列页面缩略图总览切换同一组工作上下文。
 - **作用域分离与保存目标**：查询展示订阅使用浏览会话子作用域，已接受的文件写操作使用账号级 `AccountExecutionScopes`。外部上传的默认目录经账号工作区的 `SaveTargetBinding` 注入 `SaveTargetContext`；新建导入草稿在打开那一刻从 `SaveTargetContext` 取得当前主文件目录并固定为该草稿的默认保存目标，此后浏览其他目录不会篡改该草稿的目标目录。资料库页（`Screen.Library`）、临时定位浏览页与目录选择器浮层（`FolderPickerState`）均维护各自独立的路径栈，严禁从仓库读取所谓「当前目录」或直接改动主工作区路径栈。
-- **界面入口与状态约定**：`ui/src/commonMain` 入口为 `PikoApp`，由 Android `MainActivity` 与桌面 `Main.kt` 分别组装进程级 `PikoServices` 与平台接口 `PikoPlatform`，界面内统一经 `LocalPikoServices` 与 `LocalPikoPlatform` 获取，禁止引用 `PikoApplication.instance`。`DriveScreenState` 作为网盘列表核心接缝，负责文件列表投影、排序、搜索、多选、启发式折叠、防窥揭示与动作分发；普通文件写入经 `FileCommands` 委托 `FileWriteSession`，历史事件删除经 `HistoryCommands` 委托 `HistoryEditSession`，归档清单编辑经 `VaultEntryCommands` 委托 `VaultEntryEditSession`。遵循以下准则：
+- **界面入口与状态约定**：`ui/src/commonMain` 入口为 `PikoApp`，由 Android `MainActivity` 与桌面 `Main.kt` 分别组装进程级 `PikoServices` 与平台接口 `PikoPlatform`，界面内统一经 `LocalPikoServices` 与 `LocalPikoPlatform` 获取，禁止引用 `PikoApplication.instance`。`DriveScreenState` 作为网盘列表核心接缝，负责文件列表投影、排序、搜索、多选、启发式折叠、防窥揭示与动作分发；普通文件编辑经 `FileCommands` 提交至 `FileMutations`，仅复制由 `FileWriteSession` 跟踪远端任务；历史与归档条目编辑分别使用 `HistoryMutations`、`VaultEntryMutations`。普通编辑不进入任务列表。遵循以下准则：
   - Compose 页面投影暴露只读 `State`，业务层与跨层订阅暴露只读 `StateFlow`，严禁将可变状态直接交给视图修改。
   - 高频读取的派生状态必须使用 `derivedStateOf`，避免写成每帧重复计算的普通属性 getter。
   - 即时反馈可通过 `messages: SharedFlow<String>` 驱动 Snackbar，但重要执行结局、待输入状态与恢复入口必须保留为可查询状态，不能仅依赖瞬态流订阅。
@@ -110,11 +110,16 @@ Windows 触摸与手写笔接入 Compose Desktop 的桥接库独立发布于 `de
 
 **新增偏好设置项须同步修改三处**：`PikoUserPreferences` 接口、`SessionManager`（Android DataStore 实现）与 `DesktopPikoPreferences`（桌面 `DesktopSettingsStore` 实现）。若该设置需跨设备同步，再将其加入 `shared/.../shared/sync/PikoSettingsSync.kt` 的 `SyncedSettings`；窗口尺寸、下载目录、网络代理、减少动画、蜗牛模式等设备本地属性不得加入同步。设置同步文件位于网盘根目录 `.piko/settings-<时间戳>.json`（`DriveSettingsStore`，`.piko` 目录在网盘浏览列表中隐藏），按字段记录修改时间戳执行逐项合并，当前设备从未修改过的项视为最旧。机密数据严禁放入普通设置同步（1.1.0 曾明文同步压缩包密码，已停用并清理）；压缩包密码使用账号密码派生的密钥加密后独立存放于 `.piko/archive-passwords-<时间戳>.json`（`ArchivePasswordSync`），新增其他跨设备机密同步须沿用此加密方案。
 
+MetaTube 地址与访问令牌经 `MetaTubeSync` 使用账号密码派生的密钥加密后同步至 `.piko/metatube-<时间戳>.json`，逐字段按修改时刻合并，本机同步账本只存 SHA-256 摘要。「以引用保存」勾选由 `saveAsReferenceFlow` 仅在当前设备记忆，不加入 `SyncedSettings`。
+
 ### 索引、目录树与变更收口
 
 - **文件夹索引（`FolderIndex`）**：文件夹名称与父级关系在仓库的 `FolderIndex` 中维护唯一权威副本，列目录、查详情及客户端自身写操作均实时写入。路径栈、文件标签、浏览历史、最近访问与快速访问均自动跟随索引修正名称与父级（目录重命名时即时更新显示名，移动时更新上级，删除时自动回退至有效祖先）；持久化的 `PikoPathBreadcrumb.name` 仅在索引尚未收录该节点时作为回退值。按文件夹 ID 反查完整路径统一调用 `locateFolder`（优先查本地索引，缺口再向服务端逐级补齐）；资料库虚拟根与压缩包内部层级不进入索引（`isDriveFolderId`），压缩包本身按其文件 ID 记录。
-- **本地全盘树快照（`DriveTreeIndex`）**：按账号维护文件夹、真实文件与已读取归档虚拟条目的内存与本地持久化快照。日常列目录、读取归档清单及哨兵探针增量补丁（`applyCanaryPatch`）实时更新树节点；首次全盘拉取完成后标记为 `isComplete`，后续全盘搜索、按番号子树重命名扫描与跨目录查重均可直接在内存中毫秒级完成 CJK 模糊匹配与子树遍历。
+- **本地全盘树索引（`DriveTreeIndex` 与 SQLite WAL）**：按账号独立维护带 SHA-256 后缀与 `owner_account` 双重校验的原生 SQLite WAL 库（Android 使用系统 `SQLiteDatabase`，Desktop 使用 `sqlite-jdbc`，原生解压定向至 `PikoHome/cache/natives`；无歧义旧版 `drive-tree-*.json` 首次启动流式迁入并清理）。Java 堆仅常驻文件夹骨架与物化子树聚合表（`SubtreeStats`，分别维护物理配额与归档虚拟体量/时长，驱动文件夹按递归大小与时长精确排序及 `Screen.SpaceMap` 空间分布图），不再将全盘数万至数十万文件对象常驻堆内；物理远端事实、文件实例原始存入时间（含归档取回后跨目录移动保留）与按 `GCID + size` 共享的内容媒体元数据三层分离，全盘拉取按分页候选代流式写库，全盘搜索经预归一化 `norm_name` 轻量游标完成 CJK 模糊匹配。重型流式落盘与内存水位统一受 `PikoMemoryGovernor` 协调。
 - **变更统一收口**：一切修改网盘目录结构或文件状态的入口必须调用 `driveRepository.applyChange(DriveChange)`，统一完成 `FolderIndex` 与 `DriveTreeIndex` 原地更新、列表缓存失效及 `folderChanges` 广播；禁止各业务处自行清理缓存或单独通知视图。`DriveScreenState` 与目录图已订阅 `folderChanges` 并仅重列受影响层级，视图层无需重复订阅。
+- **普通写操作的乐观投影**：`OptimisticWrites` 按账号保存待提交操作，界面、路径、搜索与资料库在已确认数据上叠加投影；`DriveScreenState` 保留基础列表供失败回滚。整批选择先投影，同一文件的请求按接受顺序执行，成功经 `applyChange` 写回基础数据，失败仅移除自身投影。撤销基线在前序请求结束后重取，撤销记录先于后序请求放行。成功响应直接确认结果；响应丢失时用绑定账号的原始接口核对，不能用乐观投影证明服务端已执行。复制仍跟随服务端任务。`VaultStore` 按目录排队保存纯函数编辑，完成或失败只移除自己的编辑，再将其余编辑应用于已确认清单。
+- **持久树增量同步**：完整扫描和后续对账使用 SDK `consumeFileChanges`，在全部分页成功后保存末页服务端水位（2026-11-10 跨页实测：水位随 `db_modify_time` 扫描推进，分页期间已读条目的更新会在后续页重现；详见 `docs/development/backend-demand-consistency.md`）。增量页先暂存，全部读取成功后在同一 SQLite 事务中提交数据与游标；切号、在途乐观操作或扫描期间的本地变更使本轮暂存作废。移动先于删除落库，确保已移出的子树保留；清单胜出者变化时清除旧虚拟条目，尚未读取的清单在后续对账继续重试。没有游标或服务端报告游标过期时建立完整基线。
+- **撤销状态与通知**：`DriveChangeJournal.state` 保存撤销记录和结果；提示事件使用有界丢弃队列，发送不挂起。界面用最新提示替换无限期 Snackbar，执行状态的收尾订阅持久状态，不依赖瞬态提示送达。
 
 ### 账号隔离与凭据管理
 
@@ -122,8 +127,9 @@ Windows 触摸与手写笔接入 Compose Desktop 的桥接库独立发布于 `de
 
 - **仓库与工作区切换**：`PikoDriveRepository.enterAccount` 切换文件索引、列表缓存、本地树快照与撤销日志；`AccountPresentationStores` 与 `AccountExecutionScopes` 按账号隔离工作区 ViewModel、导入草稿、查重会话与执行作用域，旧工作区释放时不得覆盖新账号的 `SaveTargetBinding`。根目录清单缓存与在途写事务固定绑定发起时的 `PikPakClient` 实例。
 - **进程级会话与窗口清理**：服务端解压、片段截取、归档等进程级会话以及桌面端独立播放器窗口、独立信息流窗口统一通过 `launchOnAccountLeave` 在主线程终止（`PikoServices` 与桌面 `Main.kt`）。后台下载任务携带 `account` 字段，切离账号时自动暂停该账号任务；任务页与任务入口徽标/速率仅统计当前账号的下载、上传与离线任务（`TransfersState`、`TransferActivity`），切回原账号后原任务仍可见并可继续。
-- **主界面重建与缓存键隔离**：切换账号时 `PikoApp` 根状态整体重建，挂起的信息流、临时定位标签、浮窗位置等界面态随之重置；是否按设备开关自动重开信息流由 `ClipFeedSession.reopensFor` 判定，切换至另一账号时不自动打开。缓存目录中所有按账号落盘的文件键名必须包含账号标识：文件标签、列表缓存、最近访问、来源账本（`sources-`）、归档目录表（`vault-trees-`）、归档星标表（`vault-stars-`）、本地文件树快照及信息流队列（`clip-feed-<账号>-<文件夹>`，因各账号根目录 ID 均为空串，仅凭文件夹 ID 会导致跨账号串数据）。待延迟写盘的数据在切号时立即向原账号落盘，不丢弃。记忆网盘文件夹 ID 的进程级对象（如 `PreviewTempFolder` 的 `Piko-Temp`）与偏好（`AccountScopedPreferences` 中的快速访问、最近移动目标，旧平台偏好值原样保留并记录接管账号以防同机旧版将空值同步回云端）均按账号隔离。
-- **`.piko/` 同步校验与机密保管**：`DriveSettingsStore` 执行设置、归档目录表、归档星标表、来源账本与压缩包密码同步时，每一步读写前均核对当前活动账号仍为发起同步的账号，若已切号则立即中止本轮同步。压缩包密码经进程唯一的 `ArchivePasswordVault`（`PikoServices.archivePasswords`）按账号读写（1.1.0 单账号时期的全局明文表由升级后首个登录账号迁入并删除，开发期设备级密文不迁移）。账号会话与密码合并后交由平台机密存储保管（桌面端细节见 `shared/src/desktopMain/kotlin/dev/piko/shared/auth/AGENTS.md`）；退出登录仅注销当前账号并切换至最近使用的另一账号，系统钥匙串暂时锁定无法读取密码时按无保存密码处理，不视为已退出登录。
+- **主界面重建与缓存键隔离**：切换账号时 `PikoApp` 根状态整体重建，挂起的信息流、临时定位标签、浮窗位置等界面态随之重置；是否按设备开关自动重开信息流由 `ClipFeedSession.reopensFor` 判定，切换至另一账号时不自动打开。缓存目录中所有按账号落盘的文件键名必须包含账号标识：文件标签、固定标签账本（`pinned-tabs-`）、列表缓存、最近访问、来源账本（`sources-`）、归档目录表（`vault-trees-`）、归档星标表（`vault-stars-`）、本地文件树快照及信息流队列（`clip-feed-<账号>-<文件夹>`，因各账号根目录 ID 均为空串，仅凭文件夹 ID 会导致跨账号串数据）。待延迟写盘的数据在切号时立即向原账号落盘，不丢弃。记忆网盘文件夹 ID 的进程级对象（如 `PreviewTempFolder` 的 `Piko-Temp`）与偏好（`AccountScopedPreferences` 中的快速访问、最近移动目标，旧平台偏好值原样保留并记录接管账号以防同机旧版将空值同步回云端）均按账号隔离。
+- **第一方 Google / 浏览器设备授权与 `sub` 槽位归并**：除邮箱/手机号密码登录外，客户端采用第一方 Android `YNxT9w7GMdWvEOKa` 的 RFC 8628 设备授权流（`POST /v1/auth/device/code` -> 系统默认浏览器打开 `https://mypikpak.com/auth?type=google&init=1&origin=...` -> `/drive/qr-login` 确认 -> `POST /v1/auth/token`）完成 Google 登录，保持 100% 完整传输额度与 `/drive/v1` 全量接口权限（严禁改走仅享 25% 传输额度的 Connected Apps / Public OAuth `/api/v1` 路线，严禁在内嵌 WebView / CEF 中打开 Google 授权页）。`PikoClientManager` 在换取令牌后先经 `/v1/user/me` 核对 `sub`，同一 PikPak 账号无论先后使用 Google 还是密码登录均按 `sub` 归并至同一本地存储槽位（未记录 `sub` 的旧版槽位绝不按显示邮箱盲目覆盖）；纯 Google 登录创建的内部槽位键 `pikpak:<sub>` 仅作存储与缓存键，严禁泄露到界面文案或用户名预填框（统一经 `SavedAccount.displayName`、`publicAccountHandle` 与 `resolvePrefillContext` 投影）。续期指定失效账号时强制校验 `sub` 一致，防止误选其他 Google 账号串槽；运行期无密码会话在 `refresh_token` 失效（如 `4126`）触发 `onInteractiveLoginRequired` 时自动标记失效并退回登录页。
+- **`.piko/` 同步校验、独立同步口令与密文保护**：`DriveSettingsStore` 执行设置、固定标签账本、归档目录表、归档星标表、来源账本、压缩包密码与 MetaTube 同步时，每一步读写及旧文件清理前均核对当前活动账号仍为发起同步的账号，若已切号则立即中止本轮同步。压缩包密码（`ArchivePasswordSync`）与 MetaTube 配置（`MetaTubeSync`）优先使用按账号保存在系统机密库中的独立加密同步口令（`syncSecret`，写入 `Envelope version = 2` 以阻止旧版客户端误用账号密码覆盖，且一旦升为 `v2` 绝不回退为 `v1`），未配置时回退到已保存的登录密码（`version = 1`）；在已解锁状态下设置或更换口令会自动用旧密钥解密合并并无损重加密为 `v2`。无可用密钥记为 `LockedNoKey`，远端密文与当前密钥不匹配时记为 `LockedKeyMismatch` 并**严禁自动覆盖远端密文**，仅允许输入匹配口令解锁或由用户显式触发先写 `backup-<前缀><时间戳>.json` 备份再以单调递增时间戳重置云端。账号会话、密码、同步口令与压缩包密码合并后交由平台机密存储保管（桌面端细节见 `shared/src/desktopMain/kotlin/dev/piko/shared/auth/AGENTS.md`）；退出登录仅注销当前账号并切换至最近使用的另一账号，系统钥匙串暂时锁定时跳过加密同步轮次而不视为无密钥或已退出登录。
 
 ### 归档（Vault）、引用写入内核与来源账本
 
@@ -176,11 +182,11 @@ Piko 源码以 `AGPL-3.0-or-later` 许可证发布（1.1.0 及更早版本为 MI
 
 ### 持续集成与冒烟测试（`test.yml`）
 
-`.github/workflows/test.yml` 分层验证跨平台行为：
+`.github/workflows/test.yml` 按变更路径智能筛选目标（`workflow_dispatch` 与发版门控固定全量执行）并分层验证跨平台行为：
 
-- **JVM 单元测试**：Linux runner 执行 `:shared:desktopTest` 与 `:ui:desktopTest`；Windows runner 执行 `:desktopApp:desktopTest` 与 Android `:app:testDebugUnitTest`。
-- **Android 模拟器真机冒烟**：x86_64 模拟器（API 34）执行 `:app:connectedDebugAndroidTest`，走真实 `libmpv` 与回环代理，以 Ktor `MockEngine` 模拟 PikPak 服务端。注意：`connectedDebugAndroidTest` 执行完毕后会自动卸载 `dev.piko.debug`（连同本地登录态与下载任务表一并清除），在日常联调使用的物理真机上运行前必须先征得用户确认，或改用模拟器。
-- **桌面安装包与更新冒烟**：`windows-package`、`windows-package-legacy`、`macos-package` 与 `linux-package`（日常 push 不触发，手动触发 `test.yml` 或正式发版时运行）打包真实安装包并验证全新安装、老版本升级、默认协议关联、在系统文件管理器中定位及内置硬件播放自检（`SelfTest.kt`，详见 `shared/src/commonMain/kotlin/dev/piko/shared/update/AGENTS.md`）。
+- **JVM 单元测试**：Linux runner 执行 `:shared:desktopTest` 与 `:ui:desktopTest`；Windows runner 执行 `:desktopApp:desktopTest` 与 Android `:app:testDebugUnitTest`；macOS runner 执行钥匙串测试 `macos-keychain`。
+- **移动端真机/模拟器冒烟**：Android x86_64 模拟器（API 34）执行 `:app:connectedDebugAndroidTest`，走真实 `libmpv` 与回环代理，以 Ktor `MockEngine` 模拟 PikPak 服务端；iOS 模拟器调用 `ios-native.yml` 执行 `:shared:iosSimulatorArm64Test`、`:ui:iosSimulatorArm64Test` 与 iOS 15 部署目标宿主启动验证。注意：`connectedDebugAndroidTest` 执行完毕后会自动卸载 `dev.piko.debug`（连同本地登录态与下载任务表一并清除），在日常联调使用的物理真机上运行前必须先征得用户确认，或改用模拟器。
+- **桌面安装包与更新冒烟**：`windows-package`、`windows-legacy-upgrade`、`windows-2022-portable`、`macos-package` 与 `linux-package`（日常 push 不触发，手动触发 `test.yml -f desktop=true` 或正式发版时运行）并行打包真实安装包并验证全新安装、老版本升级、默认协议关联、在系统文件管理器中定位及内置硬件播放自检（`SelfTest.kt`，详见 `shared/src/commonMain/kotlin/dev/piko/shared/update/AGENTS.md`）。
 - **Android ICU 正则兼容性防线**：HotSpot JVM 正则引擎与 Android ICU 正则引擎存在致命差异：
   1. ICU 不支持 `\p{IsHan}` 等 Java 专有字符类写法，在 Android 8 上编译正则即直接崩溃（1.0.0 曾发生），汉字脚本类必须统一写为 `\p{script=Han}`。
   2. ICU 的 `\d` 会匹配全部 Unicode 十进制数字字符（如数学粗体数字 `𝟐`、全角数字），提取后直接调用 `toInt()` 会抛出 `NumberFormatException`（1.1.0 信息流曾因此闪退），匹配 ASCII 数字必须统一写为 `[0-9]`。

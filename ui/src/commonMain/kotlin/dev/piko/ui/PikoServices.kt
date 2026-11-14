@@ -2,11 +2,15 @@ package dev.piko.ui
 
 import dev.piko.shared.sync.ArchivePasswordSync
 import dev.piko.shared.sync.DriveSettingsStore
+import dev.piko.shared.sync.EncryptedSyncApplyOutcome
+import dev.piko.shared.sync.EncryptedSyncStatus
 import dev.piko.shared.sync.LibrarySync
 import dev.piko.shared.sync.PikoSettingsSync
+import dev.piko.shared.sync.PinnedTabSync
 import dev.piko.shared.sync.SyncCipher
 import dev.piko.shared.sync.SourceLedgerSync
 import dev.piko.shared.sync.VaultTreeSync
+import dev.piko.shared.download.DriveDownloadFolderSource
 import dev.piko.ui.components.SegmentSession
 import androidx.compose.runtime.staticCompositionLocalOf
 import dev.piko.data.auth.PikoUserPreferences
@@ -20,6 +24,7 @@ import dev.piko.shared.data.InstantMagnetRepository
 import dev.piko.shared.data.MoveHistory
 import dev.piko.shared.data.OfflinePackTracker
 import dev.piko.shared.data.PikoCacheStore
+import dev.piko.shared.data.PikoTreeDatabaseFactory
 import dev.piko.shared.data.PikoAccountRepository
 import dev.piko.shared.data.PikoClientManager
 import dev.piko.shared.data.PreviewTempFolder
@@ -53,10 +58,13 @@ import dev.piko.shared.log.PikoLog
 import dev.piko.shared.log.logFailure
 import dev.piko.shared.scrape.MetaTubeService
 import io.ktor.client.HttpClient
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -66,6 +74,8 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.receiveAsFlow
 import kotlinx.coroutines.launch
+import kotlin.concurrent.Volatile
+import kotlin.time.Clock
 
 /**
  * 界面用到的进程级对象。各端在入口按自己的偏好、会话存储与下载实现拼好一份，
@@ -106,7 +116,12 @@ class PikoServices(
     /** 抓到的字幕写本机、交出上传 uri 的实现（Android 走 FileProvider，桌面写文件）。 */
     subtitleSaver: SubtitleFileSaver? = null,
     localFileAccess: (((String) -> Unit) -> dev.piko.shared.data.LocalFileAccess)? = null,
+    treeDatabaseFactory: PikoTreeDatabaseFactory? = null,
 ) {
+    val memoryGovernor = dev.piko.shared.memory.PikoMemoryGovernor.Shared
+    val workloadGovernor = dev.piko.shared.runtime.PikoWorkloadGovernor.Shared
+    val appPresence = dev.piko.shared.runtime.AppPresence()
+
     private val appNoticesChannel = Channel<String>(Channel.BUFFERED)
     val appNotices: Flow<String> = appNoticesChannel.receiveAsFlow()
     fun postAppNotice(message: String) {
@@ -120,12 +135,13 @@ class PikoServices(
     val preferences: PikoUserPreferences =
         cacheStore?.let { AccountScopedPreferences(platformPreferences, clientManager, it) } ?: platformPreferences
 
-    val driveRepository: DriveRepository = DriveRepository(clientManager, preferences, cacheStore).also {
+    val driveRepository: DriveRepository = DriveRepository(clientManager, preferences, cacheStore, treeDatabaseFactory = treeDatabaseFactory).also {
         val repository = it
         it.localMounts.access = localFileAccess?.invoke { folder ->
             repository.applyChange(dev.piko.shared.data.DriveChange.ContentsChanged(setOf(folder)))
         }
         mediaRepository.localMounts = it.localMounts
+        mediaRepository.metadataSink = it.metadataSink
     }
     internal val presentationStores = dev.piko.ui.workbench.AccountPresentationStores()
     val fileExecutionScopes = dev.piko.shared.state.AccountExecutionScopes(
@@ -134,13 +150,10 @@ class PikoServices(
     val fileWrites = dev.piko.shared.state.FileWriteSession(
         driveRepository, CoroutineScope(backgroundScope.coroutineContext + Dispatchers.Main.immediate),
     )
-    val historyEdits = dev.piko.shared.state.HistoryEditSession(
+    val historyEdits = dev.piko.shared.state.HistoryMutations(
         driveRepository, CoroutineScope(backgroundScope.coroutineContext + Dispatchers.Main.immediate),
     )
-    val vaultEntryEdits = dev.piko.shared.state.VaultEntryEditSession(
-        driveRepository, CoroutineScope(backgroundScope.coroutineContext + Dispatchers.Main.immediate),
-    )
-    val shareSaves = dev.piko.shared.state.ShareSaveSession(
+    val vaultEntryEdits = dev.piko.shared.state.VaultEntryMutations(
         driveRepository, CoroutineScope(backgroundScope.coroutineContext + Dispatchers.Main.immediate),
     )
     val driveWorkspace by lazy { dev.piko.shared.presentation.DriveWorkspace(driveRepository, cacheStore, backgroundScope) }
@@ -149,7 +162,8 @@ class PikoServices(
     val openDriveRequested: StateFlow<Boolean> = _openDriveRequested.asStateFlow()
     fun requestOpenDrive() {
         _openDriveRequested.value = true
-        driveRepository.applyChange(dev.piko.shared.data.DriveChange.ContentsChanged(null))
+        driveRepository.refreshActiveListings()
+        onAppForegrounded()
     }
     fun consumeOpenDriveRequest() { _openDriveRequested.value = false }
     class FileHighlightRequest internal constructor(val account: String, val ids: Set<String>)
@@ -169,11 +183,30 @@ class PikoServices(
     init {
         // 打开归档条目时借的对象放进 Piko-Temp：取到直链就删，偶有删不掉的也随 Piko-Temp 一起清走
         mediaRepository.leaseFolder = { owner -> previewTempFolder.folderId(owner).getOrThrow() }
+        // 绑定默认文件夹下载源，使在递归列目录（Listing）阶段退出的文件夹下载可在下次冷启动后自动接续展开
+        downloadManager.bindDefaultFolderSource(DriveDownloadFolderSource(driveRepository))
     }
 
     val vaultStore: VaultStore get() = driveRepository.vault
 
     val offlinePacks = OfflinePackTracker(instantMagnetRepository, driveRepository, preferences)
+
+    private var taskCenterAccount: String? = null
+    private var taskCenterState: dev.piko.shared.state.TransfersState? = null
+    val taskCenter: dev.piko.shared.state.TransfersState
+        get() {
+            val account = requireNotNull(driveRepository.currentAccount)
+            if (taskCenterAccount != account || taskCenterState == null) {
+                taskCenterAccount = account
+                taskCenterState = dev.piko.shared.state.TransfersState(
+                    downloadManager, taskRepository, offlinePacks, fileExecutionScopes.forAccount(account),
+                    driveRepository, uploadManager, instantSaveRecords, account, archiveExtractSession,
+                    folderVaultSession, listsServerWork = true, fileWrites = fileWrites,
+                    receiving = receivingActivity,
+                )
+            }
+            return requireNotNull(taskCenterState)
+        }
 
     val moveHistory = MoveHistory(preferences, driveRepository, backgroundScope)
 
@@ -185,9 +218,6 @@ class PikoServices(
         cacheStore,
         backgroundScope,
         preferences.settingsSyncFlow,
-        // MetaTube 令牌与翻译 Key 跟着设置走，但要加密：密钥由账号密码派生
-        cipher = syncCipher,
-        passwordOf = clientManager::savedPassword,
     )
         .also { it.start() }
     private val vaultTreeSync = VaultTreeSync(clientManager, driveRepository, backgroundScope, preferences.settingsSyncFlow)
@@ -196,6 +226,50 @@ class PikoServices(
         .also { it.start() }
     private val sourceLedgerSync = SourceLedgerSync(clientManager, driveRepository, backgroundScope, preferences.settingsSyncFlow)
         .also { it.start() }
+    val pinnedTabSync = PinnedTabSync(clientManager, driveRepository, driveWorkspace.pinnedTabs, backgroundScope, preferences.settingsSyncFlow)
+        .also { it.start() }
+
+    // 进程刚启动时各 Sync.start() 已经发起了首轮同步，初始化为当前时刻可避免开屏窗口首次获得焦点时立刻重复跑第二轮同步
+    @Volatile
+    private var lastForegroundSyncMs = Clock.System.now().toEpochMilliseconds()
+
+    /** 设置页「立即同步」：一并拉取与推送偏好设置、固定标签、归档树、归档星标与来源账本。 */
+    suspend fun syncAllNow() {
+        kotlinx.coroutines.coroutineScope {
+            launch { settingsSync.syncNow() }
+            launch { pinnedTabSync.syncNow() }
+            launch { vaultTreeSync.syncNow() }
+            launch { vaultStarSync.syncNow() }
+            launch { sourceLedgerSync.syncNow() }
+            launch { archivePasswordSync?.syncNow() }
+            launch { metaTubeSync?.syncNow() }
+        }
+    }
+
+    fun onWindowFocusChanged(windowId: String, focused: Boolean) {
+        if (appPresence.onWindowFocusChanged(windowId, focused)) {
+            onAppForegrounded()
+        }
+    }
+
+    fun onWindowClosed(windowId: String) {
+        appPresence.onWindowClosed(windowId)
+    }
+
+    /** 窗口重新获得焦点或应用回到前台时轻量增量拉取固定标签与设置（10 秒冷却防抖），无需重启应用即可跨端实时同步。 */
+    fun onAppForegrounded() {
+        val now = Clock.System.now().toEpochMilliseconds()
+        if (now - lastForegroundSyncMs < 10_000L) return
+        lastForegroundSyncMs = now
+        backgroundScope.launch {
+            workloadGovernor.awaitBackgroundSyncAllowed()
+            if (clientManager.currentClient.value != null) {
+                pinnedTabSync.syncNow()
+                settingsSync.syncNow()
+                metaTubeSync?.syncNow()
+            }
+        }
+    }
     /** 当前账号存过的压缩包密码，解压、浏览压缩包与设置页共用这一个，见 ArchivePasswordVault。 */
     val archivePasswords = ArchivePasswordVault(clientManager, clientManager.archivePasswordStore, preferences)
         .also { it.start(backgroundScope) }
@@ -204,8 +278,116 @@ class PikoServices(
         ArchivePasswordSync(clientManager, driveRepository, archivePasswords, it, backgroundScope, preferences.settingsSyncFlow).also { sync -> sync.start() }
     }
 
-    /** API 走哪个根域名：用户固定的，或登录后测速自动挑的，见 PikPakDomainSelector。 */
-    val domainSelector = PikPakDomainSelector(clientManager, preferences, backgroundScope).also { it.start() }
+    private val metaTubeSync = syncCipher?.let {
+        dev.piko.shared.sync.MetaTubeSync(clientManager, driveRepository, preferences, cacheStore, it, backgroundScope, preferences.settingsSyncFlow)
+            .also { sync -> sync.start() }
+    }
+
+    /** 解压密码与 MetaTube 加密同步的综合状态（供设置页提示配置口令或处理密钥不匹配）。 */
+    val encryptedSyncStatus: StateFlow<EncryptedSyncStatus> =
+        if (archivePasswordSync != null && metaTubeSync != null) {
+            kotlinx.coroutines.flow.combine(archivePasswordSync.status, metaTubeSync.status) { a, b ->
+                when {
+                    a == EncryptedSyncStatus.LockedKeyMismatch || b == EncryptedSyncStatus.LockedKeyMismatch ->
+                        EncryptedSyncStatus.LockedKeyMismatch
+                    a == EncryptedSyncStatus.CorruptOrUnsupported || b == EncryptedSyncStatus.CorruptOrUnsupported ->
+                        EncryptedSyncStatus.CorruptOrUnsupported
+                    a == EncryptedSyncStatus.LockedNoKey || b == EncryptedSyncStatus.LockedNoKey ->
+                        EncryptedSyncStatus.LockedNoKey
+                    a == EncryptedSyncStatus.Unlocked || b == EncryptedSyncStatus.Unlocked ->
+                        EncryptedSyncStatus.Unlocked
+                    else -> EncryptedSyncStatus.Idle
+                }
+            }.let { combined ->
+                kotlinx.coroutines.flow.MutableStateFlow(EncryptedSyncStatus.Idle).also { out ->
+                    backgroundScope.launch { combined.collect { out.value = it } }
+                }
+            }
+        } else {
+            MutableStateFlow(EncryptedSyncStatus.Idle)
+        }
+
+    val supportsEncryptedSync: Boolean get() = archivePasswordSync != null
+
+    suspend fun hasSyncPassphraseForCurrentAccount(): Boolean {
+        val account = clientManager.currentClient.value?.account ?: return false
+        return clientManager.hasSyncPassphrase(account)
+    }
+
+    suspend fun updateSyncPassphrase(passphrase: String): PassphraseUpdateResult {
+        val account = clientManager.currentClient.value?.account ?: return PassphraseUpdateResult.Failed
+        return try {
+            if (passphrase.isEmpty()) {
+                clientManager.setSyncPassphrase(account, "")
+                val (archiveOut, metaTubeOut) = coroutineScope {
+                    val a = async { archivePasswordSync?.applyPassphrase(account, "", null) ?: EncryptedSyncApplyOutcome.UNLOCKED }
+                    val m = async { metaTubeSync?.applyPassphrase(account, "", null) ?: EncryptedSyncApplyOutcome.UNLOCKED }
+                    a.await() to m.await()
+                }
+                return if (archiveOut == EncryptedSyncApplyOutcome.UNLOCKED && metaTubeOut == EncryptedSyncApplyOutcome.UNLOCKED) {
+                    PassphraseUpdateResult.SavedAndSynced
+                } else {
+                    PassphraseUpdateResult.SavedOffline
+                }
+            }
+
+            val previousPassphrase = clientManager.rawSyncPassphrase(account)
+            val previousKey = clientManager.syncKeyFor(account)
+            val isKeyRotation = previousKey != null && previousKey.secret != passphrase
+            val (archiveCheck, metaTubeCheck) = coroutineScope {
+                val a = async { archivePasswordSync?.checkPassphrase(account, passphrase, previousKey) ?: EncryptedSyncApplyOutcome.UNLOCKED }
+                val m = async { metaTubeSync?.checkPassphrase(account, passphrase, previousKey) ?: EncryptedSyncApplyOutcome.UNLOCKED }
+                a.await() to m.await()
+            }
+            if (archiveCheck == EncryptedSyncApplyOutcome.KEY_MISMATCH || metaTubeCheck == EncryptedSyncApplyOutcome.KEY_MISMATCH) {
+                return PassphraseUpdateResult.KeyMismatch
+            }
+            // 从已有密钥轮换到新口令时，若离线或远端不可达（DEFERRED），不得覆盖本机旧密钥，否则重启后将丢失自动迁移能力
+            if (isKeyRotation && (archiveCheck != EncryptedSyncApplyOutcome.UNLOCKED || metaTubeCheck != EncryptedSyncApplyOutcome.UNLOCKED)) {
+                return PassphraseUpdateResult.Failed
+            }
+
+            clientManager.setSyncPassphrase(account, passphrase)
+            val archiveOut = archivePasswordSync?.applyPassphrase(account, passphrase, previousKey) ?: EncryptedSyncApplyOutcome.UNLOCKED
+            if (isKeyRotation && archiveOut != EncryptedSyncApplyOutcome.UNLOCKED) {
+                clientManager.setSyncPassphrase(account, previousPassphrase.orEmpty())
+                return if (archiveOut == EncryptedSyncApplyOutcome.KEY_MISMATCH) {
+                    PassphraseUpdateResult.KeyMismatch
+                } else {
+                    PassphraseUpdateResult.Failed
+                }
+            }
+            val metaTubeOut = metaTubeSync?.applyPassphrase(account, passphrase, previousKey) ?: EncryptedSyncApplyOutcome.UNLOCKED
+            when {
+                archiveOut == EncryptedSyncApplyOutcome.KEY_MISMATCH || metaTubeOut == EncryptedSyncApplyOutcome.KEY_MISMATCH -> {
+                    if (archiveOut != EncryptedSyncApplyOutcome.UNLOCKED && metaTubeOut != EncryptedSyncApplyOutcome.UNLOCKED) {
+                        clientManager.setSyncPassphrase(account, previousPassphrase.orEmpty())
+                    }
+                    PassphraseUpdateResult.KeyMismatch
+                }
+                archiveOut == EncryptedSyncApplyOutcome.DEFERRED || metaTubeOut == EncryptedSyncApplyOutcome.DEFERRED ->
+                    PassphraseUpdateResult.SavedOffline
+                else -> PassphraseUpdateResult.SavedAndSynced
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            PikoLog.w(TAG, "Failed to update sync passphrase: ${e::class.simpleName}")
+            PassphraseUpdateResult.Failed
+        }
+    }
+
+    suspend fun resetEncryptedSyncRemote(): Boolean {
+        val account = clientManager.currentClient.value?.account ?: return false
+        return coroutineScope {
+            val archiveOk = async { archivePasswordSync?.resetRemoteWithCurrentKey(account) ?: true }
+            val metaTubeOk = async { metaTubeSync?.resetRemoteWithCurrentKey(account) ?: true }
+            archiveOk.await() && metaTubeOk.await()
+        }
+    }
+
+    /** API 走哪个根域名：用户固定的，或登录后测速自动挑的（冷启动先沿用上次测通的域名），见 PikPakDomainSelector。 */
+    val domainSelector = PikPakDomainSelector(clientManager, preferences, backgroundScope, cacheStore).also { it.start() }
 
     val uploadManager = PikoUploadCoordinator(clientManager, preferences, uploadSources, driveRepository, backgroundScope)
 
@@ -312,14 +494,13 @@ class PikoServices(
                     scope,
                     magnet,
                     saveTargetContext = saveTargets.context,
-                    shareSaves = shareSaves,
                 )
             },
             newStateForDraft = { scope, saveScope, magnet, target ->
                 InstantSheetState(
                     instantMagnetRepository, driveRepository, preferences, previewTempFolder,
                     offlinePacks, instantSaveRecords, scope, magnet,
-                    saveTargetContext = target, shareSaves = shareSaves, saveScope = saveScope,
+                    saveTargetContext = target, saveScope = saveScope,
                 )
             },
         )
@@ -327,19 +508,15 @@ class PikoServices(
 
     val addLink by lazy { dev.piko.shared.presentation.AddLinkViewModel(instantSession) }
 
-    /** 下载片段的面板收起后选好的区间还在，见 [SegmentSession]。 */
+    /** 挂在进程级服务上，网盘页被压栈页临时盖住而离开组合时状态不丢；主动关掉面板即结束会话，见 [SegmentSession]。 */
     val segmentSession: SegmentSession by lazy { SegmentSession() }
-
-    val trashSession by lazy {
-        dev.piko.shared.state.TrashSession(driveRepository, CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate))
-    }
 
     val duplicateSessions = androidx.compose.runtime.mutableStateListOf<DuplicateSession>()
 
     fun newDuplicateSession(): DuplicateSession =
         DuplicateSession(
             newScope = { CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate) },
-            newState = { scope, root -> DuplicateFinderState(clientManager, driveRepository, scope, root, trashSession) },
+            newState = { scope, root -> DuplicateFinderState(clientManager, driveRepository, scope, root) },
         ).also(duplicateSessions::add)
 
     fun releaseDuplicateSession(session: DuplicateSession) {
@@ -368,7 +545,7 @@ class PikoServices(
     val folderVaultSession: FolderVaultSession by lazy {
         FolderVaultSession(driveRepository, CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)).also { session ->
             session.conflictReason = { targets ->
-                val commands = dev.piko.shared.presentation.FileCommands(driveRepository, fileWrites, cleanup = trashSession, vault = session, vaultEdits = vaultEntryEdits, shareSaves = shareSaves, receiving = receivingActivity)
+                val commands = dev.piko.shared.presentation.FileCommands(driveRepository, fileWrites, vault = session, receiving = receivingActivity)
                 (commands.vaultAvailability(targets) as? dev.piko.shared.presentation.ActionAvailability.Blocked)?.reason
             }
         }
@@ -405,19 +582,19 @@ class PikoServices(
         // 未完成的添加链接、查重、解压、片段下载、信息流与归档都属于上一个账号：保存目标、文件 ID 都是那边的。
         // 主线程上当场结束，会话的状态只在主线程上改
         CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate).launchOnAccountLeave(clientManager) { left ->
-            PikoLog.i(TAG, "${if (clientManager.currentClient.value == null) "退出登录" else "换号"}：结束上一账号的进程级会话")
+            val transition = if (clientManager.currentClient.value == null) "Signed out" else "Switched account"
+            PikoLog.i(TAG, "$transition: ending process-scoped sessions for previous account")
             presentationStores.leave(left)
+            if (taskCenterAccount == left) { taskCenterAccount = null; taskCenterState = null }
             fileWrites.clear(left)
             historyEdits.clear(left)
             vaultEntryEdits.clear(left)
             instantSaveRecords.clearAttempts(left)
-            shareSaves.clear(left)
             instantMagnetRepository.offlineSubmissions.clear(left)
             driveRepository.localMounts.access?.cancelPending()
             driveRepository.enterAccount(clientManager.currentClient.value?.account)
             _fileHighlightRequested.value?.takeIf { it.account == left }?.let(::consumeFileHighlight)
             instantSession.clear()
-            trashSession.clear()
             duplicateSessions.toList().forEach { it.end() }
             duplicateSessions.clear()
             archiveExtractSession.clear()
@@ -447,7 +624,9 @@ class PikoServices(
                 }
                 // 上次进程被杀时面板来不及清 Piko-Temp，登录后补上。每个账号只清一次：断线重连
                 // 也会换一个新的 client，那时面板可能正开着，预览的文件还要用
-                if (cleanedAccounts.add(client.account)) previewTempFolder.clear(client).logFailure(TAG, "登录后清理 Piko-Temp 失败")
+                if (cleanedAccounts.add(client.account)) {
+                    previewTempFolder.clear(client).logFailure(TAG, "Failed to clean up Piko-Temp after sign-in")
+                }
                 // 换号或退出登录时 collectLatest 取消它，换成新账号的记录重来
                 offlinePacks.run(client.account)
             }
@@ -456,6 +635,13 @@ class PikoServices(
 }
 
 private const val TAG = "Services"
+
+enum class PassphraseUpdateResult {
+    SavedAndSynced,
+    KeyMismatch,
+    SavedOffline,
+    Failed,
+}
 
 val LocalPikoServices = staticCompositionLocalOf<PikoServices> {
     error("PikoServices 未提供，入口要用 PikoApp 包一层")

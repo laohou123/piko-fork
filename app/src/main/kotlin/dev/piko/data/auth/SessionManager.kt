@@ -21,12 +21,17 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.runBlocking
 
 // 文件损坏时整份重置而不是抛 CorruptionException：首读发生在 appScope 的恢复登录里，
 // 那里抛出的异常没有人接，结果是每次冷启动都崩，只能清数据
 val Context.dataStore: DataStore<Preferences> by preferencesDataStore(
     name = "piko_preferences",
-    corruptionHandler = ReplaceFileCorruptionHandler { emptyPreferences() },
+    corruptionHandler = ReplaceFileCorruptionHandler { ex ->
+        PikoLog.e(TAG, "DataStore piko_preferences corrupted; resetting to empty preferences", ex)
+        emptyPreferences()
+    },
 )
 
 /** 1.1.0 全机一份的解压密码，明文。之后按账号存在 AndroidPikoSessionStore，这里只在迁移时读。 */
@@ -40,14 +45,20 @@ private const val TAG = "Preferences"
  */
 private val Context.playbackDataStore: DataStore<Preferences> by preferencesDataStore(
     name = "piko_playback",
-    corruptionHandler = ReplaceFileCorruptionHandler { emptyPreferences() },
+    corruptionHandler = ReplaceFileCorruptionHandler { ex ->
+        PikoLog.e(TAG, "DataStore piko_playback corrupted; resetting to empty preferences", ex)
+        emptyPreferences()
+    },
     produceMigrations = { context -> listOf(LegacyPlaybackPositionMigration(context.dataStore)) },
 )
 
 /** 下载任务表同理单独一个文件：整张表一个键，随任务数增长，每次状态变化都整份重写。 */
 private val Context.downloadsDataStore: DataStore<Preferences> by preferencesDataStore(
     name = "piko_downloads",
-    corruptionHandler = ReplaceFileCorruptionHandler { emptyPreferences() },
+    corruptionHandler = ReplaceFileCorruptionHandler { ex ->
+        PikoLog.e(TAG, "DataStore piko_downloads corrupted; resetting to empty preferences", ex)
+        emptyPreferences()
+    },
 )
 
 private val DOWNLOAD_TASKS = stringPreferencesKey("download_tasks")
@@ -89,14 +100,40 @@ private class LegacyPlaybackPositionMigration(
 }
 
 class SessionManager(private val context: Context) : PikoUserPreferences {
+    @Volatile
+    private var cachedMainPreferences: Preferences? = null
+    private val mainDataFlow: Flow<Preferences> = context.dataStore.data.onEach { cachedMainPreferences = it }
+    private val playbackCacheLock = Any()
+    private val lastSavedPlaybackPositions = object : LinkedHashMap<String, Long>(128, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Long>): Boolean = size > 512
+    }
+    @Volatile
+    private var lastSavedDownloadTasks: String? = null
+    @Volatile
+    private var lastSavedUploadTasks: String? = null
+    @Volatile
+    private var lastSavedOfflinePacks: String? = null
+
+    internal fun preloadMainPreferences(): Preferences =
+        cachedMainPreferences ?: runBlocking { mainDataFlow.first() }.also { cachedMainPreferences = it }
+
+    internal fun currentAppLanguage(): AppLanguage =
+        AppLanguage.fromStorage(preloadMainPreferences()[appLanguageKey])
+
+    internal fun currentProxySetting(): ProxySetting =
+        ProxySetting.decode(preloadMainPreferences()[PreferencesKeys.PROXY_SETTING].orEmpty())
+
+    internal fun currentHardwareDecoding(): Boolean =
+        preloadMainPreferences()[PreferencesKeys.HARDWARE_DECODING] ?: true
+
     private val appLanguageKey = stringPreferencesKey("app_language")
     override val appLanguageFlow: Flow<AppLanguage> = preference { AppLanguage.fromStorage(it[appLanguageKey]) }
     override suspend fun setAppLanguage(language: AppLanguage) {
-        context.dataStore.edit { it[appLanguageKey] = language.tag }
+        cachedMainPreferences = context.dataStore.edit { it[appLanguageKey] = language.tag }
     }
 
     private object PreferencesKeys {
-        val CONCURRENT_ACCELERATION = booleanPreferencesKey("concurrent_acceleration")
+        val SAVE_AS_REFERENCE = booleanPreferencesKey("save_as_reference")
         val DOWNLOAD_DIR_PATH = stringPreferencesKey("download_dir_path")
         val SPOILER_BLUR_ENABLED = booleanPreferencesKey("spoiler_blur_enabled")
         val AUTO_CHECK_UPDATES = booleanPreferencesKey("auto_check_updates")
@@ -142,6 +179,7 @@ class SessionManager(private val context: Context) : PikoUserPreferences {
         val LAST_FOLDER_STACK_SERIALIZED = stringPreferencesKey("last_folder_stack")
         val RECENT_MOVE_TARGETS = stringPreferencesKey("recent_move_targets")
         val PINNED_FOLDERS = stringPreferencesKey("pinned_folders")
+        val FOLDERS_FIRST = booleanPreferencesKey("folders_first")
         val PER_FOLDER_SORT_ENABLED = booleanPreferencesKey("per_folder_sort_enabled")
         val FOLDER_SORT_ORDERS = stringPreferencesKey("folder_sort_orders")
         val LOCAL_MOUNTS = stringPreferencesKey("local_mounts")
@@ -165,22 +203,34 @@ class SessionManager(private val context: Context) : PikoUserPreferences {
     }
 
     /**
-     * 每个 DataStore 值都从同一份 data 流映射出来，任何一个键的写入都会让所有映射重新发射。
-     * 不去重的话，播放器每 5 秒写一次进度，网盘列表、下载存储、设置页的收集者就跟着每 5 秒
-     * 醒一次。
+     * 主偏好 DataStore 的各个设置项都从同一份 data 流映射出来，任一偏好键写入都会让整份 Preferences 重新发射；
+     * 加上 distinctUntilChanged 后，修改单个设置不会无谓唤醒其余无关收集者。
+     * （高频续播进度与传输任务表已分别拆入独立的 playbackDataStore 与 downloadsDataStore。）
      */
     private fun <T> preference(read: (Preferences) -> T): Flow<T> =
-        context.dataStore.data.map(read).distinctUntilChanged()
+        mainDataFlow.map(read).distinctUntilChanged()
 
     override suspend fun savePlaybackPosition(fileId: String, positionMs: Long) {
+        val unchanged = synchronized(playbackCacheLock) { lastSavedPlaybackPositions[fileId] == positionMs }
+        if (unchanged) return
         context.playbackDataStore.edit { preferences ->
-            preferences[playbackKey(fileId)] = positionMs
+            val key = playbackKey(fileId)
+            if (preferences[key] != positionMs) {
+                preferences[key] = positionMs
+            }
+        }
+        synchronized(playbackCacheLock) {
+            lastSavedPlaybackPositions[fileId] = positionMs
         }
     }
 
     override suspend fun getPlaybackPosition(fileId: String): Long {
         val prefs = context.playbackDataStore.data.first()
-        return prefs[playbackKey(fileId)] ?: 0L
+        val position = prefs[playbackKey(fileId)] ?: 0L
+        synchronized(playbackCacheLock) {
+            lastSavedPlaybackPositions[fileId] = position
+        }
+        return position
     }
 
     override suspend fun saveLastFolder(folderId: String, folderName: String, stackSerialized: String) {
@@ -255,7 +305,7 @@ class SessionManager(private val context: Context) : PikoUserPreferences {
     override val hardwareDecodingFlow: Flow<Boolean> = preference { it[PreferencesKeys.HARDWARE_DECODING] ?: true }
 
     override suspend fun setHardwareDecoding(enabled: Boolean) {
-        context.dataStore.edit { preferences ->
+        cachedMainPreferences = context.dataStore.edit { preferences ->
             preferences[PreferencesKeys.HARDWARE_DECODING] = enabled
         }
     }
@@ -503,14 +553,6 @@ class SessionManager(private val context: Context) : PikoUserPreferences {
         }
     }
 
-    override val concurrentAccelerationFlow: Flow<Boolean> = preference { preferences ->
-        preferences[PreferencesKeys.CONCURRENT_ACCELERATION] ?: true
-    }
-
-    override val concurrentConnectionsFlow: Flow<Int> = concurrentAccelerationFlow.map { enabled ->
-        if (enabled) 8 else 1
-    }
-
     override val downloadDirPathFlow: Flow<String> = preference { preferences ->
         preferences[PreferencesKeys.DOWNLOAD_DIR_PATH] ?: ""
     }
@@ -526,32 +568,41 @@ class SessionManager(private val context: Context) : PikoUserPreferences {
         return prefs[PreferencesKeys.DOWNLOAD_DIR_PATH] ?: ""
     }
 
-    override suspend fun setConcurrentAccelerationEnabled(enabled: Boolean) {
-        context.dataStore.edit { preferences ->
-            preferences[PreferencesKeys.CONCURRENT_ACCELERATION] = enabled
-        }
-    }
-
     override suspend fun loadDownloadTasks(): String =
-        context.downloadsDataStore.data.first()[DOWNLOAD_TASKS].orEmpty()
+        context.downloadsDataStore.data.first()[DOWNLOAD_TASKS].orEmpty().also {
+            if (lastSavedDownloadTasks == null) lastSavedDownloadTasks = it
+        }
 
     override suspend fun saveDownloadTasks(serialized: String) {
+        if (lastSavedDownloadTasks == serialized) return
         context.downloadsDataStore.edit { preferences ->
-            preferences[DOWNLOAD_TASKS] = serialized
+            if (preferences[DOWNLOAD_TASKS] != serialized) {
+                preferences[DOWNLOAD_TASKS] = serialized
+            }
         }
+        lastSavedDownloadTasks = serialized
     }
 
     override suspend fun loadUploadTasks(): String =
-        context.downloadsDataStore.data.first()[UPLOAD_TASKS].orEmpty()
+        context.downloadsDataStore.data.first()[UPLOAD_TASKS].orEmpty().also {
+            if (lastSavedUploadTasks == null) lastSavedUploadTasks = it
+        }
 
     override suspend fun saveUploadTasks(serialized: String) {
+        if (lastSavedUploadTasks == serialized) return
         context.downloadsDataStore.edit { preferences ->
-            preferences[UPLOAD_TASKS] = serialized
+            if (preferences[UPLOAD_TASKS] != serialized) {
+                preferences[UPLOAD_TASKS] = serialized
+            }
         }
+        lastSavedUploadTasks = serialized
     }
 
-    override suspend fun loadUploadCredentials(taskId: String): String? =
-        context.downloadsDataStore.data.first()[uploadCredentialsKey(taskId)]?.let(CredentialCipher::decrypt)
+    override suspend fun loadUploadCredentials(taskId: String): String? {
+        val stored = context.downloadsDataStore.data.first()[uploadCredentialsKey(taskId)] ?: return null
+        return CredentialCipher.decrypt(stored)
+            ?: null.also { PikoLog.w(TAG, "Failed to decrypt upload credentials for task $taskId") }
+    }
 
     // 密钥库不可用时加密抛出、不存明文，由调用方记下；这个会话重启后按凭据过期处理，只是重传
     override suspend fun saveUploadCredentials(taskId: String, serialized: String) {
@@ -568,12 +619,18 @@ class SessionManager(private val context: Context) : PikoUserPreferences {
     }
 
     override suspend fun loadOfflinePacks(): String =
-        context.downloadsDataStore.data.first()[OFFLINE_PACKS].orEmpty()
+        context.downloadsDataStore.data.first()[OFFLINE_PACKS].orEmpty().also {
+            if (lastSavedOfflinePacks == null) lastSavedOfflinePacks = it
+        }
 
     override suspend fun saveOfflinePacks(serialized: String) {
+        if (lastSavedOfflinePacks == serialized) return
         context.downloadsDataStore.edit { preferences ->
-            preferences[OFFLINE_PACKS] = serialized
+            if (preferences[OFFLINE_PACKS] != serialized) {
+                preferences[OFFLINE_PACKS] = serialized
+            }
         }
+        lastSavedOfflinePacks = serialized
     }
 
     override suspend fun loadLegacyArchivePasswords(): String =
@@ -597,6 +654,12 @@ class SessionManager(private val context: Context) : PikoUserPreferences {
         context.dataStore.edit { preferences ->
             preferences[PreferencesKeys.PINNED_FOLDERS] = serialized
         }
+    }
+
+    override val foldersFirstFlow: Flow<Boolean> = preference { it[PreferencesKeys.FOLDERS_FIRST] ?: true }
+
+    override suspend fun setFoldersFirst(enabled: Boolean) {
+        context.dataStore.edit { preferences -> preferences[PreferencesKeys.FOLDERS_FIRST] = enabled }
     }
 
     override val perFolderSortFlow: Flow<Boolean> = preference { it[PreferencesKeys.PER_FOLDER_SORT_ENABLED] ?: false }
@@ -648,7 +711,7 @@ class SessionManager(private val context: Context) : PikoUserPreferences {
         preference { ProxySetting.decode(it[PreferencesKeys.PROXY_SETTING].orEmpty()) }
 
     override suspend fun saveProxySetting(setting: ProxySetting) {
-        context.dataStore.edit { preferences ->
+        cachedMainPreferences = context.dataStore.edit { preferences ->
             preferences[PreferencesKeys.PROXY_SETTING] = setting.encode()
         }
     }
@@ -662,6 +725,11 @@ class SessionManager(private val context: Context) : PikoUserPreferences {
         }
     }
 
+    override val saveAsReferenceFlow: Flow<Boolean> = preference { it[PreferencesKeys.SAVE_AS_REFERENCE] ?: false }
+    override suspend fun setSaveAsReference(enabled: Boolean) {
+        context.dataStore.edit { it[PreferencesKeys.SAVE_AS_REFERENCE] = enabled }
+    }
+
     override val metaTubeUrlFlow: Flow<String> = preference { it[PreferencesKeys.METATUBE_URL].orEmpty() }
 
     override suspend fun setMetaTubeUrl(url: String) {
@@ -672,7 +740,12 @@ class SessionManager(private val context: Context) : PikoUserPreferences {
 
     // 与解压密码同样加密存放；解不开（密钥库被清）当作没填
     override val metaTubeTokenFlow: Flow<String> = preference { it[PreferencesKeys.METATUBE_TOKEN] }.map { stored ->
-        stored?.let(CredentialCipher::decrypt).orEmpty()
+        if (stored.isNullOrEmpty()) {
+            ""
+        } else {
+            CredentialCipher.decrypt(stored)
+                ?: "".also { PikoLog.w(TAG, "Failed to decrypt MetaTube token; treating as unset") }
+        }
     }
 
     // 加密失败时不存，宁可让用户再填一次，也不落明文
@@ -681,7 +754,7 @@ class SessionManager(private val context: Context) : PikoUserPreferences {
             ""
         } else {
             runCatching { CredentialCipher.encrypt(token) }
-                .onFailure { PikoLog.w(TAG, "MetaTube 令牌加密失败，未保存", it) }
+                .onFailure { PikoLog.w(TAG, "Failed to encrypt MetaTube token; skipping save", it) }
                 .getOrNull() ?: return
         }
         context.dataStore.edit { preferences ->

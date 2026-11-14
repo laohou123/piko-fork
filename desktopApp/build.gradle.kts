@@ -208,8 +208,11 @@ val bundledAppResources by tasks.registering(Sync::class) {
             includeEmptyDirs = false
         }
     }
-    // Toast 的 AUMID 登记要一个磁盘上的图标文件，exe 里内嵌的那份用不上
+    // Toast 的 AUMID 登记要一个磁盘上的图标文件，exe 里内嵌的那份用不上；.torrent 关联另用独立文档图标
     from("src/desktopMain/resources/app-icon.png")
+    if (isWindowsHost) {
+        from("package/windows/torrent.ico")
+    }
     into(layout.buildDirectory.dir("appResources/common"))
 }
 
@@ -272,9 +275,9 @@ compose.desktop {
         }
         nativeDistributions {
             appResourcesRootDir = layout.buildDirectory.dir("appResources")
-            // Compose 默认的 jlink 模块集之外只补 jdk.unsupported（sun.misc.Unsafe）。
+            // Compose 默认的 jlink 模块集之外补 jdk.unsupported（sun.misc.Unsafe）与 java.sql（桌面端 sqlite-jdbc）。
             // suggestRuntimeModules 还列了 java.instrument 与 java.management，只有协程调试代理用到
-            modules("jdk.unsupported")
+            modules("jdk.unsupported", "java.sql")
             // MSI 安装器：开始菜单快捷方式、按用户安装（magnet 协议与 Toast 的 AUMID 都登记在 HKCU），
             // 并自带 JDK 25 运行时（FFM 原生调用与 AOT 缓存都要求）。
             // packageVersion 与 release tag（vMAJOR.MINOR.PATCH）对齐，CI 打包时可覆写：
@@ -555,7 +558,7 @@ abstract class UpdateArtifactsTask : DefaultTask() {
             val blocking = kept.filter { (path, hash) -> retired[path] != hash }.keys
             check(blocking.isNotEmpty()) {
                 "${manifest.name} 的客户端对本版仍能走补丁：补丁包之外的文件它全有且相同。它的更新脚本在 8.3 临时目录下" +
-                    "静默失败、反复提示（见 shared/src/commonMain/kotlin/dev/piko/shared/update/CLAUDE.md），须让补丁包之外" +
+                    "静默失败、反复提示（见 shared/src/commonMain/kotlin/dev/piko/shared/update/AGENTS.md），须让补丁包之外" +
                     "留有它没有的文件"
             }
             logger.lifecycle("${manifest.name} 的客户端走不了补丁，它缺或不同的文件：${blocking.joinToString()}")

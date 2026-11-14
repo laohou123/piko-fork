@@ -16,6 +16,7 @@ import io.github.nihildigit.pikpak.getTask
 import io.github.nihildigit.pikpak.instantCreate
 import io.github.nihildigit.pikpak.listFiles
 import io.github.nihildigit.pikpak.listStarred
+import io.github.nihildigit.pikpak.listTrash
 import io.github.nihildigit.pikpak.rename
 import io.github.nihildigit.pikpak.restoreShare
 import io.github.nihildigit.pikpak.sampleCid
@@ -38,7 +39,10 @@ class DriveWriteAccess internal constructor(
             block()
         }
     }
-    suspend fun detail(id: String) = request(listOf(id)) { client.getFile(id) }
+    suspend fun detail(id: String) = request(listOf(id)) {
+        val observer = repository.metadataSink.capture(client)
+        client.getFile(id).also { observer?.observe(id, it) }
+    }
     suspend fun listFolder(id: String) = request(listOf(id)) { client.listFiles(id) }
     suspend fun browsableList(folderId: String): Result<List<FileStat>> {
         if (LocalLocation.isLocal(folderId)) return Result.failure(IllegalArgumentException("本地文件夹为只读"))
@@ -55,14 +59,25 @@ class DriveWriteAccess internal constructor(
     suspend fun starredIds() = request { client.listStarred().mapTo(HashSet()) { it.id } }
     suspend fun createFolder(parent: String, name: String) = request(listOf(parent)) { client.createFolder(parent, name) }
     suspend fun rename(id: String, name: String) = request(listOf(id)) { client.rename(id, name) }
-    suspend fun move(ids: List<String>, parent: String) = request(ids + parent) { client.batchMove(ids, parent) }
-    suspend fun copy(ids: List<String>, parent: String) = request(ids + parent) { client.batchCopy(ids, parent) }
-    suspend fun trash(ids: List<String>) = request(ids) { client.batchTrash(ids) }
-    suspend fun restore(ids: List<String>) = request(ids) { client.batchUntrash(ids) }
-    suspend fun delete(ids: List<String>) = request(ids) { client.batchDelete(ids) }
+    suspend fun move(ids: List<String>, parent: String, awaitCompletion: Boolean = true) = request(ids + parent) { client.batchMove(ids, parent, awaitCompletion = awaitCompletion) }
+    suspend fun copy(ids: List<String>, parent: String) = request(ids + parent) { client.batchCopy(ids, parent, awaitCompletion = false) }
+    suspend fun trash(ids: List<String>, awaitCompletion: Boolean = true) = request(ids) { client.batchTrash(ids, awaitCompletion = awaitCompletion) }
+    suspend fun restore(ids: List<String>, awaitCompletion: Boolean = true) = request(ids) { client.batchUntrash(ids, awaitCompletion = awaitCompletion) }
+    suspend fun delete(ids: List<String>, awaitCompletion: Boolean = true) = request(ids) { client.batchDelete(ids, awaitCompletion = awaitCompletion) }
     suspend fun star(ids: List<String>, value: Boolean) = request(ids) { if (value) client.starFiles(ids) else client.unstarFiles(ids) }
     suspend fun task(id: String) = request { client.getTask(id) }
-    suspend fun sampleCid(fileId: String) = request(listOf(fileId)) { client.sampleCid(client.getFile(fileId)) }
+    suspend fun sampleCid(fileId: String) = request(listOf(fileId)) {
+        val observer = repository.metadataSink.capture(client)
+        val detail = client.getFile(fileId)
+        observer?.observe(fileId, detail)
+        client.sampleCid(detail).also { sampled ->
+            if (sampled.isNotBlank() && isCurrentClient) {
+                ContentKey.of(detail.hash, detail.sizeBytes)?.let { key ->
+                    repository.driveTreeIndex.observeContentMetadata(key, ContentMetadata(cid = sampled))
+                }
+            }
+        }
+    }
     suspend fun instantCreate(
         file: ResolvedFile,
         parentId: String,
@@ -75,6 +90,7 @@ class DriveWriteAccess internal constructor(
         }
     }
     suspend fun trashFiles(fresh: Boolean = false): Result<List<FileStat>> = repository.trashFilesForClient(client, fresh)
+    suspend fun authoritativeTrashFiles(): Result<List<FileStat>> = request { client.listTrash() }
     suspend fun remainingQuotaBytes(): Result<Long?> =
         request { client.getQuota() }.map { it.quota.takeIf { q -> q.limitBytes > 0 }?.remainingBytes }
     fun knownVaultMetaOf(gcid: String, size: Long): VaultMediaMeta? =

@@ -31,10 +31,13 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
+import androidx.compose.material.icons.automirrored.outlined.KeyboardArrowRight
 import androidx.compose.material.icons.automirrored.outlined.Logout
+import androidx.compose.material.icons.filled.PieChart
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.ExpandLess
 import androidx.compose.material.icons.outlined.ExpandMore
+import androidx.compose.material.icons.outlined.PieChart
 import androidx.compose.material.icons.outlined.Refresh
 import dev.piko.ui.components.TooltipIconButton
 import kotlinx.coroutines.coroutineScope
@@ -99,14 +102,14 @@ import dev.piko.ui.components.toReadableSize
 import dev.piko.ui.navigation.Screen
 import io.github.nihildigit.pikpak.CountQuota
 import io.github.nihildigit.pikpak.TransferAllowances
-import java.time.OffsetDateTime
-import java.time.ZoneOffset
-import java.time.format.DateTimeFormatter
-import java.time.temporal.ChronoUnit
-import java.util.Locale
+import dev.piko.ui.format.dailyQuotaResetLabel as formatDailyQuotaResetLabel
+import dev.piko.ui.format.formatOffsetDate
+import dev.piko.ui.format.monthlyQuotaResetLabel
 import kotlinx.coroutines.launch
 import dev.piko.shared.data.SavedAccount
 import androidx.compose.ui.unit.Dp
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.seconds
 
 /**
  * 「我的」页：账号卡片（含网盘空间与流量额度）、库与管理的入口、关于、退出登录。
@@ -135,7 +138,7 @@ fun ProfileScreen(
     // 内容。副标题在收起态也在（flexible 顶栏的 subtitle 同时用作收起态的小副标题），只放一行短字，
     // 头像与会员期留在下面的账号卡里
     val topBarScrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
-    val accountLabel = saved?.email?.ifBlank { null } ?: saved?.account?.takeIf { it != saved.displayName }
+    val accountLabel = saved?.email?.ifBlank { null } ?: saved?.publicAccountHandle?.takeIf { it != saved.displayName }
     PikoScaffold(
         modifier = modifier
             .fillMaxSize()
@@ -187,7 +190,7 @@ fun ProfileScreen(
                 .padding(top = 8.dp, bottom = 24.dp)
                 .readableWidth(),
         ) {
-            AccountCard(account)
+            AccountCard(account, onOpenSpaceMap = { onOpenPane(Screen.SpaceMap()) })
 
             AccountSwitcher()
 
@@ -224,6 +227,14 @@ fun ProfileScreen(
                     supporting = tr("复制或取消已创建的分享链接", "Copy or revoke your share links", "作成した共有リンクをコピーまたは解除", "만든 공유 링크 복사 또는 취소", "複製或取消已建立的分享連結"),
                     onClick = { onOpenPane(Screen.MyShares) },
                     selected = selectedPane == Screen.MyShares,
+                )
+                SettingsNavigationRow(
+                    icon = Icons.Outlined.PieChart,
+                    selectedIcon = Icons.Filled.PieChart,
+                    title = tr("空间分布", "Space usage", "ストレージ内訳", "공간 분포", "空間分佈"),
+                    supporting = tr("按文件夹与文件大小查看空间占用", "View space usage by folders and files", "フォルダーとファイル別の容量内訳を確認", "폴더 및 파일별 공간 사용량 확인", "依資料夾與檔案大小檢視空間佔用"),
+                    onClick = { onOpenPane(Screen.SpaceMap()) },
+                    selected = selectedPane is Screen.SpaceMap,
                 )
                 SettingsNavigationRow(
                     icon = DriveLibrary.TRASH.icon,
@@ -271,39 +282,48 @@ internal fun rememberAccountSummary(): AccountSummary {
     val driveRepo = services.driveRepository
     val accounts by services.clientManager.accounts.collectAsStateWithLifecycle()
     val client by services.clientManager.currentClient.collectAsStateWithLifecycle()
-    val saved = client?.account?.let(accounts::find)
+    val currentAccount = client?.account
+    val saved = currentAccount?.let(accounts::find)
     // 网络回来之前先用列表里记着的数字渲染，否则卡片整块缺席、刷新完再跳出来
     val liveQuota by driveRepo.quotaFlow.collectAsStateWithLifecycle()
-    val cachedQuota = saved?.takeIf { it.limitBytes > 0 }?.let { QuotaSnapshot(it.usageBytes, it.limitBytes) }
-    val quota = liveQuota?.let { QuotaSnapshot(it.quota.usageBytes, it.quota.limitBytes) } ?: cachedQuota
-    // 不落盘，只在本页存活期间保留；失败时留着上一次的值，只在旁边补一行错误文字
+    val cachedQuota = saved?.quota?.takeIf { it.quota.limitBytes > 0 }?.let { QuotaSnapshot(it.quota.usageBytes, it.quota.limitBytes) }
+        ?: saved?.takeIf { it.limitBytes > 0 }?.let { QuotaSnapshot(it.usageBytes, it.limitBytes) }
+    val quota = liveQuota?.takeIf { it.quota.limitBytes > 0 }?.let { QuotaSnapshot(it.quota.usageBytes, it.quota.limitBytes) } ?: cachedQuota
     val transferQuota by driveRepo.transferQuotaFlow.collectAsStateWithLifecycle()
-    var transferQuotaError by remember { mutableStateOf<String?>(null) }
-    var refreshCount by remember { mutableStateOf(0) }
-    var refreshing by remember { mutableStateOf(false) }
-    LaunchedEffect(refreshCount) {
-        refreshing = true
-        coroutineScope {
-            launch {
-                driveRepo.getQuota()
-                // 昵称与头像不随登录态返回，每次进入取一次。
-                // 失败不提示：头像本就有首字母兜底，为它弹一条错误反而扰人。
-                services.accountRepository.refreshProfile()
-            }
-            launch {
-                driveRepo.getTransferQuota()
-                    .onSuccess { transferQuotaError = null }
-                    .onFailure { transferQuotaError = tr("流量额度加载失败", "Failed to load traffic quota", "転送量の利用枠を読み込めませんでした", "트래픽 할당량을 불러오지 못했습니다", "流量額度載入失敗") }
-            }
+    var transferQuotaError by remember(currentAccount) { mutableStateOf<String?>(null) }
+    var refreshCount by remember(currentAccount) { mutableStateOf(0) }
+    var refreshing by remember(currentAccount) { mutableStateOf(false) }
+    LaunchedEffect(currentAccount, refreshCount) {
+        if (currentAccount == null) {
+            refreshing = false
+            return@LaunchedEffect
         }
-        refreshing = false
+        val maxAge = if (refreshCount == 0) 30.seconds else Duration.ZERO
+        refreshing = true
+        try {
+            coroutineScope {
+                launch {
+                    driveRepo.getQuota(maxAge)
+                    // 昵称与头像不随登录态返回，进入时按 TTL 复用、手动刷新时强刷。
+                    // 失败不提示：头像本就有首字母兜底，为它弹一条错误反而扰人。
+                    services.accountRepository.refreshProfile(maxAge)
+                }
+                launch {
+                    driveRepo.getTransferQuota(maxAge)
+                        .onSuccess { transferQuotaError = null }
+                        .onFailure { transferQuotaError = tr("流量额度加载失败", "Failed to load traffic quota", "転送量の利用枠を読み込めませんでした", "트래픽 할당량을 불러오지 못했습니다", "流量額度載入失敗") }
+                }
+            }
+        } finally {
+            refreshing = false
+        }
     }
     return AccountSummary(
         saved = saved,
         quota = quota,
-        allowances = transferQuota?.account,
+        allowances = (transferQuota ?: saved?.transferQuota)?.account,
         allowancesError = transferQuotaError,
-        cloudDownload = liveQuota?.quotas?.cloudDownload,
+        cloudDownload = (liveQuota ?: saved?.quota)?.quotas?.cloudDownload,
         refreshing = refreshing,
         refresh = { refreshCount++ },
     )
@@ -358,7 +378,11 @@ internal fun LogoutDialog(next: SavedAccount?, onDismiss: () -> Unit, onLoggedOu
  * 是 Surface 不是 Card：M3 的 card 是可以点进去的单一主题入口，这一块不可点，只是个容器。
  */
 @Composable
-internal fun AccountCard(account: AccountSummary, showRefresh: Boolean = false) {
+internal fun AccountCard(
+    account: AccountSummary,
+    showRefresh: Boolean = false,
+    onOpenSpaceMap: (() -> Unit)? = null,
+) {
     val username = account.saved?.displayName
     val avatarUrl = account.saved?.avatarUrl
     val quota = account.quota
@@ -381,15 +405,15 @@ internal fun AccountCard(account: AccountSummary, showRefresh: Boolean = false) 
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Avatar(username = username, avatarUrl = avatarUrl)
-                Spacer(modifier = Modifier.width(16.dp))
+                Spacer(modifier = Modifier.width(if (onOpenSpaceMap != null && quota != null) 10.dp else 16.dp))
                 if (quota != null) {
-                    StorageSection(quota, tier, Modifier.weight(1f))
+                    StorageSection(quota, tier, Modifier.weight(1f), onClick = onOpenSpaceMap)
                 } else if (tier != null) {
                     TierChip(tier)
                 }
                 if (showRefresh) {
                     if (quota == null) Spacer(modifier = Modifier.weight(1f))
-                    Spacer(modifier = Modifier.width(8.dp))
+                    Spacer(modifier = Modifier.width(4.dp))
                     TooltipIconButton(Icons.Outlined.Refresh, tr("刷新", "Refresh", "更新", "새로고침", "重新整理"), account.refresh, enabled = !account.refreshing)
                 }
             }
@@ -424,7 +448,7 @@ internal fun Avatar(username: String?, avatarUrl: String?, size: Dp = AvatarSize
             contentAlignment = Alignment.Center,
         ) {
             Text(
-                text = username?.take(1)?.uppercase(Locale.getDefault()) ?: "P",
+                text = username?.take(1)?.uppercase() ?: "P",
                 style = MaterialTheme.typography.titleMedium,
                 color = MaterialTheme.colorScheme.onPrimaryContainer,
             )
@@ -453,14 +477,40 @@ private fun TierChip(tier: String, modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun StorageSection(quota: QuotaSnapshot, tier: String?, modifier: Modifier = Modifier) {
+private fun StorageSection(
+    quota: QuotaSnapshot,
+    tier: String?,
+    modifier: Modifier = Modifier,
+    onClick: (() -> Unit)? = null,
+) {
     val fraction = usedFraction(quota.usageBytes, quota.limitBytes)
     val nearlyFull = fraction >= NEARLY_FULL_FRACTION
     val accent = if (nearlyFull) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
-    Column(modifier = modifier) {
+    val interactiveModifier = if (onClick != null) {
+        modifier
+            .clip(MaterialTheme.shapes.small)
+            .clickable(
+                role = Role.Button,
+                onClickLabel = tr("查看空间分布", "View space usage", "ストレージ内訳を表示", "공간 분포 보기", "檢視空間分佈"),
+                onClick = onClick,
+            )
+            .padding(horizontal = 6.dp, vertical = 4.dp)
+    } else {
+        modifier
+    }
+    Column(modifier = interactiveModifier) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             SectionLabel(tr("网盘空间", "Cloud storage", "ドライブ容量", "클라우드 공간", "雲端硬碟空間"), Modifier.weight(1f))
             if (tier != null) TierChip(tier)
+            if (onClick != null) {
+                Spacer(modifier = Modifier.width(4.dp))
+                Icon(
+                    imageVector = Icons.AutoMirrored.Outlined.KeyboardArrowRight,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(18.dp),
+                )
+            }
         }
         Spacer(modifier = Modifier.height(2.dp))
         Row(modifier = Modifier.fillMaxWidth()) {
@@ -517,6 +567,8 @@ private fun TransferSection(allowances: TransferAllowances?, cloudDownload: Coun
 @Composable
 private fun UsageSection(title: String, usages: List<Usage>, resetLabel: () -> String, error: String?) {
     var expanded by rememberSaveable(title) { mutableStateOf(false) }
+    var displayedUsages by remember { mutableStateOf(usages) }
+    if (usages.isNotEmpty()) displayedUsages = usages
     val tightest = usages.maxByOrNull { usedFraction(it.usedBytes, it.limitBytes) }
     Column {
         Row(
@@ -563,7 +615,7 @@ private fun UsageSection(title: String, usages: List<Usage>, resetLabel: () -> S
         AnimatedVisibility(visible = expanded && usages.isNotEmpty()) {
             Column {
                 Spacer(modifier = Modifier.height(4.dp))
-                UsageGrid(usages)
+                UsageGrid(displayedUsages)
             }
         }
     }
@@ -612,6 +664,7 @@ private fun SectionLabel(text: String, modifier: Modifier = Modifier) {
  */
 @Composable
 private fun UsageGrid(usages: List<Usage>) {
+    if (usages.isEmpty()) return
     BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
         val spacing = 8.dp
         val maxColumns = ((maxWidth + spacing) / (USAGE_TILE_MIN_WIDTH + spacing)).toInt().coerceIn(1, usages.size)
@@ -686,26 +739,15 @@ private fun UsageTile(usage: Usage, modifier: Modifier = Modifier) {
 /**
  * 距下一次月度重置还有几天（每月 1 日 0 点，新加坡时间；接口不返回）。写天数不写日期：看额度时
  * 要掂量的是「还能撑几天」，日期还得自己再减一次。按新加坡的日历日算，月末最后一天是「1 天后」。
- * minSdk 26 起自带 java.time，不必再引入 kotlinx-datetime。
  */
-private fun transferQuotaResetLabel(): String {
-    val today = OffsetDateTime.now(ZoneOffset.ofHours(8)).toLocalDate()
-    val reset = today.plusMonths(1).withDayOfMonth(1)
-    return tr("${ChronoUnit.DAYS.between(today, reset)} 天后重置", "Resets in ${enCount(ChronoUnit.DAYS.between(today, reset), "day", "days")}", "${ChronoUnit.DAYS.between(today, reset)} 日後にリセット", "${ChronoUnit.DAYS.between(today, reset)}일 후 초기화", "${ChronoUnit.DAYS.between(today, reset)} 天後重設")
-}
+private fun transferQuotaResetLabel(): String = monthlyQuotaResetLabel()
 
-/** 距下一次每日重置（新加坡时间 0 点）还有几小时，不足 1 小时写「1 小时内」。 */
-private fun dailyQuotaResetLabel(): String {
-    val now = OffsetDateTime.now(ZoneOffset.ofHours(8))
-    val hours = ChronoUnit.HOURS.between(now, now.toLocalDate().plusDays(1).atStartOfDay().atOffset(now.offset))
-    return if (hours < 1) tr("1 小时内重置", "Resets within 1 hour", "1時間以内にリセット", "1시간 이내 초기화", "1 小時內重設") else tr("$hours 小时后重置", "Resets in ${enCount(hours, "hour", "hours")}", "$hours 時間後にリセット", "${hours}시간 후 초기화", "$hours 小時後重設")
-}
+/** 距新加坡时间午夜的整小时数，不足一小时单独提示。 */
+private fun dailyQuotaResetLabel(): String = formatDailyQuotaResetLabel()
 
 /** 非会员时 [TransferAllowances.expireTime] 为空字符串，解析失败也一并按「没有」处理。 */
 private fun formatExpireDate(expireTime: String): String? {
     if (expireTime.isBlank()) return null
-    return runCatching {
-        OffsetDateTime.parse(expireTime).format(DateTimeFormatter.ofPattern(tr("yyyy 年 M 月 d 日", "MMM d, yyyy", "yyyy年M月d日", "yyyy년 M월 d일", "yyyy 年 M 月 d 日"), Locale.getDefault()))
-    }.getOrNull()
+    return formatOffsetDate(expireTime, includeYear = true)
 }
 

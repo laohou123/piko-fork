@@ -31,7 +31,6 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import dev.piko.shared.media.player.isPlayerSubtitleName
-import dev.piko.shared.naming.av.matchAvFile
 import dev.piko.ui.LocalPikoServices
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
@@ -182,22 +181,11 @@ fun MediampVideoPlayerScreen(
         }
     }
     // 字幕的 MIME 类型各家登记得不一，按类型过滤会把 .ass 这类藏起来，只能全列、选完按扩展名判断
-    val pickLocalSubtitle = {
-        subtitlePickedFor = state.fileId
-        subtitleLauncher.launch(arrayOf("*/*"))
-    }
-
-    // 在线搜字幕（SubtitleCat）：下载到当前视频所在的网盘目录，之后从「网盘字幕」挂上。
-    // 本地播放没有网盘目录，给不了入口
-    val services = LocalPikoServices.current
-    val currentVideoFolderId = siblingVideos.find { it.id == state.fileId }?.parentId
-    // 作品收藏（与海报墙收藏夹同一份数据）：按文件名认番号，认不出就不给入口
-    val currentWorkCode = remember(state.fileId, state.title) {
-        matchAvFile(state.title)?.code
-    }
-    var favorite by remember { mutableStateOf(false) }
-    LaunchedEffect(state.fileId, currentWorkCode) {
-        favorite = currentWorkCode?.let { services.libraryStore?.isWorkFavorite(it) } ?: false
+    val pickLocalSubtitle: () -> Unit = remember(state, subtitleLauncher) {
+        {
+            subtitlePickedFor = state.fileId
+            subtitleLauncher.launch(arrayOf("*/*"))
+        }
     }
 
     LaunchedEffect(isFullscreen) {
@@ -210,7 +198,7 @@ fun MediampVideoPlayerScreen(
         onDispose { window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
     }
 
-    // 没有后台播放与媒体通知，退到后台就暂停；Surface 此时也被销毁，画面本就停了
+    // 不支持退到后台继续播放（前台期间通过下方 MediaSession 与媒体通知提供耳机按键和系统媒体控制），ON_STOP 时暂停；Surface 此时也被销毁
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner, state) {
         val observer = LifecycleEventObserver { _, event ->
@@ -381,6 +369,11 @@ fun MediampVideoPlayerScreen(
         }
     }
     LaunchedEffect(mediaSession, state) {
+        var lastPlaybackState = -1
+        var lastActions = -1L
+        var lastSpeed = Float.NaN
+        var lastReportedPosMs = -1L
+        var lastReportedElapsedMs = 0L
         snapshotFlow {
             Triple(
                 state.isPlaying,
@@ -410,12 +403,32 @@ fun MediampVideoPlayerScreen(
                     playing -> PlaybackState.STATE_PLAYING
                     else -> PlaybackState.STATE_PAUSED
                 }
-                mediaSession.setPlaybackState(
-                    PlaybackState.Builder()
-                        .setActions(actions)
-                        .setState(playbackState, (posSeconds * 1_000L).coerceAtLeast(0L), speed ?: 1f)
-                        .build(),
-                )
+                val effectiveSpeed = speed ?: 1f
+                val posMs = (posSeconds * 1_000L).coerceAtLeast(0L)
+                val nowElapsedMs = android.os.SystemClock.elapsedRealtime()
+                val extrapolatedPosMs = if (lastPlaybackState == PlaybackState.STATE_PLAYING) {
+                    lastReportedPosMs + ((nowElapsedMs - lastReportedElapsedMs) * lastSpeed).toLong()
+                } else {
+                    lastReportedPosMs
+                }
+                val unchanged = playbackState == lastPlaybackState &&
+                    actions == lastActions &&
+                    effectiveSpeed == lastSpeed &&
+                    lastReportedPosMs >= 0L &&
+                    kotlin.math.abs(posMs - extrapolatedPosMs) <= 1_500L
+                if (!unchanged) {
+                    lastPlaybackState = playbackState
+                    lastActions = actions
+                    lastSpeed = effectiveSpeed
+                    lastReportedPosMs = posMs
+                    lastReportedElapsedMs = nowElapsedMs
+                    mediaSession.setPlaybackState(
+                        PlaybackState.Builder()
+                            .setActions(actions)
+                            .setState(playbackState, posMs, effectiveSpeed)
+                            .build(),
+                    )
+                }
             }
         }
     }
@@ -424,9 +437,36 @@ fun MediampVideoPlayerScreen(
         if (isFullscreen) exitFullscreen() else onBackClick()
     }
 
-    val leave = {
-        orientationController.resetOrientation()
-        onBackClick()
+    val leave = remember(orientationController, onBackClick) {
+        {
+            orientationController.resetOrientation()
+            onBackClick()
+        }
+    }
+    val positionMillisProvider = remember(state) { { state.positionMillis } }
+    val bufferedPositionMillisProvider = remember(state) { { state.bufferedPositionMillis } }
+    val toggleFullscreen = remember(isFullscreen, orientationController, state) {
+        // 比例还没拿到时按横片进，与原先一律横屏全屏相同
+        { if (isFullscreen) exitFullscreen() else enterFullscreen(state.isLandscapeVideo != false) }
+    }
+    val handleSeekStepChange: (Int) -> Unit = remember(scope, preferences) {
+        { scope.launch { preferences.setPlayerSeekStepSeconds(it) } }
+    }
+    val handleLongPressSpeedChange: (Float) -> Unit = remember(scope, preferences) {
+        { scope.launch { preferences.setPlayerBoostSpeed(it) } }
+    }
+    val handleRotationChange: (Int) -> Unit = remember(state, isFullscreen, orientationController) {
+        { degrees ->
+            // 转了 90 度，片子横竖对调。全屏时屏幕跟着换方向；不在全屏时只转画面，页面照旧，
+            // 如同桌面窗口最大化时不动窗口。新比例由后端观察 video-params 异步报回，这里按对调直接推算
+            val turned = (degrees - state.rotationDegrees) % 180 != 0
+            val landscapeVideo = state.isLandscapeVideo
+            state.setRotation(degrees)
+            if (turned && isFullscreen && landscapeVideo != null) enterFullscreen(!landscapeVideo)
+        }
+    }
+    val pickDriveSubtitle: (FileStat) -> Unit = remember(state) {
+        { file -> state.addDriveSubtitle(file.id, file.name) }
     }
 
     Box(modifier.fillMaxSize().background(Color.Black)) {
@@ -453,9 +493,10 @@ fun MediampVideoPlayerScreen(
                 isLocalPlayback = state.isLocalPlayback,
                 isPlaying = state.isPlaying,
                 isLoading = state.isLoading,
-                positionMillis = state.positionMillis,
+                loadingSpeedText = state.loadingSpeedText,
                 durationMillis = state.durationMillis,
-                bufferedPositionMillis = state.bufferedPositionMillis,
+                positionMillisProvider = positionMillisProvider,
+                bufferedPositionMillisProvider = bufferedPositionMillisProvider,
                 playbackSpeed = state.playbackSpeed,
                 aspectRatio = state.aspectRatio,
                 cropRegion = state.cropRegion,
@@ -473,8 +514,7 @@ fun MediampVideoPlayerScreen(
                 onRetry = state::retry,
                 onRestartFromBeginning = state::restartFromBeginning,
                 onBack = leave,
-                // 比例还没拿到时按横片进，与原先一律横屏全屏相同
-                onToggleFullscreen = { if (isFullscreen) exitFullscreen() else enterFullscreen(state.isLandscapeVideo != false) },
+                onToggleFullscreen = toggleFullscreen,
                 isFullscreen = isFullscreen,
                 isLandscapeVideo = state.isLandscapeVideo,
                 playlist = state.playlist,
@@ -486,9 +526,9 @@ fun MediampVideoPlayerScreen(
                 onSelectEntry = state::playEntry,
                 hideEpisodeThumbnails = isSpoilerBlurEnabled,
                 seekStepSeconds = seekStepSeconds,
-                onSeekStepChange = { scope.launch { preferences.setPlayerSeekStepSeconds(it) } },
+                onSeekStepChange = handleSeekStepChange,
                 longPressSpeed = longPressSpeed,
-                onLongPressSpeedChange = { scope.launch { preferences.setPlayerBoostSpeed(it) } },
+                onLongPressSpeedChange = handleLongPressSpeedChange,
                 playbackStats = state::stats,
                 audioTracks = state.audioTracks,
                 selectedAudioTrackId = state.selectedAudioTrackId,
@@ -503,45 +543,9 @@ fun MediampVideoPlayerScreen(
                     scope.launch { snackbarHostState.showSnackbar(message, withDismissAction = true) }
                 },
                 rotationDegrees = state.rotationDegrees.takeIf { state.supportsRotation },
-                onRotationChange = { degrees ->
-                    // 转了 90 度，片子横竖对调。全屏时屏幕跟着换方向；不在全屏时只转画面，页面照旧，
-                    // 如同桌面窗口最大化时不动窗口。新比例由后端观察 video-params 异步报回，这里按对调直接推算
-                    val turned = (degrees - state.rotationDegrees) % 180 != 0
-                    val landscapeVideo = state.isLandscapeVideo
-                    state.setRotation(degrees)
-                    if (turned && isFullscreen && landscapeVideo != null) enterFullscreen(!landscapeVideo)
-                },
+                onRotationChange = handleRotationChange,
                 onPickLocalSubtitle = pickLocalSubtitle.takeIf { state.canAddSubtitle },
-                onPickDriveSubtitle = { file: FileStat -> state.addDriveSubtitle(file.id, file.name) }
-                    .takeIf { state.canAddSubtitle },
-                // 字幕搜索就地开在播放器面板里（与 AI 翻译同款），不再弹外层面板
-                subtitleSearchTarget = currentVideoFolderId?.let { folderId ->
-                    SubtitleSearchTarget(
-                        code = currentWorkCode ?: state.title.substringBeforeLast('.'),
-                        folderId = folderId,
-                        folderName = "视频所在目录",
-                    )
-                }.takeIf { state.canAddSubtitle },
-                onSearchedSubtitle = if (state.canAddSubtitle) {
-                    { fileId: String, name: String -> state.addDriveSubtitle(fileId, name) }
-                } else {
-                    null
-                },
-                // AI 翻译字幕：要番号（译文名）与翻译配置都齐了才给入口
-                subtitleTranslateCode = currentWorkCode
-                    .takeIf { services.translation != null && state.canAddSubtitle },
-                onTranslatedSubtitle = { fileId, name -> state.addDriveSubtitle(fileId, name) },
-                // 「音轨与字幕」里的网盘字幕行带删除：先卸轨道再删文件，见 state.deleteDriveSubtitle
-                driveSubtitleFiles = state.driveSubtitleFiles,
-                onDeleteDriveSubtitle = state::deleteDriveSubtitle,
-                isFavorite = favorite,
-                onFavoriteClick = currentWorkCode?.let { code ->
-                    {
-                        scope.launch {
-                            favorite = services.libraryStore?.toggleWorkFavorite(code) ?: false
-                        }
-                    }
-                },
+                onPickDriveSubtitle = pickDriveSubtitle.takeIf { state.canAddSubtitle },
             )
         }
     }
@@ -575,14 +579,14 @@ private fun copySubtitleToCache(context: Context, uri: Uri): LocalSubtitle {
     }.getOrElse { LocalSubtitle.Unreadable }
 }
 
+private const val MEDIA_CHANNEL_ID = "piko_media_playback"
+private const val MEDIA_NOTIFICATION_ID = 9528
+
 /**
  * 这个文件已下载到本地的完整副本，没有则为 null。
  *
  * 分段下载的片段不算，路径对应的文件也要还在。
  */
-private const val MEDIA_CHANNEL_ID = "piko_media_playback"
-private const val MEDIA_NOTIFICATION_ID = 9528
-
 private fun completedDownloadPath(fileId: String): String? =
     PikoApplication.instance.downloadManager.tasks.value.values
         .find { it.fileId == fileId && it.status == DownloadStatus.COMPLETED && !it.isSegment }

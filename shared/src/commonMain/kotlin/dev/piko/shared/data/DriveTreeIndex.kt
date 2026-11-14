@@ -1,7 +1,17 @@
 package dev.piko.shared.data
 
+import dev.piko.shared.log.PikoLog
+import dev.piko.shared.util.PikoLock
+import dev.piko.shared.util.withPikoLock
 import dev.piko.data.repository.NaturalOrder
-import dev.piko.shared.search.cjkFuzzyScore
+import dev.piko.shared.search.prepareCjkQuery
+import io.github.nihildigit.pikpak.FileDetail
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.debounce
+import kotlinx.io.Source
 import io.github.nihildigit.pikpak.FileKind
 import io.github.nihildigit.pikpak.FileStat
 import io.github.nihildigit.pikpak.FileTag
@@ -13,21 +23,123 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.Json
+
+private const val TREE_INDEX_TAG = "DriveTreeIndex"
 
 /**
- * 当前账号的本地文件树索引（文件夹、真实文件与已读出的归档虚拟条目）。
+ * 当前账号的本地全盘树索引（文件夹骨架、真实文件与已解析的归档虚拟条目）。
  *
- * 来源：
- * 1. 日常浏览列目录（[putFolderListing]）与读取归档清单（[putVaultEntries]）实时写入；
- * 2. 全盘搜索首次流式拉取平铺目录与文件（[putFolders]、[putFiles]）后拼齐整棵树并标为 [isComplete]；
- * 3. 网盘内的新建、改名、移动、移入回收站、删除经 [applyChange] 原地更新，无需整树作废。
- *
- * 有了完整本地树后，再次全盘搜索或边输边改搜索词可直接在内存中毫秒级完成 CJK 模糊匹配。
+ * 存储与投影模型：
+ * 1. 常规运行下由原生 SQLite WAL 库（[SqliteTreeStore]）承载全量文件行，Java 堆仅常驻文件夹骨架与物化子树聚合表
+ *    （[SubtreeStats]）；未注入 [database] 时（如轻量测试或数据库打开失败）自动回退至纯内存状态表；
+ * 2. 全盘基线构建经候选代（[beginCandidate] / [appendCandidate] / [commitCandidate]）分页流式落盘，后续增量对账经
+ *    [beginDelta] / [appendDelta] / [commitDelta] 原子推进服务端水位；日常列目录（[putFolderListing]）、归档清单更新
+ *    （[putVaultEntries]）与本地变更（[applyChange]）实时原地写穿；
+ * 3. 全盘搜索在 SQLite 模式下直接扫描预归一化 `norm_name` 轻量游标完成 CJK 模糊匹配，仅对最终命中项解码完整行。
  */
 internal class DriveTreeIndex(
     private val locallyCachedManifestIds: () -> Set<String> = ::emptySet,
+    database: PikoTreeDatabase? = null,
+    private val ownerAccount: String = "",
 ) {
+    private val disk = database?.let { SqliteTreeStore(it, ownerAccount, locallyCachedManifestIds) }
+    private var closed = false
+    val isPersistent: Boolean get() = disk != null
+    val isClosed: Boolean get() = withPikoLock(lock) { closed }
+
+    fun close() = withPikoLock(lock) { closed = true; disk?.close() }
+
+    private fun publishDisk() {
+        val store = disk ?: return
+        if (store.currentRevision == state.value.revision) return
+        state.value = store.projection()
+        lastFullSyncAtMillis = store.syncedAt
+    }
+
+    private class RetiredMigration : RuntimeException()
+
+    /** Source framing stays outside the account lock; each batch is a short, unpublished transaction. */
+    fun importLegacySnapshot(source: Source): Boolean {
+        fun <T> step(block: (SqliteTreeStore) -> T): T = withPikoLock(lock) {
+            val store = disk
+            if (closed || store == null) throw RetiredMigration()
+            block(store).also { if (store.currentRevision != state.value.revision) publishDisk() }
+        }
+        val generation = withPikoLock(lock) {
+            if (closed || disk == null || disk.complete) return false
+            disk.beginCandidate()
+        }
+        val entries = ArrayList<StoredTreeEntry>(256)
+        val sources = ArrayList<Pair<Int, String>>(256)
+        val metadata = ArrayList<StoredContentMetadata>(128)
+        val instances = ArrayList<Pair<String, EntryMetadata>>(256)
+        var entryCharacters = 0; var sourceCharacters = 0; var metadataCharacters = 0
+        fun flushEntries() { if (entries.isNotEmpty()) { step { it.appendLegacyEntries(generation, entries) }; entries.clear(); entryCharacters = 0 } }
+        fun flushSources() { if (sources.isNotEmpty()) { step { it.appendLegacySources(generation, sources) }; sources.clear(); sourceCharacters = 0 } }
+        fun flushMetadata() { if (metadata.isNotEmpty()) { step { it.appendLegacyContent(generation, metadata) }; metadata.clear(); metadataCharacters = 0 } }
+        fun flushInstances() { if (instances.isNotEmpty()) { step { it.appendLegacyInstances(generation, instances) }; instances.clear() } }
+        return try {
+            val header = TreeSnapshotCodec.readStreaming(source,
+                entry = { entry ->
+                    entries += entry
+                    entryCharacters += entry.name.length + entry.id.length + entry.parentId.length + entry.thumbnailLink.length + entry.hash.length + entry.size.length + entry.createdTime.length + entry.modifiedTime.length + entry.mimeType.length + entry.fileExtension.length + entry.phase.length + entry.params.entries.sumOf { it.key.length + it.value.length } + entry.tags.sumOf { it.id.length + it.name.length }
+                    if (entries.size >= 256 || entryCharacters >= 131072) flushEntries()
+                },
+                sourceValue = { id, value -> sources += id to value; sourceCharacters += value.length; if (sources.size >= 256 || sourceCharacters >= 131072) flushSources() },
+                content = { metadata += it; metadataCharacters += it.key.gcid.length + (it.metadata.cid?.length ?: 0) + (it.metadata.mimeType?.length ?: 0); if (metadata.size >= 128 || metadataCharacters >= 131072) flushMetadata() },
+                instance = { id, value -> instances += id to value; if (instances.size >= 256) flushInstances() },
+            )
+            flushEntries(); flushSources(); flushMetadata(); flushInstances()
+            var after: String? = null
+            while (true) { after = step { it.resolveLegacySources(generation, after) } ?: break }
+            after = null
+            while (true) { after = step { it.resolveLegacyContent(generation, after) } ?: break }
+            step { it.finishLegacy(generation, header).also { publishDisk() } }
+        } catch (_: RetiredMigration) {
+            false
+        } catch (err: IllegalArgumentException) {
+            PikoLog.w(
+                TREE_INDEX_TAG,
+                "Corrupted legacy tree snapshot rejected (acct=${logAccountSlot(ownerAccount)}, error=${err::class.simpleName})",
+            )
+            false
+        } catch (err: kotlinx.io.IOException) {
+            PikoLog.w(
+                TREE_INDEX_TAG,
+                "I/O failure while importing legacy tree snapshot (acct=${logAccountSlot(ownerAccount)}, error=${err::class.simpleName})",
+                err,
+            )
+            false
+        } finally {
+            withPikoLock(lock) { if (!closed) disk?.abortCandidate(generation) }
+        }
+    }
+
+    fun beginCandidate(): Long = withPikoLock(lock) { if (closed) -1 else disk?.beginCandidate() ?: error("Candidates require SQLite") }
+    fun appendCandidate(generation: Long, files: List<FileStat>) = withPikoLock(lock) {
+        if (!closed) disk?.let { it.appendCandidate(generation, files); if (it.currentRevision != state.value.revision) publishDisk() }
+    }
+    fun appendCandidateVault(generation: Long, folderId: String, entries: List<VaultEntry>) = withPikoLock(lock) {
+        if (!closed) disk?.let { it.vault(folderId, entries, null, false, emptySet(), generation); if (it.currentRevision != state.value.revision) publishDisk() }
+    }
+    fun appendCandidateVaultBatch(generation: Long, batches: List<Pair<String, List<VaultEntry>>>) = withPikoLock(lock) {
+        if (!closed) disk?.let { it.vaultBatch(generation, batches); if (it.currentRevision != state.value.revision) publishDisk() }
+    }
+    fun commitCandidate(generation: Long, usageBytes: Long?, syncedAtMillis: Long = 0L, syncCursor: String? = null): Set<String> = withPikoLock(lock) {
+        if (closed) emptySet() else disk?.commitCandidate(generation, usageBytes, syncedAtMillis, syncCursor).orEmpty().also { publishDisk() }
+    }
+
+    val syncCursor: String? get() = withPikoLock(lock) { disk?.syncCursor }
+    fun beginDelta() = withPikoLock(lock) { check(!closed); requireNotNull(disk).beginDelta() }
+    fun appendDelta(files: List<FileStat>) = withPikoLock(lock) { check(!closed); requireNotNull(disk).appendDelta(files) }
+    fun abortDelta() = withPikoLock(lock) { if (!closed) disk?.abortDelta() }
+    fun commitDelta(cursor: String): Set<String> = withPikoLock(lock) {
+        check(!closed)
+        requireNotNull(disk).commitDelta(cursor).also { publishDisk() }
+    }
+    fun abortCandidate(generation: Long) = withPikoLock(lock) { if (!closed) disk?.abortCandidate(generation) }
+
+
     data class State(
         val entries: Map<String, FileStat> = emptyMap(),
         val childrenByParent: Map<String, Set<String>> = emptyMap(),
@@ -38,10 +150,50 @@ internal class DriveTreeIndex(
         val lastUsageBytes: Long? = null,
         val complete: Boolean = false,
         val revision: Long = 0L,
-    )
+        val contentMetadata: Map<ContentKey, ContentMetadata> = emptyMap(),
+        val entryMetadata: Map<String, EntryMetadata> = emptyMap(),
+        /** SQLite mode publishes only immutable folder projections, including their captured aggregates. */
+        val sortProjection: SortContext? = null,
+    ) {
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (other !is State) return false
+            if (revision != other.revision || complete != other.complete || lastUsageBytes != other.lastUsageBytes) return false
+            if (entries.size != other.entries.size ||
+                childrenByParent.size != other.childrenByParent.size ||
+                listedFolders.size != other.listedFolders.size ||
+                dirtyFolders.size != other.dirtyFolders.size ||
+                manifestsByFolder.size != other.manifestsByFolder.size ||
+                vaultEntriesByFolder.size != other.vaultEntriesByFolder.size ||
+                contentMetadata.size != other.contentMetadata.size ||
+                entryMetadata.size != other.entryMetadata.size
+            ) return false
+            return entries == other.entries &&
+                childrenByParent == other.childrenByParent &&
+                manifestsByFolder == other.manifestsByFolder &&
+                vaultEntriesByFolder == other.vaultEntriesByFolder &&
+                listedFolders == other.listedFolders &&
+                dirtyFolders == other.dirtyFolders &&
+                contentMetadata == other.contentMetadata &&
+                entryMetadata == other.entryMetadata &&
+                sortProjection == other.sortProjection
+        }
 
-    private val lock = Any()
-    private val state = MutableStateFlow(State())
+        override fun hashCode(): Int {
+            var result = revision.hashCode()
+            result = 31 * result + complete.hashCode()
+            result = 31 * result + (lastUsageBytes?.hashCode() ?: 0)
+            result = 31 * result + entries.size
+            result = 31 * result + listedFolders.size
+            result = 31 * result + dirtyFolders.size
+            return result
+        }
+    }
+
+    private var cachedSortContext: SortContext? = null
+    private val canonicalizer = TreeCanonicalizer()
+    private val lock = PikoLock()
+    private val state = MutableStateFlow(disk?.projection() ?: State())
     val flow: StateFlow<State> = state.asStateFlow()
 
     private var mutationSeq: Long = 0L
@@ -53,24 +205,177 @@ internal class DriveTreeIndex(
     private val renamedAtSeq = HashMap<String, Pair<Long, String>>()
     private val movedAtSeq = HashMap<String, Pair<Long, String>>()
     private val patchedAtSeq = HashMap<String, Pair<Long, FileStat>>()
+    private val historyPins = HashMap<Long, Long>()
+    private var nextHistoryPin = 0L
 
-    var lastFullSyncAtMillis: Long = 0L
+    inner class MutationHistoryToken internal constructor(private val id: Long, val sequence: Long) {
+        fun close() { withPikoLock(lock) { historyPins.remove(id) } }
+    }
+
+    fun retainMutationHistory(): MutationHistoryToken = withPikoLock(lock) {
+        val id = ++nextHistoryPin
+        val sequence = disk?.mutationSequence ?: mutationSeq
+        historyPins[id] = sequence
+        MutationHistoryToken(id, sequence)
+    }
+
+    /** Caller confirms legacy, unpinned readers through this baseline have finished. Pins always win. */
+    fun pruneMutationHistory(throughSequence: Long) = withPikoLock(lock) {
+        val cutoff = minOf(throughSequence, historyPins.values.minOrNull() ?: (disk?.mutationSequence ?: mutationSeq))
+        disk?.pruneMutationHistory(cutoff)
+        dirtyAtSeq.keys.removeAll { dirtyAtSeq.getValue(it) <= cutoff }
+        listedAtSeq.keys.removeAll { listedAtSeq.getValue(it) <= cutoff }
+        removedAtSeq.keys.removeAll { removedAtSeq.getValue(it) <= cutoff }
+        renamedAtSeq.keys.removeAll { renamedAtSeq.getValue(it).first <= cutoff }
+        movedAtSeq.keys.removeAll { movedAtSeq.getValue(it).first <= cutoff }
+        patchedAtSeq.keys.removeAll { patchedAtSeq.getValue(it).first <= cutoff }
+    }
+
+    var lastFullSyncAtMillis: Long = disk?.syncedAt ?: 0L
         private set
 
-    val currentMutationSeq: Long get() = synchronized(lock) { mutationSeq }
+    val currentMutationSeq: Long get() = withPikoLock(lock) { disk?.mutationSequence ?: mutationSeq }
 
     enum class FolderCoverage { UNKNOWN, PARTIAL, COMPLETE, DIRTY }
 
     data class FolderChildren(val files: List<FileStat>, val coverage: FolderCoverage)
 
     private inline fun update(transform: (State) -> State) {
-        synchronized(lock) {
+        withPikoLock(lock) {
+            if (closed) return
             val current = state.value
-            val next = transform(current).copy(revision = current.revision)
+            val transformed = transform(current)
+            if (transformed === current) return
+            val next = if (transformed.revision == current.revision) transformed else transformed.copy(revision = current.revision)
             if (next != current) {
+                cachedSortContext = null
                 state.value = next.copy(revision = current.revision + 1)
             }
         }
+    }
+
+    fun contentMetadata(key: ContentKey): ContentMetadata? = withPikoLock(lock) {
+        val normalized = ContentKey.of(key.gcid, key.sizeBytes) ?: return@withPikoLock null
+        disk?.content(normalized) ?: state.value.contentMetadata[normalized]
+    }
+
+    fun observeContentMetadata(key: ContentKey, metadata: ContentMetadata) {
+        withPikoLock(lock) { if (closed) return; disk?.let { it.observeContent(key, metadata); publishDisk(); return } }
+        val normalized = ContentKey.of(key.gcid, key.sizeBytes) ?: return
+        update { current ->
+            val prev = current.contentMetadata[normalized]
+            val merged = prev?.merge(metadata) ?: ContentMetadata().merge(metadata)
+            if (merged == prev || (prev == null && merged == ContentMetadata())) current
+            else current.copy(contentMetadata = current.contentMetadata + (normalized to merged))
+        }
+    }
+
+    /** Temporary lease identities never enter the physical tree. Only original media supplies dimensions. */
+    fun observeDetail(detail: FileDetail) {
+        val (key, metadata) = detail.toObservedContentMetadata() ?: return
+        observeContentMetadata(key, metadata)
+    }
+
+    fun observeDetails(details: Collection<FileDetail>) {
+        if (details.isEmpty()) return
+        val pairs = details.mapNotNull { it.toObservedContentMetadata() }
+        if (pairs.isEmpty()) return
+        withPikoLock(lock) {
+            if (closed) return
+            disk?.let {
+                it.observeContentBatch(pairs)
+                publishDisk()
+                return
+            }
+        }
+        update { current ->
+            var updatedMap: MutableMap<ContentKey, ContentMetadata>? = null
+            for ((key, incoming) in pairs) {
+                val baseMap = updatedMap ?: current.contentMetadata
+                val prev = baseMap[key]
+                val merged = prev?.merge(incoming) ?: ContentMetadata().merge(incoming)
+                if (merged != prev && !(prev == null && merged == ContentMetadata())) {
+                    val mutable = updatedMap ?: current.contentMetadata.toMutableMap().also { updatedMap = it }
+                    mutable[key] = merged
+                }
+            }
+            val finalMap = updatedMap
+            if (finalMap != null) current.copy(contentMetadata = finalMap) else current
+        }
+    }
+
+    fun observeTranscodeSize(
+        gcid: String,
+        sizeBytes: Long,
+        mediaId: String,
+        streamSizeBytes: Long?,
+        unreadable: Boolean = false,
+    ) {
+        if (mediaId.isBlank()) return
+        val normalized = ContentKey.of(gcid, sizeBytes) ?: return
+        withPikoLock(lock) {
+            if (closed) return
+            disk?.let {
+                it.observeTranscodeSize(normalized, mediaId, streamSizeBytes, unreadable)
+                publishDisk()
+                return
+            }
+        }
+        update { current ->
+            val prev = current.contentMetadata[normalized] ?: return@update current
+            val next = prev.withTranscodeProbe(mediaId, streamSizeBytes, unreadable)
+            if (next == prev) current else current.copy(contentMetadata = current.contentMetadata + (normalized to next))
+        }
+    }
+
+    fun originalCreatedAtMillis(id: String): Long? = withPikoLock(lock) {
+        if (closed || id.isBlank()) return@withPikoLock null
+        disk?.originalCreated(id) ?: state.value.entryMetadata[id]?.originalCreatedAtMillis
+    }
+
+    fun subtreeStats(folderId: String): SubtreeStats? {
+        val projected = fastSortContext().subtreeStats[folderId]
+        return projected?.takeIf { it.structuralValid }
+    }
+
+    fun setEntryMetadata(id: String, metadata: EntryMetadata) {
+        withPikoLock(lock) { if (closed) return; disk?.let { it.instance(id, metadata); publishDisk(); return } }
+        update { current ->
+            if (current.entryMetadata[id] == metadata) current
+            else current.copy(entryMetadata = current.entryMetadata + (id to metadata))
+        }
+    }
+
+    /** Capture all sort keys for this caller-owned list under the same tree revision. */
+    fun sortContext(files: List<FileStat>, order: PikoFileSortOrder? = null): SortContext {
+        if (files.isEmpty() || files.all { it.isFolder } || order == PikoFileSortOrder.NAME_ASC || order == PikoFileSortOrder.NAME_DESC || order == PikoFileSortOrder.SIZE_ASC || order == PikoFileSortOrder.SIZE_DESC) {
+            flow.value.sortProjection?.let { return it }
+        }
+        return withPikoLock(lock) {
+            disk?.sortContext(state.value, files = files, order = order) ?: sortContextOf(state.value)
+        }
+    }
+
+    /** 无锁快速读取内存已物化的目录聚合排序上下文，供主线程即时重排使用，绝不触发 SQLite 查询或等待写锁。 */
+    fun fastSortContext(): SortContext = flow.value.sortProjection ?: sortContextOf(flow.value)
+
+    /** A non-suspending scope for compound reads. Published State itself contains immutable folder projections. */
+    fun <T> withReadState(block: (State) -> T): T = withPikoLock(lock) { block(state.value) }
+
+    fun sortContext(): SortContext = sortContextOf(flow.value)
+
+    private fun sortContextOf(captured: State): SortContext {
+        captured.sortProjection?.let { return it }
+        withPikoLock(lock) { cachedSortContext?.takeIf { it.revision == captured.revision }?.let { return it } }
+        val computed = SortContext.of(captured)
+        withPikoLock(lock) { if (state.value.revision == captured.revision) cachedSortContext = computed }
+        return computed
+    }
+
+    @OptIn(kotlinx.coroutines.FlowPreview::class)
+    @Suppress("UNUSED_PARAMETER")
+    fun observeSortContext(folderId: String): Flow<SortContext> = flow.debounce(50L).map { captured ->
+        withContext(Dispatchers.Default) { withPikoLock(lock) { disk?.sortContext(state.value, folderId) ?: sortContextOf(captured) } }
     }
 
     val isComplete: Boolean get() = flow.value.complete
@@ -80,11 +385,17 @@ internal class DriveTreeIndex(
     val lastUsageBytes: Long? get() = flow.value.lastUsageBytes
 
     fun setLastUsageBytes(bytes: Long?) {
-        update { it.copy(lastUsageBytes = bytes) }
+        withPikoLock(lock) { if (closed) return; disk?.let { it.usage(bytes); publishDisk(); return } }
+        update { current -> if (current.lastUsageBytes == bytes) current else current.copy(lastUsageBytes = bytes) }
     }
 
     fun clear() {
-        synchronized(lock) {
+        withPikoLock(lock) {
+            if (closed) return
+            disk?.let { it.clear(); publishDisk(); return }
+            canonicalizer.clear()
+            cachedSortContext = null
+            historyPins.clear()
             mutationSeq = 0L
             treeInvalidatedAtSeq = 0L
             usagePatchedAtSeq = 0L
@@ -103,13 +414,59 @@ internal class DriveTreeIndex(
         }
     }
 
-    fun file(id: String): FileStat? = flow.value.entries[id]
+    fun file(id: String): FileStat? = withPikoLock(lock) {
+        disk?.file(id) ?: flow.value.let { s ->
+            val raw = s.entries[id] ?: return@let null
+            raw.enrichWithContentMetadata(ContentKey.of(raw)?.let { s.contentMetadata[it] })
+        }
+    }
+
+    fun filesByIds(ids: Collection<String>): Map<String, FileStat> = withPikoLock(lock) {
+        disk?.filesByIds(ids) ?: state.value.let { s ->
+            ids.mapNotNull { id ->
+                s.entries[id]?.let { raw ->
+                    id to raw.enrichWithContentMetadata(ContentKey.of(raw)?.let { s.contentMetadata[it] })
+                }
+            }.toMap()
+        }
+    }
+
+    fun vaultEntries(folderId: String): List<VaultEntry>? = withPikoLock(lock) {
+        if (disk != null) disk.vaultEntries(folderId) else state.value.vaultEntriesByFolder[folderId]
+    }
+
+    fun vaultFolders(): Set<String> = withPikoLock(lock) {
+        disk?.vaultFolders() ?: state.value.vaultEntriesByFolder.keys
+    }
+
+    fun hasPhysicalMissingFrom(ids: Set<String>): Boolean = withPikoLock(lock) {
+        disk?.hasPhysicalMissingFrom(ids) ?: state.value.entries.values.any { !VaultEntry.isVaulted(it.id) && it.id !in ids }
+    }
 
     fun children(folderId: String): FolderChildren = children(folderId, realOnly = false)
 
     fun realChildren(folderId: String): FolderChildren = children(folderId, realOnly = true)
 
+    internal fun directSpaceFiles(folderId: String, includeVaulted: Boolean): List<SqliteTreeStore.RawSpaceFile>? =
+        withPikoLock(lock) { disk?.directSpaceFiles(folderId, includeVaulted) }
+
+    internal fun topSpacePreviewFiles(folderId: String, includeVaulted: Boolean, limit: Int): List<dev.piko.shared.space.SpacePreviewBlock>? =
+        withPikoLock(lock) { disk?.topSpacePreviewFiles(folderId, includeVaulted, limit) }
+
+    internal fun topSpacePreviewFilesByParent(
+        folderIds: Collection<String>,
+        includeVaulted: Boolean,
+        limitPerParent: Int,
+    ): Map<String, List<dev.piko.shared.space.SpacePreviewBlock>>? =
+        withPikoLock(lock) { disk?.topSpacePreviewFilesByParent(folderIds, includeVaulted, limitPerParent) }
+
+    internal fun totalPhysicalBytes(): Long? = withPikoLock(lock) {
+        if (disk != null) disk.totalPhysicalBytes()
+        else state.value.entries.values.sumOf { if (it.isFolder || VaultEntry.isVaulted(it.id)) 0L else it.sizeBytes.coerceAtLeast(0L) }
+    }
+
     private fun children(folderId: String, realOnly: Boolean): FolderChildren {
+        withPikoLock(lock) { disk?.let { return it.children(folderId, realOnly) } }
         val current = flow.value
         val ids = current.childrenByParent[folderId].orEmpty()
         val coverage = when {
@@ -120,7 +477,9 @@ internal class DriveTreeIndex(
         }
         return FolderChildren(
             ids.mapNotNull { id ->
-                current.entries[id]?.takeUnless { realOnly && VaultEntry.isVaulted(id) }
+                current.entries[id]?.takeUnless { realOnly && VaultEntry.isVaulted(id) }?.let { raw ->
+                    raw.enrichWithContentMetadata(ContentKey.of(raw)?.let { current.contentMetadata[it] })
+                }
             },
             coverage,
         )
@@ -128,6 +487,10 @@ internal class DriveTreeIndex(
 
     /** 完整列举替换真实子项；分页列举只合并已观察到的条目。返回因跨目录移动而受影响的原父目录集合。 */
     fun putFolderListing(parentId: String, files: List<FileStat>, complete: Boolean = true): Set<String> {
+        withPikoLock(lock) { if (closed) return emptySet(); disk?.let { store ->
+            val revision = store.currentRevision
+            return store.listing(parentId, files, complete).also { if (store.currentRevision != revision) publishDisk() }
+        } }
         val physical = files.filterNot { it.trashed || VaultEntry.isVaulted(it.id) }
         var reparentedFrom = emptySet<String>()
         update { current ->
@@ -210,7 +573,9 @@ internal class DriveTreeIndex(
         expectedManifestId: String? = null,
         requireMatch: Boolean = false,
         starredEntryIds: Set<String> = emptySet(),
+        optimistic: Boolean = false,
     ): Boolean {
+        withPikoLock(lock) { if (closed) return false; disk?.let { return it.vault(folderId, entries, expectedManifestId, requireMatch, starredEntryIds, optimistic = optimistic).also { publishDisk() } } }
         val virtualStats = entries.filter { it.isArchived }.map { it.toFileStat(folderId, starred = it.id in starredEntryIds) }
         val storedEntries = entries.toList()
         var accepted = true
@@ -226,11 +591,7 @@ internal class DriveTreeIndex(
             val replaced = current.childrenByParent[folderId].orEmpty().filterTo(HashSet()) {
                 VaultEntry.isVaulted(it)
             }
-            val nextVaultMap = if (storedEntries.isEmpty()) {
-                current.vaultEntriesByFolder - folderId
-            } else {
-                current.vaultEntriesByFolder + (folderId to storedEntries)
-            }
+            val nextVaultMap = current.vaultEntriesByFolder + (folderId to storedEntries)
             upsert(current, virtualStats, replaced).copy(vaultEntriesByFolder = nextVaultMap)
         }
         return accepted
@@ -243,6 +604,7 @@ internal class DriveTreeIndex(
 
     /** 全盘平铺分页拉回的真实文件列表。 */
     fun putFiles(files: List<FileStat>) {
+        withPikoLock(lock) { if (closed) return; disk?.let { it.putFiles(files); publishDisk(); return } }
         val physical = files.filterNot { it.trashed || VaultEntry.isVaulted(it.id) }
         if (physical.isEmpty()) return
         update { current ->
@@ -262,6 +624,7 @@ internal class DriveTreeIndex(
 
     /** 哨兵探针增量补丁：写入新增/修改的节点并记入变更日志，防止并发进行的后台整树重建回滚补丁。 */
     fun applyCanaryPatch(files: List<FileStat>, usageBytes: Long? = null) {
+        withPikoLock(lock) { if (closed) return; disk?.let { it.canary(files, usageBytes); publishDisk(); return } }
         val physical = files.filterNot { it.trashed || VaultEntry.isVaulted(it.id) }
         if (physical.isEmpty() && usageBytes == null) return
         update { current ->
@@ -290,13 +653,15 @@ internal class DriveTreeIndex(
     }
 
     fun markComplete() {
+        withPikoLock(lock) { if (closed) return; disk?.let { it.markComplete(); publishDisk(); return } }
         update { it.copy(complete = true) }
     }
 
     /** 返回当前本地树中已知属于 [rootFolderId] 子树的全部文件夹 ID（含自身）。 */
-    fun descendantFolders(rootFolderId: String): Set<String> = collectDescendantFolders(flow.value, setOf(rootFolderId))
+    fun descendantFolders(rootFolderId: String): Set<String> = withPikoLock(lock) { disk?.descendants(rootFolderId) ?: collectDescendantFolders(flow.value, setOf(rootFolderId)) }
 
     fun applyChange(change: DriveChange) {
+        withPikoLock(lock) { if (closed) return; disk?.let { it.change(change); publishDisk(); return } }
         update { current ->
             val seq = ++mutationSeq
             when (change) {
@@ -397,7 +762,7 @@ internal class DriveTreeIndex(
                         } else withoutStar
                         if (nextTags != target.tags) {
                             val map = updatedEntries ?: current.entries.toMutableMap().also { updatedEntries = it }
-                            val patched = target.copy(tags = nextTags)
+                            val patched = target.copy(starred = change.starred, tags = nextTags)
                             map[id] = patched
                             if (!VaultEntry.isVaulted(id)) patchedAtSeq[id] = seq to patched
                         }
@@ -421,10 +786,10 @@ internal class DriveTreeIndex(
         }
     }
 
-    private fun upsert(current: State, added: List<FileStat>, removed: Set<String> = emptySet()): State {
-        if (added.isEmpty() && removed.isEmpty()) return current
-        val entries = current.entries.toMutableMap()
-        val children = current.childrenByParent.toMutableMap()
+    private fun upsert(current: State, added: Iterable<FileStat>, removed: Set<String> = emptySet(), owned: Boolean = false): State {
+        // owned is restricted to unpublished shadow states. Published maps are always copy-on-write.
+        val entries = if (owned && current.entries.isNotEmpty()) current.entries as MutableMap<String, FileStat> else current.entries.toMutableMap()
+        val children = if (owned && current.childrenByParent.isNotEmpty()) current.childrenByParent as MutableMap<String, Set<String>> else current.childrenByParent.toMutableMap()
         // 每个受影响的桶只复制一次，避免批量写入时反复复制同一组兄弟节点。
         val changedBuckets = HashMap<String, MutableSet<String>>()
         fun bucket(parentId: String): MutableSet<String> = changedBuckets.getOrPut(parentId) {
@@ -434,8 +799,19 @@ internal class DriveTreeIndex(
             bucket(entry.parentId).remove(entry.id)
         }
         for (id in removed) entries.remove(id)?.let(::detach)
-        for (entry in added) {
-            if (entry.trashed) continue
+        val contentMetadata = if (owned && current.contentMetadata.isNotEmpty()) current.contentMetadata as MutableMap<ContentKey, ContentMetadata> else current.contentMetadata.toMutableMap()
+        val entryMetadata = if (owned && current.entryMetadata.isNotEmpty()) current.entryMetadata as MutableMap<String, EntryMetadata> else current.entryMetadata.toMutableMap()
+        for (id in removed) entryMetadata.remove(id)
+        for (rawEntry in added) {
+            if (rawEntry.trashed) continue
+            val entry = canonicalizer.compact(rawEntry)
+            ContentKey.of(entry)?.let { key ->
+                val observed = ContentMetadata.of(entry)
+                if (observed != ContentMetadata()) contentMetadata[key] = contentMetadata[key]?.merge(observed) ?: observed
+            }
+            entry.params["piko_original_created_at"]?.toLongOrNull()?.let {
+                entryMetadata[entry.id] = EntryMetadata(it)
+            }
             val old = entries.put(entry.id, entry)
             if (old != null && old.parentId != entry.parentId) detach(old)
             bucket(entry.parentId).add(entry.id)
@@ -443,7 +819,8 @@ internal class DriveTreeIndex(
         for ((parentId, ids) in changedBuckets) {
             if (ids.isEmpty()) children.remove(parentId) else children[parentId] = ids.toSet()
         }
-        return current.copy(entries = entries.toMap(), childrenByParent = children.toMap())
+        return current.copy(entries = entries, childrenByParent = children,
+            contentMetadata = contentMetadata, entryMetadata = entryMetadata)
     }
 
     private fun collectDescendantFolders(current: State, rootFolders: Set<String>): Set<String> {
@@ -550,6 +927,18 @@ internal class DriveTreeIndex(
         movedParents: Map<String, String> = emptyMap(),
         syncedAtMillis: Long = 0L,
     ): Set<String> {
+        withPikoLock(lock) {
+            if (closed) return emptySet()
+            disk?.let {
+                val generation = it.beginCandidate()
+                try {
+                    it.appendCandidate(generation, folders)
+                    it.appendCandidate(generation, files)
+                    for ((folder, entries) in vaultByFolder) it.vault(folder, entries, null, false, emptySet(), generation)
+                    return it.commitCandidate(generation, usageBytes, syncedAtMillis).also { publishDisk() }
+                } finally { it.abortCandidate(generation) }
+            }
+        }
         var changedFolders = emptySet<String>()
         update { current ->
             if (sinceMutationSeq != null && treeInvalidatedAtSeq > sinceMutationSeq) {
@@ -620,8 +1009,8 @@ internal class DriveTreeIndex(
                 VaultStore.winnerOf(list, cachedIds)?.id?.let { rawWinnerIds[folderId] = it }
             }
             val candidateIds = HashSet<String>(folders.size + files.size)
-            val candidateEntries = buildList(folders.size + files.size + effPatched.size) {
-                for (rawEntry in folders + files) {
+            val candidateEntries = sequence {
+                for (rawEntry in folders.asSequence() + files.asSequence()) {
                     if (!rawEntry.trashed) candidateIds += rawEntry.id
                     val patchedPair = effPatched[rawEntry.id]
                     val entry = patchedPair?.second ?: rawEntry
@@ -638,7 +1027,7 @@ internal class DriveTreeIndex(
                         newParent != null -> entry.copy(parentId = newParent)
                         else -> entry
                     }
-                    add(patched)
+                    yield(patched)
                 }
                 for ((patchedId, pair) in effPatched) {
                     if (patchedId in candidateIds) continue
@@ -655,18 +1044,18 @@ internal class DriveTreeIndex(
                         newParent != null -> entry.copy(parentId = newParent)
                         else -> entry
                     }
-                    add(patched)
+                    yield(patched)
                 }
                 for ((movedId, newParent) in effMoved) {
                     if (movedId !in candidateIds && movedId !in effPatched) {
                         current.entries[movedId]?.takeUnless { VaultEntry.isVaulted(it.id) }?.let { live ->
                             val newName = effRenamed[movedId] ?: live.name
-                            add(live.copy(name = newName, parentId = newParent))
+                            yield(live.copy(name = newName, parentId = newParent))
                         }
                     }
                 }
             }
-            val rawCandidateBase = upsert(State(), candidateEntries)
+            val rawCandidateBase = upsert(State(), candidateEntries.asIterable())
             val candidateBase = if (effRemoved.isNotEmpty()) {
                 removeEntriesAndDescendants(rawCandidateBase, effRemoved)
             } else {
@@ -705,8 +1094,10 @@ internal class DriveTreeIndex(
                     entries.filter { it.isArchived }.forEach { virtualStats += it.toFileStat(preservedId) }
                 }
             }
-            var merged = upsert(candidateBase, virtualStats)
+            var merged = upsert(candidateBase, virtualStats, owned = true)
             val goneFromPreserved = HashSet<String>()
+            val preservedPhysical = ArrayList<FileStat>()
+            val replacedPhysical = HashSet<String>()
             if (preservedFolders.isNotEmpty()) {
                 for (preservedId in preservedFolders) {
                     val livePhysical = current.childrenByParent[preservedId].orEmpty().mapNotNull { id ->
@@ -720,8 +1111,10 @@ internal class DriveTreeIndex(
                     }
                     val missingInLive = candidatePhysicalIds - livePhysical.mapTo(HashSet()) { it.id }
                     missingInLive.filterTo(goneFromPreserved) { it !in current.entries }
-                    merged = upsert(merged, livePhysical, missingInLive)
+                    preservedPhysical.addAll(livePhysical)
+                    replacedPhysical.addAll(missingInLive)
                 }
+                merged = upsert(merged, preservedPhysical, replacedPhysical, owned = true)
             }
             val allRemovedIds = effRemoved + goneFromPreserved
             if (allRemovedIds.isNotEmpty()) {
@@ -755,6 +1148,8 @@ internal class DriveTreeIndex(
                 dirtyFolders = survivingDirty,
                 lastUsageBytes = effectiveUsageBytes,
                 complete = true,
+                contentMetadata = mergeTreeContentMetadata(current.contentMetadata, merged.contentMetadata),
+                entryMetadata = current.entryMetadata.filterKeys { it in merged.entries } + merged.entryMetadata,
             )
             val allParents = current.childrenByParent.keys + nextState.childrenByParent.keys
             val diffs = HashSet<String>()
@@ -784,6 +1179,7 @@ internal class DriveTreeIndex(
      * 若 [rootId] 子树在本地树中已完整且无脏目录，直接内存 $O(K)$ 汇总真实文件数与总字节数；否则返回 null 交由网络遍历兜底。
      */
     fun folderUsage(rootId: String): FolderUsage? {
+        withPikoLock(lock) { disk?.let { return it.folderUsage(rootId, state.value) } }
         val current = flow.value
         if (!current.complete && rootId !in current.listedFolders) return null
         if (rootId in current.dirtyFolders) return null
@@ -811,155 +1207,6 @@ internal class DriveTreeIndex(
         return FolderUsage(files, bytes, FolderUsage.Progress.COMPLETE)
     }
 
-    /** 从磁盘快照与已缓存的归档清单恢复完整内存树。若恢复前已有前台列举或本地改动，保留最新状态。 */
-    fun restoreSnapshot(
-        snapshot: PersistedTreeSnapshot,
-        cachedManifests: Map<String, List<VaultEntry>>,
-        sinceMutationSeq: Long = 0L,
-    ): Boolean {
-        val rawPhysical = snapshot.entries.map(StoredTreeEntry::toFileStat).filterNot { it.trashed }
-        var applied = false
-        update { current ->
-            if (current.complete || treeInvalidatedAtSeq > sinceMutationSeq) return@update current
-            applied = true
-            val effRemoved = removedAtSeq.filterValues { it > sinceMutationSeq }.keys
-            val effRenamed = renamedAtSeq.mapNotNull { (id, pair) ->
-                if (pair.first > sinceMutationSeq) id to pair.second else null
-            }.toMap()
-            val effMoved = movedAtSeq.mapNotNull { (id, pair) ->
-                if (pair.first > sinceMutationSeq) id to pair.second else null
-            }.toMap()
-            val journalDirty = dirtyAtSeq.filter { (folderId, dirtySeq) ->
-                dirtySeq > sinceMutationSeq && dirtySeq >= (listedAtSeq[folderId] ?: 0L)
-            }.keys
-            val journalListed = listedAtSeq.filter { (folderId, listSeq) ->
-                listSeq > sinceMutationSeq && listSeq > (dirtyAtSeq[folderId] ?: 0L)
-            }.keys
-            val effDirty = (journalDirty + current.dirtyFolders) - (journalListed - current.dirtyFolders)
-            val cleanLiveListed = ((journalListed + current.listedFolders) - current.dirtyFolders) - journalDirty
-
-            val snapshotIds = HashSet<String>(rawPhysical.size)
-            val movedOldParents = HashSet<String>()
-            val patchedEntries = buildList(rawPhysical.size + current.entries.size) {
-                for (entry in rawPhysical) {
-                    snapshotIds += entry.id
-                    val newName = effRenamed[entry.id]
-                    val newParent = effMoved[entry.id]
-                    if (newParent != null && newParent != entry.parentId) {
-                        movedOldParents += entry.parentId
-                    }
-                    val patched = when {
-                        newName != null && newParent != null -> entry.copy(name = newName, parentId = newParent)
-                        newName != null -> entry.copy(name = newName)
-                        newParent != null -> entry.copy(parentId = newParent)
-                        else -> entry
-                    }
-                    add(patched)
-                }
-                for (live in current.entries.values) {
-                    if (VaultEntry.isVaulted(live.id) || live.id in snapshotIds || live.id in effRemoved) continue
-                    val newName = effRenamed[live.id] ?: live.name
-                    val newParent = effMoved[live.id] ?: live.parentId
-                    add(live.copy(name = newName, parentId = newParent))
-                }
-            }
-            val base = upsert(State(), patchedEntries)
-            val manifestsByFolder = HashMap<String, FileStat>()
-            val vaultByFolder = HashMap<String, List<VaultEntry>>()
-            val cachedIds = locallyCachedManifestIds()
-            for ((folderId, ids) in base.childrenByParent) {
-                val childStats = ids.mapNotNull { base.entries[it] }
-                val winner = VaultStore.winnerOf(childStats, cachedIds) ?: continue
-                manifestsByFolder[folderId] = winner
-                val cached = cachedManifests[winner.id]
-                if (cached != null) {
-                    vaultByFolder[folderId] = cached
-                }
-            }
-            val virtualStats = vaultByFolder.flatMap { (folderId, entries) ->
-                entries.filter { it.isArchived }.map { it.toFileStat(folderId) }
-            }
-            var merged = upsert(base, virtualStats)
-            val goneFromLiveListed = HashSet<String>()
-            for (folderId in cleanLiveListed) {
-                val livePhysical = current.childrenByParent[folderId].orEmpty().mapNotNull { id ->
-                    current.entries[id]?.takeUnless { VaultEntry.isVaulted(id) }?.let { live ->
-                        val newName = effRenamed[live.id]
-                        if (newName != null && newName != live.name) live.copy(name = newName) else live
-                    }
-                }
-                val snapshotPhysicalIds = merged.childrenByParent[folderId].orEmpty().filterTo(HashSet()) {
-                    !VaultEntry.isVaulted(it)
-                }
-                val missingInLive = snapshotPhysicalIds - livePhysical.mapTo(HashSet()) { it.id }
-                missingInLive.filterTo(goneFromLiveListed) { it !in current.entries }
-                val liveVirtualIds = merged.childrenByParent[folderId].orEmpty().filterTo(HashSet()) {
-                    VaultEntry.isVaulted(it)
-                }
-                merged = upsert(merged, livePhysical, missingInLive + liveVirtualIds)
-                val liveWinner = current.manifestsByFolder[folderId]
-                if (liveWinner != null) manifestsByFolder[folderId] = liveWinner else manifestsByFolder.remove(folderId)
-                val liveVault = current.vaultEntriesByFolder[folderId] ?: liveWinner?.let { cachedManifests[it.id] }
-                if (liveVault != null) {
-                    vaultByFolder[folderId] = liveVault
-                    merged = upsert(merged, liveVault.filter { it.isArchived }.map { it.toFileStat(folderId) })
-                } else {
-                    vaultByFolder.remove(folderId)
-                }
-            }
-            for (folderId in effDirty) {
-                val livePhysical = current.childrenByParent[folderId].orEmpty().mapNotNull { id ->
-                    current.entries[id]?.takeUnless { VaultEntry.isVaulted(id) }?.let { live ->
-                        val newName = effRenamed[live.id]
-                        if (newName != null && newName != live.name) live.copy(name = newName) else live
-                    }
-                }
-                if (livePhysical.isNotEmpty()) {
-                    merged = upsert(merged, livePhysical)
-                }
-                if (folderId in current.vaultEntriesByFolder) {
-                    val liveVault = current.vaultEntriesByFolder.getValue(folderId)
-                    vaultByFolder[folderId] = liveVault
-                    val oldVirtual = merged.childrenByParent[folderId].orEmpty().filterTo(HashSet()) { VaultEntry.isVaulted(it) }
-                    merged = upsert(merged, liveVault.filter { it.isArchived }.map { it.toFileStat(folderId) }, oldVirtual)
-                }
-            }
-            val allRemovedIds = effRemoved + goneFromLiveListed
-            if (allRemovedIds.isNotEmpty()) {
-                merged = removeEntriesAndDescendants(merged, allRemovedIds)
-                manifestsByFolder.keys.removeAll(allRemovedIds)
-                vaultByFolder.keys.removeAll(allRemovedIds)
-            }
-            val unlistedLiveFolders = merged.entries.values.asSequence()
-                .filter { it.isFolder && it.id !in snapshotIds && it.id !in cleanLiveListed }
-                .mapTo(HashSet()) { it.id }
-            val effectiveDirty = ((snapshot.dirtyFolders - cleanLiveListed) + effDirty + movedOldParents + unlistedLiveFolders) - allRemovedIds
-            val listedFolders = if (snapshot.complete) {
-                buildSet {
-                    add("")
-                    for (entry in merged.entries.values) {
-                        if (entry.isFolder) add(entry.id)
-                    }
-                    removeAll(effectiveDirty)
-                }
-            } else {
-                cleanLiveListed - effectiveDirty
-            }
-            if (snapshot.lastFullSyncAtMillis > 0L) {
-                lastFullSyncAtMillis = snapshot.lastFullSyncAtMillis
-            }
-            merged.copy(
-                manifestsByFolder = manifestsByFolder.toMap(),
-                vaultEntriesByFolder = vaultByFolder.toMap(),
-                listedFolders = listedFolders,
-                dirtyFolders = effectiveDirty,
-                lastUsageBytes = current.lastUsageBytes ?: snapshot.lastUsageBytes,
-                complete = snapshot.complete,
-            )
-        }
-        return applied
-    }
-
     /**
      * 在当前已知的本地文件树中搜索 [parentId] 子树下匹配 [query] 的条目，按匹配度排序返回。
      * [skipIds] 可传入本轮流式扫描中已确认不匹配的条目 ID，避免分页到达时对数万旧节点重复跑模糊匹配。
@@ -972,6 +1219,27 @@ internal class DriveTreeIndex(
         transformFile: (FileStat) -> FileStat = { it },
         skipIds: MutableSet<String>? = null,
     ): List<SearchHit> {
+        val preparedQuery = prepareCjkQuery(query)
+        withPikoLock(lock) {
+            if (closed) return emptyList()
+            disk?.let { store ->
+                val hits = ArrayList<Pair<Int, SearchHit>>()
+                val entries = state.value.entries
+                val nodes = folderIndex.flow.value.nodes
+                store.searchCandidates(preparedQuery, extraFolderTitle) { score, file ->
+                    if (!isPikoInternalFolder(file, file.parentId) && !VaultStore.looksLikeManifest(file) && !VaultStore.isRecoveryFile(file)) {
+                        resolveBreadcrumb(file, parentId, entries, nodes)?.let { hits += score to SearchHit(transformFile(file), it) }
+                    }
+                }
+                hits.sortWith { a, b ->
+                    val byScore = b.first.compareTo(a.first)
+                    if (byScore != 0) byScore else if (a.second.file.isFolder != b.second.file.isFolder) {
+                        if (a.second.file.isFolder) -1 else 1
+                    } else NaturalOrder.compare(a.second.file.name, b.second.file.name)
+                }
+                return hits.map { it.second }
+            }
+        }
         val currentEntries = flow.value.entries
         if (currentEntries.isEmpty()) return emptyList()
         val indexNodes = folderIndex.flow.value.nodes
@@ -992,9 +1260,9 @@ internal class DriveTreeIndex(
                 skipIds?.add(entry.id)
                 continue
             }
-            val nameScore = cjkFuzzyScore(query, entry.name)
+            val nameScore = preparedQuery.score(entry.name)
             val titleScore = if (nameScore == null && entry.isFolder) {
-                extraFolderTitle(entry)?.let { cjkFuzzyScore(query, it) }
+                extraFolderTitle(entry)?.let(preparedQuery::score)
             } else null
             val score = nameScore ?: titleScore
             if (score == null) {
@@ -1028,7 +1296,6 @@ internal class DriveTreeIndex(
         val lastUsageBytes: Long? = null,
         val complete: Boolean = true,
         val dirtyFolders: Set<String> = emptySet(),
-        val entries: List<StoredTreeEntry> = emptyList(),
     )
 
     @Serializable
@@ -1047,6 +1314,8 @@ internal class DriveTreeIndex(
         @SerialName("ph") val phase: String = TaskPhase.COMPLETE,
         @SerialName("pa") val params: Map<String, String> = emptyMap(),
         @SerialName("tg") val tags: List<FileTag> = emptyList(),
+        @SerialName("sr") val sourceRef: Int? = null,
+        @SerialName("oc") val originalCreatedAtMillis: Long? = null,
     ) {
         fun toFileStat(): FileStat = FileStat(
             kind = if (isFolder) FileKind.FOLDER else FileKind.FILE,
@@ -1080,44 +1349,17 @@ internal class DriveTreeIndex(
                 thumbnailLink = stat.thumbnailLink,
                 phase = stat.phase,
                 params = stat.params,
-                tags = stat.tags,
+                tags = if (stat.starred && stat.tags.none { it.name == FileTag.STAR }) stat.tags + FileTag(name = FileTag.STAR) else stat.tags,
             )
         }
     }
 
     companion object {
-        private const val CURRENT_SCHEMA_VERSION = 1
+        private const val CURRENT_SCHEMA_VERSION = 2
         private val UNSAFE_KEY_CHARS = Regex("""[^A-Za-z0-9._@-]""")
-        private val SNAPSHOT_JSON = Json { ignoreUnknownKeys = true; encodeDefaults = false; explicitNulls = false }
 
         fun snapshotKeyOf(account: String): String =
             "drive-tree-" + account.replace(UNSAFE_KEY_CHARS, "_") + ".json"
-
-        fun encodeSnapshot(
-            state: State,
-            savedAtMillis: Long = 0L,
-            lastFullSyncAtMillis: Long = 0L,
-        ): String {
-            val physical = state.entries.values
-                .filterNot { it.trashed || VaultEntry.isVaulted(it.id) }
-                .map(StoredTreeEntry::of)
-            val snapshot = PersistedTreeSnapshot(
-                schemaVersion = CURRENT_SCHEMA_VERSION,
-                savedAtMillis = savedAtMillis,
-                lastFullSyncAtMillis = lastFullSyncAtMillis,
-                lastUsageBytes = state.lastUsageBytes,
-                complete = state.complete,
-                dirtyFolders = state.dirtyFolders,
-                entries = physical,
-            )
-            return SNAPSHOT_JSON.encodeToString(PersistedTreeSnapshot.serializer(), snapshot)
-        }
-
-        fun decodeSnapshot(text: String): PersistedTreeSnapshot? =
-            runCatching {
-                SNAPSHOT_JSON.decodeFromString(PersistedTreeSnapshot.serializer(), text)
-                    .takeIf { it.schemaVersion == CURRENT_SCHEMA_VERSION }
-            }.getOrNull()
 
         internal fun resolveBreadcrumb(
             entry: FileStat,

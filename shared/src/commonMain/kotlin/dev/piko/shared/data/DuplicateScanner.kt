@@ -1,5 +1,8 @@
 package dev.piko.shared.data
 
+import dev.piko.shared.log.PikoLog
+import dev.piko.shared.log.logFailure
+import dev.piko.shared.log.logFolder
 import io.github.nihildigit.pikpak.FileStat
 import io.github.nihildigit.pikpak.listFiles
 import kotlinx.coroutines.Dispatchers
@@ -34,8 +37,6 @@ sealed interface DuplicateScanEvent {
      * 几千个目录里偶有一个超时，不值得让整轮扫描作废。
      * [subfolders] 是起点之下列出过内容的文件夹，没来得及列或列失败的不在里面：按番号规范命名（CanonicalTreeScan）据此看文件夹里有什么，
      * 内容不明的文件夹不能拿来判断。
-     * [manifests] 是路上遇到的归档清单（`.piko-vault-*.json`），海报墙据此把引用保存的条目也摆上墙；
-     * 它们不计进 [files]，两者的口径在界面上本来也不一样。
      */
     data class Finished(
         val files: List<ScannedFile>,
@@ -43,6 +44,10 @@ sealed interface DuplicateScanEvent {
         val failedFolders: Int,
         val stop: ScanStop?,
         val subfolders: List<ScannedFile> = emptyList(),
+        /**
+         * 路上遇到的归档清单（`.piko-vault-*.json`），海报墙据此把引用保存的条目也摆上墙；
+         * 它们不计进 [files]，两者的口径在界面上本来也不一样。
+         */
         val manifests: List<ScannedFile> = emptyList(),
     ) : DuplicateScanEvent
 }
@@ -50,12 +55,9 @@ sealed interface DuplicateScanEvent {
 /**
  * 递归列出一个目录下的全部文件与文件夹，供查找重复与按番号规范命名用。
  *
- * PikPak 没有按哈希查询的接口，只能逐个目录列出来在本地比对，一个目录一次请求（SDK 负责翻页）。
- * 按层遍历、每批并发 [concurrency] 个目录，与仓库层的 folderUsage 相同。
- * 到达目录数、文件数或时间上限时提前结束并注明原因，结果仍可用，只是不全。
- *
- * 不走 PikoDriveRepository.listAllFiles：它会把每个目录的文件名记进一张不随路径栈清理的表，
- * 扫一遍全盘就是几千项。
+ * 注入 [PikoDriveRepository] 时优先走 [PikoDriveRepository.scanRealChildren]：本地 SQLite 树已覆盖且干净的目录直接从本地读取，
+ * 整棵子树干净（[isSubtreeClean]）时自动解除目录数与文件数上限（`Int.MAX_VALUE`）；未覆盖或脏目录回退远端按层并发拉取（每批 [concurrency] 个）。
+ * 远端扫描到达目录数、文件数或时间上限时提前结束并注明 [ScanStop]，已收集结果仍可用。
  */
 class DuplicateScanner(
     private val listFolder: suspend (folderId: String) -> List<FileStat>,
@@ -63,7 +65,12 @@ class DuplicateScanner(
     private val maxFiles: Int = 200_000,
     private val timeout: Duration = 5.minutes,
     private val concurrency: Int = 12,
+    private val isSubtreeClean: (rootId: String) -> Boolean = { false },
 ) {
+    private companion object {
+        const val TAG = "DuplicateScanner"
+    }
+
     constructor(clients: PikoClientProvider) : this(
         listFolder = { folderId ->
             val client = clients.currentClient.value ?: error("Not logged in")
@@ -76,6 +83,7 @@ class DuplicateScanner(
             val client = clients.currentClient.value ?: error("Not logged in")
             driveRepo.scanRealChildren(folderId, client)
         },
+        isSubtreeClean = driveRepo::isSubtreeClean,
     )
 
     // 停止不取消协程：取消会连同已经列出的结果一起丢掉，而用户按停止多半是想看已有的部分
@@ -88,7 +96,11 @@ class DuplicateScanner(
 
     /** 列不出起点目录时抛出异常；其下的目录列不出来只计数跳过。 */
     fun scan(rootId: String): Flow<DuplicateScanEvent> = flow {
-        val deadline = TimeSource.Monotonic.markNow() + timeout
+        val started = TimeSource.Monotonic.markNow()
+        val deadline = started + timeout
+        val unlimited = isSubtreeClean(rootId)
+        val effectiveMaxFolders = if (unlimited) Int.MAX_VALUE else maxFolders
+        val effectiveMaxFiles = if (unlimited) Int.MAX_VALUE else maxFiles
         val files = mutableListOf<ScannedFile>()
         val subfolders = mutableListOf<ScannedFile>()
         val manifests = mutableListOf<ScannedFile>()
@@ -105,16 +117,22 @@ class DuplicateScanner(
                 stop = when {
                     stopRequested -> ScanStop.CANCELLED
                     deadline.hasPassedNow() -> ScanStop.TIMEOUT
-                    listed >= maxFolders -> ScanStop.FOLDER_LIMIT
-                    files.size >= maxFiles -> ScanStop.FILE_LIMIT
+                    listed >= effectiveMaxFolders -> ScanStop.FOLDER_LIMIT
+                    files.size >= effectiveMaxFiles -> ScanStop.FILE_LIMIT
                     else -> null
                 }
                 if (stop != null) break
-                val budgeted = batch.take(maxFolders - listed)
+                val budgeted = if (unlimited) batch else batch.take(effectiveMaxFolders - listed)
                 val listings = coroutineScope {
                     budgeted.map { folder ->
                         async {
-                            if (isRoot) listFolder(folder.id) else runSuspendCatching { listFolder(folder.id) }.getOrNull()
+                            if (isRoot) {
+                                runSuspendCatching { listFolder(folder.id) }
+                                    .logFailure(TAG, "Duplicate scan failed to list root ${logFolder(folder.id)}")
+                                    .getOrThrow()
+                            } else {
+                                runSuspendCatching { listFolder(folder.id) }.getOrNull()
+                            }
                         }
                     }.awaitAll()
                 }
@@ -146,6 +164,14 @@ class DuplicateScanner(
             }
             isRoot = false
             level = next
+        }
+        val elapsedMs = started.elapsedNow().inWholeMilliseconds
+        val summary = "root=${logFolder(rootId)}, folders=$listed, files=${files.size}, " +
+            "failedFolders=$failed, stop=${stop ?: "NONE"}, cleanFastPath=$unlimited, elapsedMs=$elapsedMs"
+        if ((stop != null && stop != ScanStop.CANCELLED) || failed > 0) {
+            PikoLog.w(TAG, "Tree scan finished with incomplete coverage ($summary)")
+        } else {
+            PikoLog.i(TAG, "Tree scan finished ($summary)")
         }
         emit(DuplicateScanEvent.Finished(files.toList(), listed, failed, stop, subfolders.toList(), manifests.toList()))
     }.flowOn(Dispatchers.Default)

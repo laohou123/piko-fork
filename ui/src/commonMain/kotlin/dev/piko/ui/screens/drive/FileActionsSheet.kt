@@ -25,6 +25,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import dev.piko.data.repository.isPlayableVideo
 import dev.piko.shared.data.FolderUsage
+import dev.piko.shared.log.PikoLog
+import dev.piko.shared.log.logFolder
 import dev.piko.shared.state.DriveItemName
 import dev.piko.ui.components.ActionTier
 import dev.piko.ui.components.FileTypeIcon
@@ -60,7 +62,8 @@ internal fun FileActionsSheet(
             folderUsage.collect { value = FolderUsageResult.Counted(it) }
         } catch (e: CancellationException) {
             throw e
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            PikoLog.w("Drive", "Failed to calculate folder usage in actions sheet for ${logFolder(file.id)}", e)
             value = FolderUsageResult.Failed
         }
     }
@@ -135,6 +138,7 @@ internal class FileActionHandlers(
      */
     val findDuplicates: (() -> Unit)?,
     val canonicalNameFolder: (() -> Unit)?,
+    val viewSpaceMap: (() -> Unit)? = null,
     val downloadSegment: () -> Unit,
     /** 视频的「下载指定画质」「下载指定段落」上按下或悬停时提前查各档。普通下载不探测。 */
     val prepareQualities: () -> Unit,
@@ -170,11 +174,9 @@ internal class FileActionHandlers(
  */
 internal fun fileActions(file: FileStat, commands: ItemCommands, on: FileActionHandlers): List<SheetAction> = buildList {
     val video = !file.isFolder && file.isPlayableVideo()
-    val desktop = on.putOnClipboard != null
     val putOnClipboard = on.putOnClipboard?.takeIf { commands.cutCopy }
     addAll(
         DriveActions.quickRow(
-            desktop = desktop,
             cut = null,
             copy = null,
             download = DriveActions.download(onClick = on.download).takeIf { commands.download },
@@ -196,6 +198,7 @@ internal fun fileActions(file: FileStat, commands: ItemCommands, on: FileActionH
     if (file.isFolder) {
         if (commands.rename) on.canonicalNameFolder?.let { add(DriveActions.canonicalName(it)) }
         on.findDuplicates?.let { add(DriveActions.findDuplicates(it)) }
+        if (commands.viewSpaceMap) on.viewSpaceMap?.let { add(DriveActions.viewSpaceMap(it)) }
         on.togglePin?.let { add(DriveActions.pin(on.isPinned, it)) }
     }
     if (commands.vault) add(DriveActions.vault(on.vault))

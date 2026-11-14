@@ -1,10 +1,16 @@
 package dev.piko.cli
 
+import dev.piko.shared.log.LogLevel
+import dev.piko.shared.log.PikoLog
 import dev.piko.shared.naming.parseMediaName
 import io.github.nihildigit.pikpak.getFile
+import io.github.nihildigit.pikpak.refreshAccountState
 import java.io.File
 import java.io.PrintStream
+import java.nio.file.Files
 import kotlin.system.exitProcess
+import kotlin.time.Duration
+import kotlin.time.Duration.Companion.hours
 import kotlinx.coroutines.runBlocking
 
 private const val USAGE = """piko-cli：Piko 开发工具
@@ -44,6 +50,18 @@ private const val USAGE = """piko-cli：Piko 开发工具
 
   archive-write-bench /Dramas [--parallel <1,2,4,8,16,32>] [--count <32>] [--timeout <60>] [--api-rate <1000>]
       在 Dramas 内新建独立测试目录，实测清单写入和延迟确认。只删除本次新建的目录及其内容。
+
+  sync-probe
+      创建隔离空目录实测同步分页水位，结束后移入回收站。
+
+  login [--no-browser]
+      使用第一方 Android 设备授权流（RFC 8628）在系统默认浏览器完成 Google / 网页登录，会话写入 ~/.piko-dev。
+
+  account [--cached]
+      通过 SDK 统一状态机查询当前账号资料、会员等级、网盘容量、回收站占用、流量配额与每日离线次数（--cached 优先复用本机缓存快照）。
+
+  playback-bench [/Dramas] [--proxies <SG=127.0.0.1:17891,...>] [--cases <all|cold,resume,seek,clips,popup,download>] [--steady-seconds <8>] [--download-seconds <8>]
+      端到端实测：完全走 Piko 真实播放/代理/稀疏缓存池/瀑布流/信息流/下载链路，切不同代理节点实测吞吐与响应耗时。
 """
 
 fun main(args: Array<String>) {
@@ -55,9 +73,52 @@ fun main(args: Array<String>) {
     if (System.getProperty("piko.home").isNullOrBlank()) {
         System.setProperty("piko.home", File(System.getProperty("user.home"), ".piko-dev").path)
     }
+    val logDir = Files.createTempDirectory("piko-cli-log-").toFile().apply { deleteOnExit() }
+    PikoLog.install(logDir.path) { level, tag, message, error ->
+        if (level >= LogLevel.WARN) {
+            System.err.println("Piko/$tag: $message" + (error?.let { "\n" + PikoLog.redact(it.stackTraceToString()) } ?: ""))
+        }
+    }
+    try {
+        runCli(args)
+    } finally {
+        runBlocking { PikoLog.flush() }
+        logDir.listFiles()?.forEach { it.deleteOnExit() }
+    }
+}
+
+private fun runCli(args: Array<String>) {
     val command = args.firstOrNull() ?: usage()
     val options = Options(args.drop(1))
     when (command) {
+        "clip-probe" -> runBlocking {
+            val client = appClient()
+            try {
+                val fileId = options.positional.firstOrNull() ?: usage()
+                val provider = object : dev.piko.shared.data.PikoClientProvider {
+                    override val currentClient = kotlinx.coroutines.flow.MutableStateFlow<io.github.nihildigit.pikpak.PikPakClient?>(client)
+                }
+                val repository = dev.piko.shared.media.PikoMediaRepository(provider)
+                kotlinx.coroutines.withTimeout(60_000) {
+                    val detail = client.getFile(fileId)
+                    val duration = detail.params["duration"]?.toDoubleOrNull()?.times(1000)?.toLong()
+                        ?: detail.medias.firstNotNullOfOrNull { it.video?.duration }?.times(1000) ?: error("missing duration")
+                    val probe = repository.clipProbe(fileId)
+                    println("has720P=${probe.hasTranscode}")
+                    val started = kotlin.time.TimeSource.Monotonic.markNow()
+                    repository.prepareClip(fileId, duration / 2, duration, io.github.nihildigit.pikpak.StreamRole.FOREGROUND)
+                        .getOrThrow().use { clip ->
+                            println("sliced=${clip.sliced} prepareMs=${started.elapsedNow().inWholeMilliseconds} streamBytes=${clip.streamBytes}")
+                            clip.prefetch(io.github.nihildigit.pikpak.StreamRole.FOREGROUND)
+                            println("readyMs=${started.elapsedNow().inWholeMilliseconds} windowMs=${clip.maxWindowMs}")
+                        }
+                }
+            } finally { client.close() }
+        }
+        "sync-probe" -> runBlocking {
+            val client = appClient()
+            try { probeSyncPagination(client) } finally { client.close() }
+        }
         "archive-write-cleanup" -> runBlocking {
             val path = options.positional.firstOrNull() ?: "/Dramas"
             val client = appClient()
@@ -119,13 +180,35 @@ fun main(args: Array<String>) {
         }
         "ls" -> runBlocking {
             val path = options.positional.firstOrNull() ?: usage()
-            listWithParams(appClient(), path).forEach(::println)
+            val client = appClient()
+            try {
+                listWithParams(client, path).forEach(::println)
+            } finally {
+                client.close()
+            }
         }
         "media" -> runBlocking {
             val fileId = options.positional.firstOrNull() ?: usage()
-            appClient().getFile(fileId).medias.forEach { media ->
-                println("${media.mediaName}  origin=${media.isOrigin}  ${media.video?.width}x${media.video?.height}\n  ${media.link.url}")
+            val client = appClient()
+            try {
+                val detail = client.getFile(fileId, usage = options.value("--usage"))
+                println("metadata medias=${detail.medias.size} downloadMax=${detail.octetStream.maxSpeedBytesPerSec} originMax=${detail.originMediaLink?.maxSpeedBytesPerSec}")
+                detail.medias.forEach { media ->
+                    println("${media.mediaName}  origin=${media.isOrigin}  ${media.video?.width}x${media.video?.height}  playable=${media.url != null}\n  ${media.link.url}")
+                }
+            } finally {
+                client.close()
             }
+        }
+        "playback-bench" -> runBlocking {
+            val path = options.positional.firstOrNull() ?: "/Dramas"
+            runPlaybackBench(
+                path = path,
+                proxiesSpec = options.value("--proxies") ?: options.value("--proxy") ?: "SG=127.0.0.1:17891",
+                casesSpec = options.value("--cases") ?: "all",
+                steadySeconds = options.value("--steady-seconds")?.toInt() ?: 8,
+                downloadSeconds = options.value("--download-seconds")?.toInt() ?: 8,
+            )
         }
         "bench" -> runBlocking {
             benchClipHeads(
@@ -147,6 +230,70 @@ fun main(args: Array<String>) {
                 probeShareRestore(appClient(), url, passCode)
             } else {
                 describeShare(appClient(), url, passCode).forEach(::println)
+            }
+        }
+        "login" -> runBlocking {
+            val scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.Default)
+            val store = dev.piko.shared.auth.DesktopSessionStore()
+            val manager = dev.piko.shared.data.PikoClientManager(store, scope)
+            try {
+                while (manager.isInitializing.value) kotlinx.coroutines.delay(20)
+                val tx = manager.startGoogleDeviceLogin().getOrThrow()
+                println("设备验证码: ${tx.authorization.userCode}")
+                println("Google 登录入口: ${tx.googleAuthUrl}")
+                println("手动确认页面:   ${tx.qrLoginUrl}")
+                if ("--no-browser" !in options.flags) {
+                    runCatching {
+                        if (java.awt.Desktop.isDesktopSupported()) {
+                            java.awt.Desktop.getDesktop().browse(java.net.URI(tx.googleAuthUrl))
+                            println("已在默认浏览器打开登录页面，请在浏览器中完成确认…")
+                        }
+                    }.onFailure {
+                        println("未能自动调起默认浏览器，请手动复制上方链接到浏览器中打开。")
+                    }
+                }
+                val client = manager.awaitGoogleDeviceLogin(tx).getOrThrow()
+                val saved = manager.accounts.value.find(client.account)
+                println("登录成功: ${saved?.displayName ?: "PikPak 用户"}")
+                client.close()
+            } finally {
+                scope.coroutineContext[kotlinx.coroutines.Job]?.cancel()
+            }
+        }
+        "account" -> runBlocking {
+            val client = appClient()
+            try {
+                val maxAge = if ("--cached" in options.flags) 24.hours else Duration.ZERO
+                val snap = client.refreshAccountState(maxAge)
+                val profile = snap.userProfile
+                val quota = snap.quota
+                val tq = snap.transferQuota
+                println("账号: ${client.account}")
+                if (profile != null) {
+                    println("资料: name=${profile.name.ifBlank { "(未设置)" }}  email=${profile.email.ifBlank { "(无)" }}  sub=${profile.sub}")
+                }
+                val tier = when (client.isFreeAccount) {
+                    false -> "VIP (${tq?.account?.vipStatus ?: "ok"}, 到期 ${tq?.account?.expireTime?.ifBlank { quota?.expiresAt.orEmpty() }})"
+                    true -> "免费账号 (${tq?.account?.vipStatus ?: "novip"})"
+                    null -> "未知"
+                }
+                println("等级: $tier")
+                if (quota != null) {
+                    println("网盘容量: 已用 ${quota.quota.usageBytes} B / 总计 ${quota.quota.limitBytes} B (剩余 ${quota.quota.remainingBytes} B，回收站 ${quota.quota.usageInTrashBytes} B)")
+                    val cd = quota.quotas.cloudDownload
+                    println("每日离线次数: 已用 ${cd.usage} / 上限 ${cd.limit} (无限=${cd.isUnlimited}, 剩余=${cd.remaining ?: "不限"})")
+                }
+                if (tq != null) {
+                    val acc = tq.account
+                    println("云盘离线月度流量: 已用 ${acc.offline.usedBytes} B / 总计 ${acc.offline.limitBytes} B (剩余 ${acc.offline.remainingBytes} B)")
+                    println("下载月度流量:     已用 ${acc.download.usedBytes} B / 总计 ${acc.download.limitBytes} B (剩余 ${acc.download.remainingBytes} B)")
+                    println("上传/秒传月度流量: 已用 ${acc.upload.usedBytes} B / 总计 ${acc.upload.limitBytes} B (剩余 ${acc.upload.remainingBytes} B)")
+                    if (acc.downloadDaily.limitBytes > 0) {
+                        println("下载单日流量:     已用 ${acc.downloadDaily.usedBytes} B / 总计 ${acc.downloadDaily.limitBytes} B (剩余 ${acc.downloadDaily.remainingBytes} B)")
+                    }
+                }
+            } finally {
+                client.close()
             }
         }
         else -> usage()
@@ -184,6 +331,6 @@ private class Options(args: List<String>) {
 
     companion object {
         // 不带值的开关
-        val FLAGS = setOf("--visited", "--restore", "--sequential", "--playing", "--background-first", "--combined")
+        val FLAGS = setOf("--visited", "--restore", "--sequential", "--playing", "--background-first", "--combined", "--cached", "--no-browser")
     }
 }

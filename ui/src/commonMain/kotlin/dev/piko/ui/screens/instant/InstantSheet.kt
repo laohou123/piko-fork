@@ -114,7 +114,6 @@ import dev.piko.shared.state.SavePlan
 import dev.piko.shared.state.InstantRow
 import dev.piko.shared.state.InstantSheetState
 import dev.piko.shared.state.NameGroupSummary
-import dev.piko.shared.state.ShareSaveState
 import dev.piko.shared.state.VaultArchiveOptions
 import dev.piko.shared.data.PikoPathBreadcrumb
 import dev.piko.shared.data.TruncatedReason
@@ -208,9 +207,6 @@ internal fun InstantSheetContent(
         }
     }
 
-    // 分享链接走转存，与磁力的解析、秒传、离线互不相干，下面整段换成分享面板
-    val shareState = state.shareSave
-
     val action = state.primaryAction
     var askOffline by remember { mutableStateOf<OfflineConfirm?>(null) }
     // 单条磁力的保存：免费账号要离线时先确认，按钮与快捷键走同一条路
@@ -221,8 +217,6 @@ internal fun InstantSheetContent(
     // 主修饰键+Enter 保存。不用单独的 Enter：它在输入框里换行（多条链接一行一条），在文件行上是勾选
     val saveByShortcut: (() -> Unit)? = when {
         batch != null -> if (batch.canSaveAll) batch::saveAll else null
-        shareState != null -> state.target?.takeIf { shareState.selectedIds.isNotEmpty() && !shareState.isSaving }
-            ?.let { target -> { shareState.save(PikoPathBreadcrumb(target.id, target.name), canonicalNames = state.useCanonicalNames) } }
         action != null && action.enabled && !state.isSaving && (state.hasInstantRetry || state.savePlan?.blocked != true) -> saveMagnet
         else -> null
     }
@@ -244,7 +238,7 @@ internal fun InstantSheetContent(
     BackHandler(enabled = isTreeMaximized) { isTreeMaximized = false }
     @Composable
     fun SaveSettings() {
-        if (state.resolution != null || batch != null) {
+        if ((state.resolution != null && state.supportsReferenceSave) || (batch != null && batch.rows.any { it.state.supportsReferenceSave })) {
             val referenceEnabled = state.canEdit && !state.hasRetainedInstantAttempt && batch?.rows?.any { !it.state.canEdit || it.state.hasRetainedInstantAttempt } != true
             val reference = batch?.saveAsReference ?: state.saveAsReference
             val rawUpdateReference: (Boolean) -> Unit = if (batch != null) batch::updateSaveAsReference else state::updateSaveAsReference
@@ -261,7 +255,7 @@ internal fun InstantSheetContent(
                 Checkbox(reference, null, Modifier.size(48.dp).clearAndSetSemantics {}, enabled = referenceEnabled)
                 Text(stringResource(Res.string.text_save_as_references), style = MaterialTheme.typography.bodyMedium)
             }
-            val referenceStates = batch?.rows?.map { it.state } ?: listOf(state)
+            val referenceStates = (batch?.rows?.map { it.state } ?: listOf(state)).filter { it.supportsReferenceSave }
             val missing = referenceStates.sumOf { it.missingReferenceCount }
             if (reference && missing > 0) {
                 val allMissing = referenceStates.all { it.referenceItemsToSave.isEmpty() }
@@ -275,15 +269,13 @@ internal fun InstantSheetContent(
     }
     BoxWithConstraints(Modifier.fillMaxWidth().then(if (inSideSheet || fillHeight) Modifier.fillMaxHeight() else Modifier)) {
         val splitSelection = fillHeight && maxWidth >= 720.dp && maxHeight < 480.dp && batch == null &&
-            (shareState != null || state.resolution != null)
+            state.resolution != null
         LaunchedEffect(splitSelection) {
             if (splitSelection) isTreeMaximized = false
         }
         @Composable
         fun Footer() {
-            if (shareState != null) {
-                ShareSaveFooter(state = shareState, target = state.target, canonicalNames = state.useCanonicalNames, onPickTarget = { showTargetPicker = true })
-            } else if (action != null) {
+            if (action != null) {
                 if (!isTreeMaximized || splitSelection) SaveSettings()
                 SaveBar(state = state, action = action, onSave = saveMagnet)
             }
@@ -320,24 +312,12 @@ internal fun InstantSheetContent(
                 Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(24.dp)) {
                     Column(Modifier.weight(.45f).fillMaxHeight().verticalScroll(rememberScrollState()),
                         verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        InstantBody(state, shareState, false, notice, showReceipt, showSelection = false)
+                        InstantBody(state, false, notice, showReceipt, showSelection = false)
                         Footer()
                     }
                     Column(Modifier.weight(.55f).fillMaxHeight()) {
-                        if (shareState != null) {
-                            ShareSaveSection(
-                                state = shareState, canonicalNames = state.useCanonicalNames,
-                                onCanonicalNamesChange = state::updateUseCanonicalNames,
-                                onPreview = state::previewSharedFile, previewingId = state.previewingSharedId,
-                                onDownload = { file ->
-                                    platformDownloads.enqueueResolved(listOf(io.github.nihildigit.pikpak.ResolvedFile(file.name, file.sizeBytes, file.hash)), state.target?.id.orEmpty())
-                                    showReceipt(QUEUED_RECEIPT)
-                                },
-                            )
-                        } else {
-                            SelectionHeader(state)
-                            FileTreeList(state, { showReceipt(QUEUED_RECEIPT) }, Modifier.weight(1f), fileListState)
-                        }
+                        SelectionHeader(state)
+                        FileTreeList(state, { showReceipt(QUEUED_RECEIPT) }, Modifier.weight(1f), fileListState)
                     }
                 }
             } else {
@@ -346,7 +326,7 @@ internal fun InstantSheetContent(
                     modifier = Modifier.weight(1f, fill = inSideSheet || fillHeight || isTreeMaximized),
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
-                    if (isTreeMaximized && shareState == null && state.resolution != null) {
+                    if (isTreeMaximized && state.resolution != null) {
                         Column(modifier = Modifier.weight(1f)) {
                             SelectionHeader(
                                 state = state,
@@ -363,7 +343,6 @@ internal fun InstantSheetContent(
                     } else {
                         InstantBody(
                             state = state,
-                            shareState = shareState,
                             showTitle = !inSideSheet && !headerShown,
                             notice = notice,
                             onReceipt = showReceipt,
@@ -440,11 +419,10 @@ internal fun NoticeBanner(notice: PanelNotice) {
     }
 }
 
-/** 单条链接时保存栏以上的部分：标题、输入框、解析进度与出错说明、解析结果或分享内容。 */
+/** 单条链接时保存栏以上的部分：标题、输入框、解析进度与出错说明、解析结果。 */
 @Composable
 private fun ColumnScope.InstantBody(
     state: InstantSheetState,
-    shareState: ShareSaveState?,
     showTitle: Boolean,
     notice: PanelNotice?,
     onReceipt: (String) -> Unit,
@@ -484,8 +462,6 @@ private fun ColumnScope.InstantBody(
             actionLabel = tr("重新解析", "Resolve again", "再解析", "다시 분석", "重新解析"), onAction = state::retryResolve,
         )
     }
-    val platform = LocalPikoPlatform.current
-    val downloads = LocalPikoServices.current.downloadManager
     val pendingMagnet = state.normalizedMagnet
     val result = state.resolution
 
@@ -503,25 +479,11 @@ private fun ColumnScope.InstantBody(
     LinkInput(state)
     SharePassCodeInput(state)
 
-    if (shareState != null && showSelection) {
-        ShareSaveSection(
-            state = shareState,
-            canonicalNames = state.useCanonicalNames,
-            onCanonicalNamesChange = state::updateUseCanonicalNames,
-            onPreview = state::previewSharedFile,
-            previewingId = state.previewingSharedId,
-            onDownload = { file ->
-                downloads.enqueueResolved(listOf(io.github.nihildigit.pikpak.ResolvedFile(file.name, file.sizeBytes, file.hash)), state.target?.id.orEmpty())
-                onReceipt(QUEUED_RECEIPT)
-            },
-        )
-    }
-
-    if (shareState == null && state.isResolving) {
+    if (state.isResolving) {
         ResolvingRow(text = resolvingText(state))
     }
 
-    if (shareState == null) state.errorMessage?.let { err ->
+    state.errorMessage?.let { err ->
         // 解析失败与未收录都给重试：未收录的资源过一阵可能就被索引了
         val canRetry = pendingMagnet != null && result == null && !state.isResolving
         ErrorBanner(
@@ -529,11 +491,11 @@ private fun ColumnScope.InstantBody(
             onRetry = if (canRetry) state::retryResolve else null,
         )
     }
-    if (shareState == null) state.saveBlockReason?.takeUnless { it == state.errorMessage }?.let { ErrorBanner(it, onRetry = null) }
+    state.saveBlockReason?.takeUnless { it == state.errorMessage }?.let { ErrorBanner(it, onRetry = null) }
 
     notice?.let { NoticeBanner(it) }
 
-    if (shareState == null && result != null) {
+    if (result != null) {
         ResolutionSection(
             state = state,
             resourceName = result.resource.name,
@@ -549,26 +511,45 @@ private fun ColumnScope.InstantBody(
 
 
 @Composable
-private fun LinkInput(state: InstantSheetState) {
+internal fun LinkInput(state: InstantSheetState) {
     val platform = LocalPikoPlatform.current
-    val result = state.resolution
-    var inputFocused by remember { mutableStateOf(false) }
-    val inputCompact = result != null && !inputFocused
-    OutlinedTextField(
+    LinkInputField(
         value = state.input,
+        hasResolution = state.resolution != null,
+        enabled = state.canEdit,
         onValueChange = state::updateInput,
+        onPaste = {
+            val clip = platform.readClipboardText()
+            if (!clip.isNullOrBlank()) state.updateInput(clip.trim())
+        },
+    )
+}
+
+@Composable
+fun LinkInputField(
+    value: String,
+    hasResolution: Boolean,
+    enabled: Boolean,
+    onValueChange: (String) -> Unit,
+    onPaste: () -> Unit,
+) {
+    var inputFocused by remember { mutableStateOf(false) }
+    val inputCompact = hasResolution && !inputFocused
+    // 始终保持 singleLine = false（纵向滚动器），仅通过 maxLines 在 1 行与 3 行间折叠：
+    // CoreTextField 内部用不带 orientation 键的 rememberSaveable 缓存 TextFieldScrollerPosition，
+    // 动态切换 singleLine 会在聚焦展开为 3 行时触发 Mismatching scroller orientation 炸毁 Skiko 帧循环。
+    OutlinedTextField(
+        value = value,
+        onValueChange = onValueChange,
         label = { Text(stringResource(Res.string.text_magnet_download_or_share_link)) },
         placeholder = { Text("magnet:?xt=urn:btih:…") },
         modifier = Modifier.fillMaxWidth().onFocusChanged { inputFocused = it.isFocused },
         shape = MaterialTheme.shapes.largeIncreased,
-        singleLine = inputCompact,
+        singleLine = false,
         maxLines = if (inputCompact) 1 else 3,
-        enabled = state.canEdit,
+        enabled = enabled,
         trailingIcon = {
-            IconButton(onClick = {
-                val clip = platform.readClipboardText()
-                if (!clip.isNullOrBlank()) state.updateInput(clip.trim())
-            }) {
+            IconButton(onClick = onPaste) {
                 Icon(Icons.Outlined.ContentPaste, contentDescription = tr("从剪贴板粘贴", "Paste from clipboard", "クリップボードから貼り付け", "클립보드에서 붙여넣기", "從剪貼簿貼上"))
             }
         },
@@ -1361,14 +1342,12 @@ internal fun InstantSheetState.summary(): InstantSummary {
     val saving = isSaving || batch?.isSaving == true
     val title = when {
         batch != null -> tr("${batch.rows.size} 条链接", "${enCount(batch.rows.size, "link", "links")}", "${batch.rows.size} 件のリンク", "링크 ${batch.rows.size}개", "${batch.rows.size} 條連結")
-        else -> result?.resource?.name ?: shareSave?.info?.title?.takeIf { it.isNotBlank() }
+        else -> result?.resource?.name
             ?: input.trim().ifEmpty { tr("添加链接", "Add link", "リンクを追加", "링크 추가", "新增連結") }
     }
     val status = when {
         saving -> tr("正在保存", "Saving", "保存中", "저장 중", "正在儲存")
         batch != null -> batch.blockedReason ?: tr("可保存 ${batch.submittableCount} 项", "${enCount(batch.submittableCount, "item", "items")} ready to save", "${batch.submittableCount} 項目を保存可能", "${batch.submittableCount}개 항목 저장 가능", "可儲存 ${batch.submittableCount} 項")
-        // 分享链接不走磁力解析，errorMessage 里那句「非磁力链接，可离线下载」说的不是它
-        shareSave != null -> shareSave?.doneMessage ?: shareSave?.errorMessage ?: tr("分享链接", "Share link", "共有リンク", "공유 링크", "分享連結")
         isResolving -> resolvingText(this)
         errorMessage != null -> errorMessage
         result != null -> tr("已选 $selectedEntryCount / $entryCount", "Selected $selectedEntryCount / $entryCount", "選択済み $selectedEntryCount / $entryCount", "$selectedEntryCount / ${entryCount}개 선택됨", "已選 $selectedEntryCount / $entryCount")

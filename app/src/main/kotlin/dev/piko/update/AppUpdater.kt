@@ -39,8 +39,7 @@ data class AndroidUpdate(
  * 从 GitHub Releases 检查并安装新版本。
  *
  * 发版由 v* tag 触发，Release 附按 ABI 拆分的 APK（piko-<版本>-<abi>.apk）与通用包。这里选
- * 本机主 ABI 的包，没有就退回通用包；两者都没有、整个 Release 又只挂了一个 apk 时（早期发布
- * 的附件名不规范）也认，见 [pickApk]。下载时边写边算 SHA-256，与 GitHub 为附件公布的 digest
+ * 本机主 ABI 的包，没有就退回通用包；下载时边写边算 SHA-256，与 GitHub 为附件公布的 digest
  * 对不上不安装。安装走 PackageInstaller 会话而不是 ACTION_INSTALL_PACKAGE，后者自 API 29 弃用。
  *
  * debug 包的包名是 dev.piko.debug，Release 里是 dev.piko，装上去是另一个应用而不是升级，
@@ -74,8 +73,9 @@ class AppUpdater(private val context: Context) : GithubUpdateService<AndroidUpda
         if (!context.packageManager.canRequestPackageInstalls()) {
             val intent = Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${context.packageName}"))
                 .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            PikoLog.i(TAG, "未授予安装未知应用，先去授权")
-            runCatching { context.startActivity(intent) }.onFailure { PikoLog.w(TAG, "打不开安装未知应用的授权页", it) }
+            PikoLog.i(TAG, "Unknown app install permission not granted; opening system settings")
+            runCatching { context.startActivity(intent) }
+                .onFailure { PikoLog.w(TAG, "Failed to open unknown app sources settings", it) }
             return
         }
         status = UpdateStatus.Downloading(update, 0f)
@@ -88,17 +88,18 @@ class AppUpdater(private val context: Context) : GithubUpdateService<AndroidUpda
             status = downloadFailed(e, update)
             return
         }
-        PikoLog.i(TAG, "更新包已下载并校验：${own.apk.name}，${file.length()} 字节")
-        runCatching { install(file) }
+        PikoLog.i(TAG, "Update APK downloaded and verified: ${own.apk.name} (${file.length()} bytes)")
+        runCatching { withContext(Dispatchers.IO) { install(file) } }
             .onSuccess { status = UpdateStatus.Installing(update) }
             .onFailure {
-                PikoLog.w(TAG, "提交安装会话失败", it)
+                if (it is CancellationException) throw it
+                PikoLog.w(TAG, "Failed to commit PackageInstaller session for ${own.apk.name}", it)
                 status = UpdateStatus.Failed(tr("无法启动安装", "Unable to start installation", "インストールを開始できません", "설치를 시작할 수 없습니다", "無法啟動安裝"), update)
             }
     }
 
     private suspend fun download(update: AndroidUpdate): File = withContext(Dispatchers.IO) {
-        val expected = update.apk.sha256 ?: throw ChecksumMismatchException("Release 没有公布摘要")
+        val expected = update.apk.sha256 ?: throw ChecksumMismatchException("Release asset has no SHA-256 digest")
         val dir = File(context.cacheDir, UPDATE_DIR).apply { deleteRecursively(); mkdirs() }
         val target = File(dir, update.apk.name)
         val digest = MessageDigest.getInstance("SHA-256")
@@ -128,7 +129,7 @@ class AppUpdater(private val context: Context) : GithubUpdateService<AndroidUpda
         val sessionId = installer.createSession(params)
         installer.openSession(sessionId).use { session ->
             session.openWrite("piko.apk", 0, apk.length()).use { out ->
-                apk.inputStream().use { it.copyTo(out) }
+                apk.inputStream().use { it.copyTo(out, INSTALL_COPY_BUFFER_BYTES) }
                 session.fsync(out)
             }
             val callback = Intent(context, UpdateInstallReceiver::class.java).setPackage(context.packageName)
@@ -140,31 +141,20 @@ class AppUpdater(private val context: Context) : GithubUpdateService<AndroidUpda
         }
     }
 
-    internal fun onInstallFailed(message: String) {
-        PikoLog.w(TAG, "系统安装未完成：$message")
+    internal fun onInstallFailed(userMessage: String, logReason: String, cause: Throwable? = null) {
+        PikoLog.w(TAG, "System package installation did not complete: $logReason", cause)
         val update = (status as? UpdateStatus.Installing)?.update
-        // 界面上要说清是取消了还是失败了：只有一句「安装未完成」时，用户不知道该重试还是放弃
-        status = UpdateStatus.Failed(
-            tr("安装未完成：", "Installation incomplete: ", "インストールが未完了です: ", "설치 미완료: ", "安裝未完成：") + message,
-            update,
-        )
-        mutableMessages.tryEmit(message)
+        status = UpdateStatus.Failed(tr("安装未完成", "Installation incomplete", "インストールが未完了です", "설치 미완료", "安裝未完成"), update)
+        mutableMessages.tryEmit(userMessage)
     }
 
-    private fun pickApk(release: LatestRelease): ReleaseAsset? {
-        val apks = release.assets.filter { it.name.endsWith(".apk", ignoreCase = true) }
-        // 规范命名 piko-<版本>-<abi>.apk：按本机 ABI 优先级挑，都没有再退通用包
-        Build.SUPPORTED_ABIS.firstNotNullOfOrNull { abi ->
-            apks.firstOrNull { it.name == "piko-${release.version}-$abi.apk" }
-        }?.let { return it }
-        apks.firstOrNull { it.name == "piko-${release.version}-universal.apk" }?.let { return it }
-        // 历史发布的附件名不规范（v0.5.0 叫 piko-poster-wall-release.apk）：整个 Release 只挂了一个
-        // apk 时就用它。不认它会被当成「本平台附件尚未上传」，界面误报已是最新，新版永远装不上
-        return apks.singleOrNull()
-    }
+    private fun pickApk(release: LatestRelease): ReleaseAsset? =
+        Build.SUPPORTED_ABIS.firstNotNullOfOrNull { release.asset("piko-${release.version}-$it.apk") }
+            ?: release.asset("piko-${release.version}-universal.apk")
 
     private companion object {
         const val TAG = "Update"
         const val UPDATE_DIR = "updates"
+        const val INSTALL_COPY_BUFFER_BYTES = 256 * 1024
     }
 }

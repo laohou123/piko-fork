@@ -3,6 +3,7 @@ package dev.piko.ui.screens.drive
 import dev.piko.ui.resources.*
 import dev.piko.ui.i18n.stringResource
 
+import dev.piko.shared.i18n.PikoLocale
 import dev.piko.shared.i18n.tr
 
 import androidx.compose.ui.input.pointer.isTertiaryPressed
@@ -73,7 +74,9 @@ import androidx.compose.material3.TooltipBox
 import androidx.compose.material3.TooltipDefaults
 import androidx.compose.material3.rememberTooltipState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.Stable
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.snapshotFlow
 import kotlinx.coroutines.flow.first
@@ -167,6 +170,7 @@ private const val KEY_HEADER = "drive_header"
 private const val KEY_FOLD = "drive_fold"
 
 /** 列表或海报墙里的每一项需要的回调，由 DriveScreen 按条目绑定。 */
+@Stable
 internal class DriveItemCallbacks(
     val onOpen: (FileStat) -> Unit,
     /** mac 上焦点在这一项时按回车，照 Finder 是改名。 */
@@ -357,15 +361,18 @@ internal fun DriveFileGrid(
                     is DriveListItem.File -> {
                         val file = item.file
                         if (file.isFolder) LaunchedEffect(file.id) { callbacks.onFolderVisible(file) }
+                        val folderInfo = if (file.isFolder) folderView(file) else null
+                        val text = remember(item, folderInfo, PikoLocale.effectiveLanguage) { cellText(item, folderInfo) }
                         DriveCell(
                             file = file,
                             rowKey = item.key,
-                            text = cellText(item, if (file.isFolder) folderView(file) else null),
+                            text = text,
                             viewMode = viewMode,
                             isSelectionMode = isSelectionMode,
                             isSelected = file.id in selectedIds,
                             isHighlighted = highlightSettled && (file.id in highlightedIds || file.id == locatedItemId),
                             isBlurred = isBlurred(file),
+                            isCut = file.id in cutIds,
                             locationLabel = hitLocations[file.id],
                             callbacks = callbacks,
                             moreButton = moreButton,
@@ -373,7 +380,7 @@ internal fun DriveFileGrid(
                             folderHasVault = file.isFolder && file.id in vaultedFolders,
                             requestFocus = item.key == keyboardFocusTarget,
                             onFocusRequested = onKeyboardFocusMoved,
-                            modifier = Modifier.animateItem().graphicsLayer { alpha = if (file.id in cutIds) 0.5f else 1f },
+                            modifier = Modifier.animateItem(),
                         )
                     }
                 }
@@ -484,6 +491,7 @@ private const val SKELETON_ITEM_COUNT = 40
 private val SkeletonTitleWidths = listOf(0.62f, 0.45f, 0.74f, 0.52f, 0.68f, 0.4f)
 
 /** 单元格上的文字：名字（见 [DriveItemName]）与解析出的标签。 */
+@Immutable
 internal data class CellText(val name: DriveItemName, val tags: List<String>, val code: String? = null, val resolution: String? = null)
 
 internal fun cellText(item: DriveListItem.File, folder: DriveFolderView?): CellText {
@@ -557,6 +565,7 @@ private fun DriveCell(
     isSelected: Boolean,
     isHighlighted: Boolean,
     isBlurred: Boolean,
+    isCut: Boolean,
     locationLabel: String?,
     callbacks: DriveItemCallbacks,
     moreButton: Boolean,
@@ -583,6 +592,7 @@ private fun DriveCell(
     ContextMenuArea(
         actions = { callbacks.contextActions(file) },
         modifier = modifier
+            .graphicsLayer { alpha = if (isCut) 0.5f else 1f }
             .alpha(if (beingDragged) DraggedAlpha else 1f)
             .focusRequester(focusRequester)
             .onFocusChanged { callbacks.onFocusChanged(file, it.hasFocus) }
@@ -705,6 +715,8 @@ internal fun DriveListHeader(
     onTileSizeChange: (TileSize) -> Unit,
     perFolderSort: Boolean = false,
     onPerFolderSortChange: ((Boolean) -> Unit)? = null,
+    foldersFirst: Boolean = true,
+    onFoldersFirstChange: ((Boolean) -> Unit)? = null,
     /** 为 false 时只留搜索结果的说明：宽窗口里这些控件在命令栏上。 */
     showControls: Boolean = true,
 ) {
@@ -730,8 +742,8 @@ internal fun DriveListHeader(
         AdaptiveBar(
             modifier = Modifier.fillMaxWidth().height(48.dp),
             leading = listOfNotNull(
-                BarItem("sort", 30, sortOverflowActions(sortOrder, onSortChange, perFolderSort, onPerFolderSortChange)) {
-                    SortButton(sortOrder, onSortChange, perFolderSort, onPerFolderSortChange)
+                BarItem("sort", 30, sortOverflowActions(sortOrder, onSortChange, perFolderSort, onPerFolderSortChange, foldersFirst, onFoldersFirstChange)) {
+                    SortButton(sortOrder, onSortChange, perFolderSort, onPerFolderSortChange, foldersFirst, onFoldersFirstChange)
                 },
                 BarItem("filter", 20, typeFilterOverflowActions(typeFilter, availableTypes, onTypeFilterChange)) {
                     TypeFilterButton(typeFilter, availableTypes, onTypeFilterChange)
@@ -752,6 +764,8 @@ internal fun sortOverflowActions(
     onSortChange: (FileSortOrder) -> Unit,
     perFolderSort: Boolean = false,
     onPerFolderSortChange: ((Boolean) -> Unit)? = null,
+    foldersFirst: Boolean = true,
+    onFoldersFirstChange: ((Boolean) -> Unit)? = null,
 ): List<SheetAction> = buildList {
     PikoSortField.entries.forEach { field ->
         val current = field.owns(sortOrder)
@@ -765,6 +779,15 @@ internal fun sortOverflowActions(
                 checked = current,
             ),
         )
+    }
+    if (onFoldersFirstChange != null) {
+        add(SheetAction(
+            Icons.AutoMirrored.Outlined.Sort,
+            tr("文件夹置顶", "Folders on top", "フォルダーを上部に固定", "폴더 상단 고정", "資料夾置頂"),
+            { onFoldersFirstChange(!foldersFirst) },
+            group = ActionGroup.Sort,
+            checked = foldersFirst,
+        ))
     }
     if (onPerFolderSortChange != null) {
         add(
@@ -804,6 +827,8 @@ internal fun SortButton(
     onSortChange: (FileSortOrder) -> Unit,
     perFolderSort: Boolean = false,
     onPerFolderSortChange: ((Boolean) -> Unit)? = null,
+    foldersFirst: Boolean = true,
+    onFoldersFirstChange: ((Boolean) -> Unit)? = null,
 ) {
     var showMenu by remember { mutableStateOf(false) }
     Box {
@@ -828,18 +853,34 @@ internal fun SortButton(
                     trailingIcon = { if (isCurrent) SortDirectionIcon(sortOrder) },
                 )
             }
-            if (onPerFolderSortChange != null) {
+            val optionCount = (if (onFoldersFirstChange != null) 1 else 0) + (if (onPerFolderSortChange != null) 1 else 0)
+            if (optionCount > 0) {
                 HorizontalDivider(
                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
                     color = MaterialTheme.colorScheme.outlineVariant,
                 )
+            }
+            if (onFoldersFirstChange != null) {
+                DropdownMenuItem(
+                    onClick = {
+                        showMenu = false
+                        onFoldersFirstChange(!foldersFirst)
+                    },
+                    text = { Text(tr("文件夹置顶", "Folders on top", "フォルダーを上部に固定", "폴더 상단 고정", "資料夾置頂")) },
+                    shape = menuItemShape(0, optionCount),
+                    trailingIcon = {
+                        if (foldersFirst) Icon(Icons.Outlined.Check, contentDescription = null, modifier = Modifier.size(18.dp))
+                    },
+                )
+            }
+            if (onPerFolderSortChange != null) {
                 DropdownMenuItem(
                     onClick = {
                         showMenu = false
                         onPerFolderSortChange(!perFolderSort)
                     },
                     text = { Text(stringResource(Res.string.text_sort_each_folder_separately)) },
-                    shape = menuItemShape(0, 1),
+                    shape = menuItemShape(if (onFoldersFirstChange != null) 1 else 0, optionCount),
                     trailingIcon = {
                         if (perFolderSort) Icon(Icons.Outlined.Check, contentDescription = null, modifier = Modifier.size(18.dp))
                     },

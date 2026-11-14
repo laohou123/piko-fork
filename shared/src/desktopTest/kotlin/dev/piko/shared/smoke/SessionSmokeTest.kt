@@ -5,20 +5,49 @@ import dev.piko.shared.data.SavedAccount
 import dev.piko.shared.data.SavedAccounts
 import dev.piko.shared.state.LoginState
 import io.github.nihildigit.pikpak.Session
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancelAndJoin
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
-/** 登录态的恢复、失败与退出。PikoClientManager 自建 SDK 客户端，这里经 httpClient 参数接到假服务端。 */
 class SessionSmokeTest {
     private val account = "smoke@piko.dev"
 
-    /**
-     * 防的是离线冷启动被踢回登录页：access token 过期、refresh 因断网失败时，旧实现关掉 client，
-     * 用户连已下载的文件都打不开。现在应保留登录态，网络恢复后在后台补上 refresh。
-     */
+    @Test
+    fun `immediate local account restore publishes before background coroutine advances`() = smoke { scope ->
+        val localAccount = "restore@piko.dev"
+        val store = MemorySessionStore().apply {
+            accounts = SavedAccounts(current = localAccount, accounts = listOf(SavedAccount(localAccount)))
+            sessions[localAccount] = Session(
+                accessToken = "LOCAL",
+                refreshToken = "REFRESH",
+                sub = "local",
+                expiresAt = kotlin.time.Clock.System.now().epochSeconds + 3600,
+            )
+        }
+        val server = FakePikPakServer()
+        val job = SupervisorJob()
+        try {
+            val manager = PikoClientManager(
+                store,
+                CoroutineScope(scope.coroutineContext + job),
+                httpClient = server.httpClient(),
+                restoreLocallyImmediately = true,
+            )
+            assertFalse(manager.isInitializing.value)
+            assertEquals(localAccount, manager.currentClient.value?.account)
+            assertEquals(0, server.count("POST /v1/auth/"))
+            manager.currentClient.value?.close()
+        } finally {
+            job.cancelAndJoin()
+        }
+    }
+
     @Test
     fun `an offline cold start keeps the session and refreshes once the network is back`() = smoke { scope ->
         val server = FakePikPakServer()
@@ -30,43 +59,38 @@ class SessionSmokeTest {
         server.offline = true
 
         val manager = PikoClientManager(store, scope, server.httpClient())
-        awaitUntil("恢复流程结束") { !manager.isInitializing.value }
-        assertNotNull(manager.currentClient.value, "断网不应等同于登录失效")
+        awaitUntil("restore finished") { !manager.isInitializing.value }
+        assertNotNull(manager.currentClient.value)
 
         server.offline = false
-        awaitUntil("网络恢复后会话被刷新", timeoutMs = 15_000) { store.sessions[account]?.accessToken == "AT" }
+        awaitUntil("session refreshed", timeoutMs = 15_000) { store.sessions[account]?.accessToken == "AT" }
         assertNotNull(manager.currentClient.value)
     }
 
-    /** 防的是密码错误时界面卡在加载中、或把错误的密码存下来。 */
     @Test
     fun `a rejected password surfaces the reason and stores nothing`() = smoke { scope ->
         val server = FakePikPakServer().apply { rejectSignIn = true }
         val store = MemorySessionStore()
         val manager = PikoClientManager(store, scope, server.httpClient())
-        awaitUntil("恢复流程结束") { !manager.isInitializing.value }
+        awaitUntil("restore finished") { !manager.isInitializing.value }
 
         val login = LoginState(manager, scope)
         login.updateAccount(account)
         login.updatePassword("wrong")
         login.login()
-        awaitUntil("登录请求结束") { !login.isLoggingIn && login.errorMessage != null }
+        awaitUntil("login failed") { !login.isLoggingIn && login.errorMessage != null }
 
         assertNull(manager.currentClient.value)
-        assertTrue(store.passwords.isEmpty(), "失败的密码不能落盘")
+        assertTrue(store.passwords.isEmpty())
         assertNull(store.accounts.current)
     }
 
-    /**
-     * 防的是退出一个账号时连带清掉别的账号的凭据，或退出后停在登录页、不切到还保存着的账号：
-     * 单账号时代的存储以「上次的账号」判断凭据归属，多账号下这个判断不成立。
-     */
     @Test
     fun `logging out of one account switches to another and keeps its credentials`() = smoke { scope ->
         val server = FakePikPakServer()
         val store = MemorySessionStore()
         val manager = PikoClientManager(store, scope, server.httpClient())
-        awaitUntil("恢复流程结束") { !manager.isInitializing.value }
+        awaitUntil("restore finished") { !manager.isInitializing.value }
         val other = "other@piko.dev"
 
         manager.login(account) { "pw-a" }.getOrThrow()
@@ -87,19 +111,18 @@ class SessionSmokeTest {
         assertEquals(listOf(other), store.accounts.accounts.map { it.account })
     }
 
-    /** 防的是退出登录后明文密码仍留在磁盘上：旧实现从不调用 clearCredentials。 */
     @Test
     fun `logging out forgets the saved password`() = smoke { scope ->
         val server = FakePikPakServer()
         val store = MemorySessionStore()
         val manager = PikoClientManager(store, scope, server.httpClient())
-        awaitUntil("恢复流程结束") { !manager.isInitializing.value }
+        awaitUntil("restore finished") { !manager.isInitializing.value }
 
         val login = LoginState(manager, scope)
         login.updateAccount(account)
         login.updatePassword("pw")
         login.login()
-        awaitUntil("登录成功") { manager.currentClient.value != null }
+        awaitUntil("login succeeded") { manager.currentClient.value != null }
         assertEquals("pw", store.passwords[account])
 
         manager.logout().join()
@@ -107,5 +130,164 @@ class SessionSmokeTest {
         assertTrue(store.passwords.isEmpty())
         assertNull(store.sessions[account])
         assertNull(store.accounts.current)
+    }
+
+    @Test
+    fun `google device login stores internal key safely and deduplicates with password login by sub`() = smoke { scope ->
+        val server = FakePikPakServer().apply {
+            deviceAuthPendingPolls.set(1)
+            deviceLoginUser = FakePikPakServer.FakeUser(
+                sub = "sub-google-42",
+                name = "Alice",
+                email = "a***@gmail.com",
+                providerId = "google.com",
+            )
+            usersByUsername["alice@gmail.com"] = FakePikPakServer.FakeUser(
+                sub = "sub-google-42",
+                name = "Alice",
+                email = "a***@gmail.com",
+                providerId = "password",
+            )
+        }
+        val store = MemorySessionStore()
+        val manager = PikoClientManager(store, scope, server.httpClient())
+        awaitUntil("restore finished") { !manager.isInitializing.value }
+
+        val openedUrls = mutableListOf<String>()
+        val login = LoginState(manager, scope)
+        login.startGoogleLogin { openedUrls += it }
+        awaitUntil("google login succeeded", timeoutMs = 15_000) { manager.currentClient.value != null }
+
+        assertEquals(1, openedUrls.size)
+        assertTrue(openedUrls.single().startsWith("https://mypikpak.com/auth?type=google&init=1&origin="))
+        val slotKey = "pikpak:sub-google-42"
+        assertEquals(slotKey, manager.currentClient.value?.account)
+        val saved = assertNotNull(manager.accounts.value.find(slotKey))
+        assertEquals("Alice", saved.displayName)
+        assertNull(saved.publicAccountHandle)
+        assertEquals("", manager.resolvePrefillContext(slotKey)?.loginAccount)
+
+        // 同一个 PikPak 账号随后改用邮箱+密码登录：按 sub 复用同一存储槽位，不产生重复账号，且 deviceId 同步持久化
+        manager.beginAddingAccount()
+        manager.login("alice@gmail.com") { "pw-alice" }.getOrThrow()
+        assertEquals(listOf(slotKey), manager.accounts.value.accounts.map { it.account })
+        val afterPw = assertNotNull(manager.accounts.value.find(slotKey))
+        assertEquals("alice@gmail.com", afterPw.loginAccount)
+        assertTrue(afterPw.deviceId.isNotBlank())
+        assertEquals(afterPw.deviceId, store.sessions[slotKey]?.deviceId)
+        assertEquals("pw-alice", store.passwords[slotKey])
+
+        // 再次通过 Google 登录同一账号：保留已保存的密码与槽位键，并将 SavedAccount 与 Session 的 deviceId 同步到新令牌绑定的设备号
+        manager.beginAddingAccount()
+        val tx = manager.startGoogleDeviceLogin().getOrThrow()
+        manager.awaitGoogleDeviceLogin(tx).getOrThrow()
+        assertEquals(listOf(slotKey), manager.accounts.value.accounts.map { it.account })
+        assertEquals("pw-alice", store.passwords[slotKey])
+        val afterSecondGoogle = assertNotNull(manager.accounts.value.find(slotKey))
+        assertTrue(afterSecondGoogle.deviceId.isNotBlank())
+        assertEquals(afterSecondGoogle.deviceId, store.sessions[slotKey]?.deviceId)
+    }
+
+    @Test
+    fun `reauthenticating an expired google account rejects mismatched sub and skips captcha init`() = smoke { scope ->
+        val server = FakePikPakServer().apply {
+            rejectRefresh = true
+            deviceLoginUser = FakePikPakServer.FakeUser(
+                sub = "sub-wrong-user",
+                name = "Bob",
+                email = "b***@gmail.com",
+                providerId = "google.com",
+            )
+        }
+        val expiredKey = "pikpak:sub-original"
+        val store = MemorySessionStore().apply {
+            accounts = SavedAccounts(
+                current = expiredKey,
+                accounts = listOf(
+                    SavedAccount(
+                        account = expiredKey,
+                        sub = "sub-original",
+                        name = "Original",
+                        email = "o***@gmail.com",
+                        authMethod = dev.piko.shared.data.AccountAuthMethod.Google,
+                    ),
+                ),
+            )
+            sessions[expiredKey] = Session(
+                accessToken = "EXPIRED",
+                refreshToken = "REVOKED",
+                sub = "sub-original",
+                expiresAt = 1L,
+            )
+        }
+        val manager = PikoClientManager(store, scope, server.httpClient())
+        awaitUntil("restore finished") { !manager.isInitializing.value }
+
+        // 无密码会话刷新被拒后直接回登录页，绝不浪费一次 /v1/shield/captcha/init
+        assertNull(manager.currentClient.value)
+        assertEquals(0, server.count("POST /v1/shield/captcha/init"))
+        assertTrue(expiredKey in manager.expiredAccounts.value)
+
+        val login = LoginState(manager, scope, manager.expiredPrefill)
+        assertEquals("", login.account, "内部键 pikpak:<sub> 绝不能填入用户名输入框")
+        login.startGoogleLogin {}
+        awaitUntil("mismatch rejected", timeoutMs = 15_000) {
+            login.browserAuth is dev.piko.shared.state.BrowserAuthState.Idle && login.errorMessage != null
+        }
+        assertNull(manager.currentClient.value)
+        assertEquals(listOf(expiredKey), manager.accounts.value.accounts.map { it.account })
+        assertEquals("sub-original", manager.accounts.value.find(expiredKey)?.sub)
+    }
+
+    @Test
+    fun `google login does not overwrite legacy slot without sub and runtime 401 expiry returns to login`() = smoke { scope ->
+        val server = FakePikPakServer().apply {
+            deviceLoginUser = FakePikPakServer.FakeUser(
+                sub = "sub-fresh-google",
+                name = "Legacy Lookalike",
+                email = "legacy@gmail.com",
+                providerId = "google.com",
+            )
+        }
+        val legacyKey = "legacy@gmail.com"
+        val store = MemorySessionStore().apply {
+            accounts = SavedAccounts(
+                current = null,
+                accounts = listOf(
+                    SavedAccount(
+                        account = legacyKey,
+                        sub = "",
+                        name = "Legacy",
+                        email = "legacy@gmail.com",
+                    ),
+                ),
+            )
+            passwords[legacyKey] = "legacy-secret"
+        }
+        val manager = PikoClientManager(store, scope, server.httpClient())
+        awaitUntil("restore finished") { !manager.isInitializing.value }
+
+        // 续期未知 sub 的旧槽位时，Google 登录无法证明同一身份，必须拒绝覆盖并保留旧密码
+        val mismatchTx = manager.startGoogleDeviceLogin(expectedAccount = legacyKey).getOrThrow()
+        assertTrue(manager.awaitGoogleDeviceLogin(mismatchTx).isFailure)
+        assertEquals("legacy-secret", store.passwords[legacyKey])
+
+        // 正常新增 Google 登录进入独立 pikpak:<sub> 槽位，不侵占未记录 sub 的旧槽位
+        val addTx = manager.startGoogleDeviceLogin().getOrThrow()
+        val activeClient = manager.awaitGoogleDeviceLogin(addTx).getOrThrow()
+        val googleKey = "pikpak:sub-fresh-google"
+        assertEquals(googleKey, activeClient.account)
+        assertEquals(setOf(legacyKey, googleKey), manager.accounts.value.accounts.map { it.account }.toSet())
+        assertEquals("legacy-secret", store.passwords[legacyKey])
+
+        // 运行期业务请求遭遇 401 且 refresh_token 被拒（4126）时，活动无密码会话自动失效并回退登录页
+        server.rejectAccessTokens = true
+        server.rejectRefresh = true
+        runCatching { activeClient.prewarm() }
+        awaitUntil("active google session invalidated to login") {
+            manager.currentClient.value == null && googleKey in manager.expiredAccounts.value
+        }
+        assertEquals(googleKey, manager.expiredPrefill)
+        assertNull(manager.accounts.value.current)
     }
 }

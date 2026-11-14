@@ -26,6 +26,15 @@ kotlin {
         }
     }
     jvm("desktop")
+    listOf(iosArm64(), iosSimulatorArm64()).forEach { target ->
+        target.binaries.configureEach {
+            freeCompilerArgs += "-Xoverride-konan-properties=minVersion.ios=15.0"
+        }
+        target.binaries.framework {
+            baseName = "PikoKit"
+            isStatic = true
+        }
+    }
 
     sourceSets {
         all {
@@ -60,11 +69,20 @@ kotlin {
             implementation(libs.coil.compose)
             // Coil 的 OkHttp 网络引擎（各端入口注册），封面从 MetaTube 取图靠它
             implementation(libs.coil.network.okhttp)
+            implementation(libs.zoomimage.compose.coil3)
             implementation(libs.kotlinx.coroutines.core)
             implementation(libs.kotlinx.serialization.json)
             // 海报墙刮削源与字幕源共用的 HTTP 客户端工厂返回 io.ktor.client.HttpClient，
             // 签名在 ui 模块里就要看得到（引擎本身在各端入口建）
             implementation(libs.ktor.client.core)
+        }
+        commonTest.dependencies {
+            implementation(kotlin("test"))
+        }
+        // Native 不使用 JVM ServiceLoader/OkHttp，显式装配 Ktor 3 fetcher。
+        iosMain.dependencies {
+            implementation(libs.ktor.client.core)
+            implementation(libs.coil.network.ktor3)
         }
         // CMP 的 material3 在 Android 上重定向到 androidx 的构件，版本比 app 用的 BOM 旧；
         // 这里对齐到同一份 BOM，ui 模块编译时看到的就是 app 运行时的那套 API

@@ -52,12 +52,18 @@ internal object WindowsLinkAssociation : LinkAssociation {
         // 问系统实际会用哪条命令打开，而不是自己读 UserChoice：AssocQueryString 与资源管理器同一套判定，
         // 较新的 Windows 还多了一个 UserChoiceLatest，自己读容易漏
         val opensWithPiko = listOf(
-            runCatching { openCommandOf("magnet", isProtocol = true) }.getOrNull(),
-            runCatching { openCommandOf(".torrent") }.getOrNull(),
+            runCatching { openCommandOf("magnet", isProtocol = true) }
+                .onFailure { PikoLog.w(TAG, "Failed to query magnet protocol open command", it) }
+                .getOrNull(),
+            runCatching { openCommandOf(".torrent") }
+                .onFailure { PikoLog.w(TAG, "Failed to query .torrent open command", it) }
+                .getOrNull(),
         ).all { it != null && registration.ownerOf(it, exe) == LinkRegistration.Owner.Self }
         when {
             opensWithPiko -> LinkAssociationState.Default
-            runCatching { registration.removableProgIds(exe).isNotEmpty() }.getOrDefault(false) -> LinkAssociationState.Registered
+            runCatching { registration.removableProgIds(exe).isNotEmpty() }
+                .onFailure { PikoLog.w(TAG, "Failed to inspect registered ProgIDs", it) }
+                .getOrDefault(false) -> LinkAssociationState.Registered
             else -> LinkAssociationState.NotDefault
         }
     }
@@ -66,7 +72,7 @@ internal object WindowsLinkAssociation : LinkAssociation {
         if (!writeAndNotify()) return@withContext false
         // Windows 11 打开 Piko 自己的默认应用页；不认这个参数的系统落在默认应用首页
         runCatching { ProcessBuilder("cmd", "/c", "start", "", "ms-settings:defaultapps?registeredAppUser=${identity.registeredName}").start() }
-            .onFailure { PikoLog.w(TAG, "打开默认应用设置失败", it) }
+            .onFailure { PikoLog.w(TAG, "Failed to open Windows Default Apps settings", it) }
             .isSuccess
     }
 
@@ -77,7 +83,7 @@ internal object WindowsLinkAssociation : LinkAssociation {
     fun writeAndNotify(): Boolean {
         val exe = launcher() ?: return false
         val registered = runCatching { registration.register(exe).also { forgetStaleName(exe) } }
-            .onFailure { PikoLog.w(TAG, "登记打开方式失败", it) }
+            .onFailure { PikoLog.w(TAG, "Failed to register Windows link associations", it) }
             .getOrDefault(false)
         if (registered) notifyAssociationsChanged()
         return registered
@@ -87,7 +93,7 @@ internal object WindowsLinkAssociation : LinkAssociation {
     override suspend fun unregister(): Boolean = withContext(Dispatchers.IO) {
         val exe = launcher() ?: return@withContext false
         val removed = runCatching { registration.unregister(exe) }
-            .onFailure { PikoLog.w(TAG, "取消关联失败", it) }
+            .onFailure { PikoLog.w(TAG, "Failed to unregister Windows link associations", it) }
             .getOrDefault(false)
         notifyAssociationsChanged()
         removed
@@ -97,6 +103,7 @@ internal object WindowsLinkAssociation : LinkAssociation {
      * 资源管理器把 exe 的文件描述按路径缓存在 MuiCache 里，exe 换了也不刷新。1.1.0 之前的 exe 描述是一句英文简介，
      * 从那时装上来的人在「打开方式」里看到的一直是那句简介而不是 Piko。只删这个 exe 自己的那几项，
      * 值已是 Piko 时不动；删掉后系统下次按新 exe 重新生成。启动时调一次，没登记过关联的人也不会看到旧名。
+     * 同时把已归属本 exe 的种子 ProgID 旧图标（指向 Piko.exe）就地刷新为独立的 torrent.ico。
      */
     fun forgetStaleName(exe: File? = launcher()) {
         exe ?: return
@@ -106,9 +113,13 @@ internal object WindowsLinkAssociation : LinkAssociation {
             if (cached != null && cached != APP_NAME) {
                 Registry.deleteValue(MUI_CACHE, "$prefix.FriendlyAppName")
                 Registry.deleteValue(MUI_CACHE, "$prefix.ApplicationCompany")
-                PikoLog.i(TAG, "已清除过期的应用名缓存")
+                PikoLog.i(TAG, "Cleared stale Explorer MuiCache application name entry")
             }
-        }.onFailure { PikoLog.w(TAG, "清除应用名缓存失败", it) }
+            if (registration.refreshTorrentIcon(exe)) {
+                notifyAssociationsChanged()
+                PikoLog.i(TAG, "Refreshed .torrent ProgID icon registration")
+            }
+        }.onFailure { PikoLog.w(TAG, "Failed to refresh Explorer MuiCache or .torrent icon", it) }
     }
 
     // 资源管理器缓存了关联与图标，不通知的话 .torrent 文件要到下次登录才换成 Piko 的图标
@@ -123,7 +134,7 @@ internal object WindowsLinkAssociation : LinkAssociation {
                 shell32.find("SHChangeNotify").orElseThrow(),
                 FunctionDescriptor.ofVoid(JAVA_INT, JAVA_INT, ADDRESS, ADDRESS),
             ).invokeWithArguments(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, MemorySegment.NULL, MemorySegment.NULL)
-        }
+        }.onFailure { PikoLog.w(TAG, "Failed to notify shell of association changes (SHChangeNotify)", it) }
     }
 }
 

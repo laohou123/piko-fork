@@ -2,6 +2,10 @@ package dev.piko.download
 
 import dev.piko.shared.i18n.tr
 
+import android.app.AlarmManager
+import android.os.SystemClock
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -34,6 +38,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.joinAll
 
 /**
  * 应用退到后台时让下载、上传、解压、归档与查重继续的前台服务，挂着那条进度通知。
@@ -51,6 +56,12 @@ class PikoDownloadService : Service() {
     private val serviceScope = CoroutineScope(Dispatchers.Main + Job())
     private lateinit var notificationManager: NotificationManager
     private var observeJob: Job? = null
+    private var lastPostedKey: NotificationKey? = null
+
+    private data class NotificationKey(
+        val content: WorkNotificationContent,
+        val canPause: Boolean,
+    )
 
     override fun onCreate() {
         super.onCreate()
@@ -59,9 +70,15 @@ class PikoDownloadService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_PAUSE_ALL) {
+            pauseAndFlush()
+            stepDown()
+            return START_NOT_STICKY
+        }
         // 第一条就写眼下在做的事：观察循环的第一次更新之前工作可能已经结束（小目录的查找重复只要几秒），
         // 写死成「传输」的话，查找重复时看到的就一直是它
-        val initialNotification = buildNotification(currentContent())
+        val initialKey = currentNotificationKey()
+        val initialNotification = buildNotification(initialKey)
         try {
             ServiceCompat.startForeground(
                 this,
@@ -69,17 +86,18 @@ class PikoDownloadService : Service() {
                 initialNotification,
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
             )
+            lastPostedKey = initialKey
         } catch (e: RuntimeException) {
             // Android 12 起应用在后台时不能进入前台服务（ForegroundServiceStartNotAllowedException），
             // Android 15 起 dataSync 用满当日时长后也会被拒。下载协程本身不依赖服务，
             // 下一次退到后台时 WorkResultNotifier 会再试
-            PikoLog.w(TAG, "进入前台服务被拒，传输在无通知的情况下继续", e)
+            PikoLog.w(TAG, "Foreground service promotion denied; continuing transfers without ongoing notification", e)
             stopSelf()
             return START_NOT_STICKY
         }
 
         startObservingDownloadsIfNeeded()
-        return START_NOT_STICKY
+        return START_STICKY
     }
 
     /**
@@ -88,11 +106,48 @@ class PikoDownloadService : Service() {
      * 用户回到应用可以原地继续。
      */
     override fun onTimeout(startId: Int, fgsType: Int) {
-        PikoLog.w(TAG, "前台服务到达系统时长上限，暂停全部传输")
-        PikoApplication.instance.downloadManager.pauseAll()
-        PikoApplication.instance.uploadManager.pauseAll()
-        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
-        stopSelf()
+        PikoLog.w(TAG, "Foreground service reached system time limit (fgsType=$fgsType); pausing active transfers")
+        val services = PikoApplication.instance.services
+        synchronized(timeoutLock) {
+            timedOutDownloads += services.downloadManager.tasks.value.values.filter { it.status == DownloadStatus.DOWNLOADING || it.status == DownloadStatus.PENDING }.map { it.taskId }
+            timedOutUploads += services.uploadManager.tasks.value.values.filter { it.status.isActive }.map { it.taskId }
+        }
+        pauseAndFlush()
+        WorkResultNotifier.postTimeout(PikoApplication.instance)
+        stepDown()
+    }
+
+    private fun pauseAndFlush() {
+        val app = PikoApplication.instance
+        app.downloadManager.pauseAll()
+        app.uploadManager.pauseAll()
+        app.appScope.launch {
+            app.downloadManager.flushPersistence()
+            app.uploadManager.flushPersistence()
+        }
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        val app = PikoApplication.instance
+        val services = app.services
+        // 三份快照独立写入；主线程只限时等待，超时后由进程作用域继续完成。
+        val flushes = listOf(
+            app.appScope.launch(Dispatchers.IO) { services.driveWorkspace.flushPersistence() },
+            app.appScope.launch(Dispatchers.IO) { services.downloadManager.flushPersistence() },
+            app.appScope.launch(Dispatchers.IO) { services.uploadManager.flushPersistence() },
+        )
+        runBlocking {
+            withTimeoutOrNull(800) { flushes.joinAll() }
+        }
+        if (services.hasBackgroundWork()) {
+            runCatching {
+                val pending = PendingIntent.getService(this, RESTART_REQUEST_CODE,
+                    Intent(this, PikoDownloadService::class.java),
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+                getSystemService(AlarmManager::class.java).set(AlarmManager.ELAPSED_REALTIME, SystemClock.elapsedRealtime() + 1000L, pending)
+            }.onFailure { PikoLog.w(TAG, "Failed to schedule background transfer restart alarm on task removal", it) }
+        }
+        super.onTaskRemoved(rootIntent)
     }
 
     private fun startObservingDownloadsIfNeeded() {
@@ -119,7 +174,11 @@ class PikoDownloadService : Service() {
                         if (!services.hasBackgroundWork()) stepDown()
                     }
                     else -> {
-                        notificationManager.notify(NOTIFICATION_ID, buildNotification(currentContent()))
+                        val key = currentNotificationKey()
+                        if (key != lastPostedKey) {
+                            notificationManager.notify(NOTIFICATION_ID, buildNotification(key))
+                            lastPostedKey = key
+                        }
                         delay(NOTIFICATION_INTERVAL_MS)
                     }
                 }
@@ -128,14 +187,23 @@ class PikoDownloadService : Service() {
     }
 
     private fun stepDown() {
+        lastPostedKey = null
         ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
 
-    private fun currentContent(): WorkNotificationContent =
-        workNotificationContent(PikoApplication.instance.services.runningWork())
+    private fun currentNotificationKey(): NotificationKey {
+        val services = PikoApplication.instance.services
+        val content = workNotificationContent(services.runningWork())
+        val account = services.clientManager.currentClient.value?.account
+        val canPause = services.downloadManager.tasks.value.values.any {
+            it.status == DownloadStatus.PENDING || it.status == DownloadStatus.DOWNLOADING
+        } || services.uploadManager.tasks.value.values.any { it.account == account && it.status.isActive }
+        return NotificationKey(content, canPause)
+    }
 
-    private fun buildNotification(content: WorkNotificationContent): Notification {
+    private fun buildNotification(key: NotificationKey): Notification {
+        val content = key.content
         // 下载、上传、解压与归档的进度都在传输页，点通知直接去那里
         val openIntent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
@@ -164,6 +232,12 @@ class PikoDownloadService : Service() {
         }
         if (content.lines.isNotEmpty()) {
             builder.setStyle(NotificationCompat.InboxStyle().also { style -> content.lines.forEach(style::addLine) })
+        }
+        if (key.canPause) {
+            val pause = PendingIntent.getService(this, PAUSE_REQUEST_CODE,
+                Intent(this, PikoDownloadService::class.java).setAction(ACTION_PAUSE_ALL),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+            builder.addAction(0, tr("全部暂停", "Pause all", "すべて一時停止", "모두 일시 중지", "全部暫停"), pause)
         }
         return builder
             .setOngoing(true)
@@ -199,6 +273,20 @@ class PikoDownloadService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     companion object {
+        const val ACTION_PAUSE_ALL = "dev.piko.download.action.PAUSE_ALL"
+        private val timeoutLock = Any()
+        private val timedOutDownloads = mutableSetOf<String>()
+        private val timedOutUploads = mutableSetOf<String>()
+
+        fun consumeTimedOutTransfers(): Pair<Set<String>, Set<String>> = synchronized(timeoutLock) {
+            (timedOutDownloads.toSet() to timedOutUploads.toSet()).also {
+                timedOutDownloads.clear()
+                timedOutUploads.clear()
+            }
+        }
+
+        private const val PAUSE_REQUEST_CODE = 2
+        private const val RESTART_REQUEST_CODE = 3
         private const val TAG = "DownloadService"
         private const val NOTIFICATION_ID = 9527
         private const val OPEN_TRANSFERS_REQUEST_CODE = 1
@@ -213,7 +301,7 @@ class PikoDownloadService : Service() {
                 ContextCompat.startForegroundService(context, intent)
             } catch (e: Exception) {
                 // 处理后台启动限制回退
-                PikoLog.w(TAG, "启动传输服务被拒", e)
+                PikoLog.w(TAG, "Failed to start foreground transfer service", e)
             }
         }
 

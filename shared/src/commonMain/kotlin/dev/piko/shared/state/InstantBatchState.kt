@@ -11,6 +11,7 @@ import dev.piko.shared.i18n.tr
 import dev.piko.shared.log.PikoLog
 import dev.piko.shared.log.failureText
 import dev.piko.shared.log.logFailure
+import dev.piko.shared.log.logFolder
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -23,7 +24,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 
-private const val TAG = "Instant"
+private const val TAG = "InstantBatch"
 
 enum class InstantBatchRowStatus {
     /** 等待或正在解析。 */
@@ -94,8 +95,9 @@ class InstantBatchState internal constructor(
     private val emitOutcome: suspend (InstantSaveOutcome) -> Unit,
     private val emitMessage: suspend (String) -> Unit,
     private val onEmpty: () -> Unit,
+    private val onSaveAsReferenceChanged: (Boolean) -> Unit = {},
 ) {
-    var saveAsReference by mutableStateOf(false)
+    var saveAsReference: Boolean by shared.saveAsReference
         private set
 
     var rows by mutableStateOf(links.map(::createRow))
@@ -126,7 +128,7 @@ class InstantBatchState internal constructor(
             (it.status == InstantBatchRowStatus.READY || it.status == InstantBatchRowStatus.WHOLE_OFFLINE) &&
                 (!it.state.hasInstantRetry || it.state.retryFileCount > 0) &&
                 (it.state.saveIssue?.requiresInspection != true || it.state.retryFileCount > 0)
-                && it.state.saveBlockReason == null && (!saveAsReference || it.state.referenceItemsToSave.isNotEmpty())
+                && it.state.saveBlockReason == null && (!it.state.effectiveSaveAsReference || it.state.referenceItemsToSave.isNotEmpty())
         }
     }
 
@@ -162,7 +164,7 @@ class InstantBatchState internal constructor(
             resolving > 0 -> tr("$resolving 项正在解析", "Resolving ${enCount(resolving, "item", "items")}", "$resolving 項目を解析中", "${resolving}개 항목 분석 중", "$resolving 項正在解析")
             failed > 0 -> tr("$failed 项解析失败，请重试或移除后再保存", "Failed to resolve ${enCount(failed, "item", "items")}. Retry or remove before saving", "$failed 項目の解析に失敗しました。再試行または削除してから保存してください", "${failed}개 항목 분석 실패. 다시 시도하거나 제거한 후 저장해 주세요", "$failed 項解析失敗，請重試或移除後再儲存")
             unnamed > 0 -> tr("$unnamed 项的文件夹名为空", "${enCount(unnamed, "item", "items")} have an empty folder name", "$unnamed 項目のフォルダー名が空です", "${unnamed}개 항목의 폴더 이름이 비어 있습니다", "$unnamed 項的資料夾名稱為空")
-            saveAsReference && rows.none { it.state.referenceItemsToSave.isNotEmpty() } ->
+            saveAsReference && rows.any { it.state.supportsReferenceSave } && rows.filter { it.state.supportsReferenceSave }.none { it.state.referenceItemsToSave.isNotEmpty() } ->
                 tr("所选项目均缺少引用，无法以引用保存", "Selected items lack references and cannot be saved as references", "選択した項目に参照情報がないため、参照として保存できません", "선택한 항목에 참조가 없어 참조로 저장할 수 없습니다", "所選項目均缺少引用，無法以引用儲存")
             rows.any { it.state.savePlan?.incompleteCatalog == true } -> tr("有不完整的文件清单，请逐项检查并选择可保存的内容", "Some file catalogs are incomplete. Inspect each item and select savable content", "不完全なファイル一覧があります。各項目を確認して保存できる内容を選択してください", "불완전한 파일 목록이 있습니다. 각 항목을 확인하고 저장 가능한 내용을 선택하세요", "有不完整的檔案清單，請逐項檢查並選擇可儲存的內容")
             submittableRows.isEmpty() && rows.any { it.status == InstantBatchRowStatus.NEEDS_REVIEW } -> rows.firstNotNullOfOrNull { it.state.saveBlockReason } ?: tr("请先在任务页核对保存结果", "Check save results in Tasks first", "先にタスク画面で保存結果を確認してください", "먼저 작업 페이지에서 저장 결과를 확인해 주세요", "請先至任務頁核對儲存結果")
@@ -187,10 +189,13 @@ class InstantBatchState internal constructor(
         openedRow = null
     }
 
+    val canEdit: Boolean get() = !isSaving && rows.all { it.state.canEdit }
+
     fun updateSaveAsReference(value: Boolean) {
-        if (isSaving || rows.any { !it.state.canEdit || it.state.hasRetainedInstantAttempt }) return
+        if (!canEdit || rows.any { it.state.hasInstantRetry || it.state.saveIssue != null }) return
+        shared.saveAsReferenceTouched = true
         saveAsReference = value
-        rows.forEach { it.state.updateSaveAsReference(value) }
+        onSaveAsReferenceChanged(value)
     }
 
     fun remove(row: InstantBatchRow) {
@@ -212,11 +217,11 @@ class InstantBatchState internal constructor(
                 // 解析时查到的余量与次数可能已经过时，而离线一旦提交就是整包落盘
                 val remaining = refreshRemainingBytes()
                 if (remaining != null && needed > remaining) {
-                    PikoLog.i(TAG, "批量保存：空间不足，需要 $needed 字节，剩余 $remaining 字节")
+                    PikoLog.i(TAG, "Skipped batch save due to insufficient storage (neededBytes=$needed, remainingBytes=$remaining, items=${toSubmit.size}, target=${logFolder(target.id)})")
                     return@launch
                 }
                 if (lacksOfflineCount) {
-                    PikoLog.i(TAG, "批量保存：今日离线次数不够")
+                    PikoLog.i(TAG, "Skipped batch save: insufficient daily cloud download quota (needed=$offlineCount, remaining=$offlineLeft, target=${logFolder(target.id)})")
                     return@launch
                 }
                 val createdIds = mutableListOf<String>()
@@ -232,6 +237,8 @@ class InstantBatchState internal constructor(
                         }
                     }.awaitAll()
                 }
+                var batchFailed = 0
+                val skippedByStop = results.count { it == null }
                 // 按输入顺序汇总，完成先后不改变回执和错误的顺序。
                 for ((row, result) in toSubmit.zip(results)) {
                     if (result == null) continue
@@ -240,13 +247,22 @@ class InstantBatchState internal constructor(
                             if (ids == null) allInstant = false else createdIds += ids
                             succeeded += row
                         }
-                        // 行里的保存已经记过日志，这里只换成给列表看的一句
-                        .onFailure { saveErrors[row.key] = failureText(tr("保存", "Save", "保存", "저장", "儲存"), it) }
+                        // 单行提交与预检拒绝已在 InstantSheetState / OfflineSubmitSession 记录日志，此处汇总列表错误提示
+                        .onFailure {
+                            batchFailed++
+                            saveErrors[row.key] = failureText(tr("保存", "Save", "保存", "저장", "儲存"), it)
+                        }
                 }
+                val reviewCount = rows.count { it !in succeeded && it.status == InstantBatchRowStatus.NEEDS_REVIEW && it.key !in saveErrors }
                 rows.filter { it !in succeeded && it.status == InstantBatchRowStatus.NEEDS_REVIEW }.forEach { row ->
                     saveErrors[row.key] = row.state.saveBlockReason ?: row.state.saveIssue?.message ?: tr("保存结果需要核对", "Save results need inspection", "保存結果の確認が必要です", "저장 결과 확인 필요", "儲存結果需要核對")
                 }
-                PikoLog.i(TAG, "批量保存：${toSubmit.size} 条链接，成功 ${succeeded.size} 条（秒传出 ${createdIds.size} 个文件），失败 ${saveErrors.size} 条")
+                val saveMode = if (saveAsReference) "reference" else "instantOrOffline"
+                PikoLog.i(
+                    TAG,
+                    "Batch save finished (mode=$saveMode, target=${logFolder(target.id)}, submitted=${toSubmit.size}, succeeded=${succeeded.size}, " +
+                        "savedFiles=${createdIds.size}, failed=$batchFailed, skippedByStop=$skippedByStop, priorNeedsReview=$reviewCount, stopped=$stopRequested)",
+                )
                 if (saveErrors.isEmpty() && !stopRequested) {
                     emitOutcome(
                         if (allInstant) {
@@ -280,7 +296,7 @@ class InstantBatchState internal constructor(
     private fun createRow(link: PastedLink): InstantBatchRow {
         // 每行一个子作用域：移除时连同进行中的解析一起取消，不影响别的行
         val rowScope = CoroutineScope(scope.coroutineContext + SupervisorJob(scope.coroutineContext[Job]))
-        return InstantBatchRow(link, newRow(link, rowScope).apply { updateSaveAsReference(this@InstantBatchState.saveAsReference) }, rowScope)
+        return InstantBatchRow(link, newRow(link, rowScope), rowScope)
     }
 
     private fun dropRow(row: InstantBatchRow) {
@@ -294,7 +310,7 @@ class InstantBatchState internal constructor(
         driveRepo.getQuota().onSuccess { response ->
             remainingBytes = response.quota.takeIf { it.limitBytes > 0 }?.remainingBytes
             shared.updateAccount(driveRepo.isFreeAccount(), response)
-        }
+        }.logFailure(TAG, "Failed to query storage quota for batch save; ${remainingBytes?.let { "retaining cached $it bytes" } ?: "no cached quota"}")
         return remainingBytes
     }
 }

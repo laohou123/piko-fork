@@ -17,27 +17,27 @@
 - **去重与冷却窗口**：单批内同一内容（按 `GCID + 大小` 识别）仅保留一份；参照最近已看记录（最多 `50` 段）与待播队尾避开近期刚出过的内容（候选总数较少时冷却间隔自动按比例折半，允许有限队列内按间隔循环；目录树尚未遍历完毕前仅挑本轮未出过的内容）。
 - **文件夹按规模定步调（`folderPace`）**：含 `k` 个视频的目录至少间隔 `同一内容冷却间隔 / k` 段才允许再次出段。仅靠热度惩罚不足以抑制大合集垄断：大目录多属同一部番剧，小目录若在前几段被连续抽空，此后在冷却期内将长期由大目录连出十余段。（实测已否决「按目录简单轮转」与「按文件数加权随机抽样」两种方案。）
 - **多维代价排序（`FeedCost`）**：在满足步调约束的候选中选取综合代价最小者，综合考量所在目录与所属作品（复用网盘页 `analyzeVideoFolder` 的作品块识别，分处多季目录的同一作品合并计热度）的近期热度、内容累计出段次数、是否仅含原画、是否位于子目录及微量随机扰动。`720P` 转码与当前根层仅作为代价倾向而非硬分档，避免有转码的番剧目录永远排在原画目录之前；但当目录树仍在遍历且手头已有充足已就绪片段时，若排在首位的候选仅剩原画则暂缓探测，优先等待后续遍历出的转码目录（手头余量低于 `LOW_ON_CLIPS = 3` 时立即放行原画以避免队列耗尽）。
-- **遍历期留位（`FeedHold`）**：冷启动尚未列完 8 个目录（`SPREAD_OUT_AFTER_FOLDERS`）前按 `FeedHold.Opening` 限制每个已列出目录在队列中最多占 1 段，此后在遍历完成前按 `FeedHold.Collecting` 限制最多占 2 段，防止打开瞬间一次性用最先列出的两三个目录占满二十余段队列。修改选段规则后可通过 `ClipFeedSpreadSmokeTest`（`PIKO_CLIP_SIM=1`）输出前 30 段分布模拟核对。
+- **遍历期留位（`FeedHold`）**：冷启动尚未列完 8 个目录（`SPREAD_OUT_AFTER_FOLDERS`）前按 `FeedHold.Opening` 限制每个已列出目录在队列中最多占 1 段，此后在遍历完成前按 `FeedHold.Collecting` 限制最多占 2 段，防止打开瞬间一次性用最先列出的两三个目录占满二十余段队列（回归覆盖见 `ClipFeedSmokeTest`）。
 - **同片多段起点避让与独立身份**：默认在全片 `10% ~ 85%` 区间内随机选取起点以避开片头片尾；同一内容再次入选时检索队列中最近 `6` 次起点（`RECENT_SAME_VIDEO_CLIPS`），优先放入互不重叠的空闲窗口，放不下时选取距既有起点最远的位置。每个 `Clip` 实例均携带瞬态随机 `occurrence` 身份，即使时间区间相同亦拥有独立的代理流与播放器生命周期；不同内容的快段可越过慢段先行发布至翻页器（`publishPrepared`），同一内容的多段则保持规划先后顺序。
 
 ## 有界 TS 切片、PTS 校准与取流调度
 
 ### 180 秒有界 TS 切片与磁盘缓存（`PreparedClip`、`TsTimestamps`、`FileClipCache`）
 
-- **有界紧致切片窗口（`CLIP_SLICE_MS = 180 秒`）**：PikPak 的 `720P` 转码流为无头部索引表的 MPEG-TS（包长 `188` 字节整数倍；非 TS 流自动回退原画），若将整条数百 MB 残余流直接暴露给播放器，FFmpeg 打开或定位时会在未缓存公网区间发起十余次串行二分跳读（实测耗时 `4~18 秒`），且片尾存在 PTS 跳变时会导致 `av_seek_frame` 失败。`PikoMediaRepository.prepareClip` 按平均码率估算起点后，通过 `findKeyframe` 扫描首个带 `random_access_indicator` 的视频关键帧，并**自动向前对齐紧邻的 `PAT` 节目表包**（`TsTimestamps`，`MAX_PAT_LEAD_BYTES = 32 * 188`，使解复用器首包即建立节目表与流参数，避免丢弃首个关键帧及其 VPS/SPS/PPS），截取一段约 `180 秒` 的有界 `SlicedByteSource` 作为从 `0` 时刻顺序起播的独立短流交给回环代理。
+- **有界紧致切片窗口（`CLIP_SLICE_MS = 180 秒`）**：PikPak 的 `720P` 转码流为无头部索引表的 MPEG-TS（包长 `188` 字节整数倍；非 TS 流自动回退原画），若将整条数百 MB 残余流直接暴露给播放器，FFmpeg 打开或定位时会在未缓存公网区间发起十余次串行二分跳读（实测耗时 `4~18 秒`），且片尾存在 PTS 跳变时会导致 `av_seek_frame` 失败。`PikoMediaRepository.prepareClip` 按平均码率估算起点后，通过跨分块保持解析状态的 `TsTimestamps.VerifiedSliceScanner` 定位首个同时具备**完整前导 `PAT + PMT`、无连续性断层的带内参数集（HEVC 为 `VPS + SPS + PPS`，H.264 为 `SPS + PPS`，校验宽高大于 0 且引用链匹配）与独立关键帧**的安全接入点并回退至该 `PAT` 包边界（严禁在未找到安全接入点时按估算偏移半路裸切，否则会因缺参数集导致 Android `MediaCodec` 初始化失败并静默回退 CPU 软解发热；未找到安全接入点时回退完整流），截取一段约 `180 秒` 的有界 `SlicedByteSource` 作为从 `0` 时刻顺序起播的独立短流交给回环代理。
 - **首尾预取与 PTS 时长实测校准**：`PreparedClip.prefetch` 对 TS 切片仅预取**开头 `5 秒`**（至少 `512 KiB`）与**切片流尾 `512 KiB`** 两截（`sliceRanges`），随后在前台优先级下读取整条转码流首包 PTS 与切片关键帧 PTS 计算该段对应全片的精确毫秒起点（`resolveStart` 修正 `clipStartMs`，使点击「观看完整视频」时画面帧级无缝衔接），并读取切片流尾最后一个视频 PES 的 PTS 校准该切片实际覆盖的可播放时长（`resolveWindowDuration` 修正 `maxWindowMs`，防止高码率段落实际不足 180 秒却向界面承诺 180 秒）。
-- **磁盘切片缓存（`FileClipCache`，`FORMAT = 3`）**：通过 `RangeLimitedStore` 仅将切片开头与流尾两截块写入磁盘（默认上限 `300 MiB`，超限时按文件修改时间 LRU 一次性淘汰至 `80%` 水位以避免逐块全目录扫描锁竞争；记录上限 `4096` 条），并在预热完成后持久化包含实测 `sliceStartMs` 与 `sliceDurationMs` 的 `ClipRecord`（键名带 `_v3`）。同一片段再次命中（如重开文件夹队列或往回翻出内存保留窗口后重装）时直接从磁盘重建句柄并秒开首帧，无需再次请求文件详情。
+- **磁盘切片缓存（`FileClipCache`，`FORMAT = 5`）**：通过 `RangeLimitedStore` 仅将切片开头与流尾两截块写入磁盘（默认上限 `300 MiB`，超限时按文件修改时间 LRU 一次性淘汰至 `80%` 水位以避免逐块全目录扫描锁竞争；记录上限 `4096` 条），并在预热完成后持久化包含实测 `sliceStartMs`、`sliceDurationMs` 以及关键帧偏移 `keyframeOffset` 与视频 `videoPid` 的 `ClipRecord`（键名带 `_v5`）。`SlicedByteSource` 按 `188` 字节包边界确定性将关键帧之前的视频包重写为 `0x1FFF` 空包字节视图（任意切块读取、随机定位与并发 `ReadTicket` 均字节一致，且绝不改动底层缓存块），同一片段再次命中时直接从磁盘重建句柄并秒开首帧，无需再次请求文件详情。
 
-### 并发车道、缓冲压制与定位最高优先级（`ClipStreams`）
+### 并发车道、缓冲预算与定位优先级（`ClipStreams`）
 
-- **并发车道与坏死重试**：`ClipStreams` 归属进程级 `ClipFeedSession`（Android 压栈打开完整播放器再返回时无需重备会话），内存仅保留当前页往回 `KEPT_BEHIND = 2` 段至候补末尾的会话以防撑爆移动端堆内存。冷启动首段画面走起来前仅备前 `COLD_START_CLIPS = 3` 段；起播后维持前方 `PREPARE_AHEAD = 12` 段会话就绪、`READY_AHEAD = 8` 段字节预取完成。备会话并发限制为 `PREPARE_LANES = 4`（播放器急需的最多 3 段 `forPlayer = true` 免排队直通），实际下载预取字节的并发车道限制为 `PREFETCH_LANES = 2`（防止 8 段齐发占满 HTTP/1.1 全部 16 个不可抢占连接槽而阻塞当前段拖动；`RIPEN_TIMEOUT = 60s` 仅在取得预取车道后起算真实网络耗时）。原画预取（文件头尾各 `2 MiB` 加估算起点附近 `2 秒`）优先级比转码切片低一档（`WARM_PRIORITY - 1`），不采用单通道串行以免单条坏直链堵死后续全部原画。首次取流失败调用 `ClipFeedSession.drop` 更换 `occurrence` 移至候补重取一次，连续第二次失败才记入 3 天冷却黑名单（`REJECT_TTL_MS`）。
-- **播放升档与同步 `urgent` 定位**：新装入播放器的片段及相邻预渲染片段初始将 mpv 缓冲（`HOLD_BUFFER_SECONDS = 2s`）与代理预读（`holdReadAhead` 置 `0`）双双压住，仅当前活动段给 `8 秒 / 2 MiB` 初始预读；待当前段连续播放满 `BOOST_AFTER_MS = 2.5 秒` 确认用户真正在看后，才将播放器 `cache-secs` 放开至 `10 秒`、代理预读放开至 `25 秒`（保底 `6 MiB`，显著大于播放器缓冲以保证并发大块铺路）。翻页松手瞬间即以 `pagerState.targetPage` 切换活动段，不等吸附动画收尾（`settledPage`）。用户拖动进度条或按键快进/快退（`seekClip`）时，**必须在调用 `player.seekTo` 之前同步执行 `streams.setUrgent(activeClip, true)`（SDK 最高优先级 `100`）并放开预读窗口**，确保 mpv C 线程在亚毫秒内发出的首个新 Range 请求即刻获得最高调度权（桌面端 `MediampPlaybackBackend` 对 `keyframeStart = true` 的预览流直接经底层 mpv 句柄下发 `absolute+keyframes` 定位，防止 MediaMP 硬编码 `absolute+exact` 撑爆 `8 MiB` 预览队列）。
+- **并发车道与坏死重试**：`ClipStreams` 归属进程级 `ClipFeedSession`（Android 压栈打开完整播放器再返回时无需重备会话），内存仅保留当前页往回 `KEPT_BEHIND = 2` 段至候补末尾的会话以防撑爆移动端堆内存。冷启动首段画面走起来前仅备前 `COLD_START_CLIPS = 3` 段；起播后维持前方 `PREPARE_AHEAD = 6` 段会话就绪、`READY_AHEAD = 4` 段字节预取完成。备会话并发限制为 `PREPARE_LANES = 4`（活跃等待/播放主段额外享有一个保留直通槽），实际下载预取字节的并发车道限制为 `PREFETCH_LANES = 2`（防止多段齐发占满 HTTP/1.1 全部连接槽而阻塞当前段拖动；`RIPEN_TIMEOUT = 60s` 仅在取得预取车道后起算真实网络耗时）。原画预取（文件头尾各 `2 MiB` 加估算起点附近 `2 秒`）优先级比转码切片低一档（`WARM_PRIORITY - 1`），不采用单通道串行以免单条坏直链堵死后续全部原画。首次取流失败调用 `ClipFeedSession.drop` 更换 `occurrence` 移至候补重取一次，连续第二次失败才记入 3 天冷却黑名单（`REJECT_TTL_MS`）。
+- **单一展示需求投影、播放升档与同步定位世代推进**：`ClipStreams` 由单一权威 `ClipDisplayDemand`（`focusClip`、`focusState`、`awaitingClip`、`prerenderingNeighbours`）向每个片段自始至终持有的唯一 `TransferDemand` 投影原子 `ConsumerIntent`（不再维护平行的前后台/急迫布尔开关）。新装入播放器的片段及相邻预渲染片段初始将 mpv 缓冲（`HOLD_BUFFER_SECONDS = 2s`）与投机预算（`BufferBudget.NONE`）压住，相邻预渲染段固定在 `ServiceIntent.PREFETCH`（`WARM_PRIORITY`）且 `BufferBudget.NONE`，仅当前焦点段给 `8 秒 / 2 MiB` 初始 `boost` 预算；待当前段连续播放满 `BOOST_AFTER_MS = 2.5 秒` 确认用户真正在看后，才将播放器 `cache-secs` 放开至 `10 秒`、预算放开至 `25 秒`（保底 `6 MiB`）。翻页松手瞬间即以 `pagerState.targetPage` 切换活动段，不等吸附动画收尾（`settledPage`）。用户拖动进度条或按键快进/快退（`seekClip`）时，**必须在调用 `player.seekTo` 之前同步执行 `streams.beginSeek(activeClip, player)` 递增 `ConsumerIntent.epoch`、清空旧缓冲样本并切入 `FocusPlaybackState.Waiting`（`ServiceIntent.WAITING`，SDK 最高优先级 `100`）且按需 `boost` 预读预算**，确保 mpv C 线程在亚毫秒内发出的首个新 Range 请求即刻获得最高调度权并立即撤销旧世代投机块（桌面端 `MediampPlaybackBackend` 对 `keyframeStart = true` 的预览流直接经底层 mpv 句柄下发 `absolute+keyframes` 定位，防止 MediaMP 硬编码 `absolute+exact` 撑爆 `8 MiB` 预览队列）。
 
 ## 三播放器图层、续播模式与交互键位
 
 - **三层解耦渲染架构**：
   1. **底层常驻画面层**：`POOL_SIZE = 3` 个 `PreviewBackend` 实例按 `page % 3` 轮换分配给上一段、当前段与下一段（当前段画面走起来或至多等待 `800ms` 后再装入下一段与上一段并停在首帧，避免手机端起步解码争抢耗时），三个视频渲染表面常驻在 `VerticalPager` 下方，滑动中仅在绘制阶段通过 `graphicsLayer` 硬件层 `translationY` 跟随页偏移矩阵平移（完全移出视口时置 `alpha = 0f` 消除三层全屏纹理混合 Overdraw），绝不随翻页销毁重建 `Surface`；同时对容器尺寸变化施加 `250ms` 防抖（`SURFACE_RESIZE_SETTLE`），规避 MediaMP 0.5.0 D3D11 `MpvSurfaceRing` 连续改尺寸时的渲染锁死。
-  2. **中层透明翻页器（`VerticalPager`）**：按整数下标作 key（末尾存在未就绪候补时多出一页加载等待页，候补就绪后原地无缝变为视频页而不触发页面跳动），仅绘制未出首帧前的模糊封面遮罩（`ClipBackdrop`）、超过 `300ms` 的缓冲指示器、暂停图标与双击点赞星爆动效。
+  2. **中层透明翻页器（`VerticalPager`）**：按整数下标作 key（末尾存在未就绪候补时多出一页加载等待页，候补就绪后原地无缝变为视频页而不触发页面跳动），仅绘制未出首帧前或留边时的预模糊封面背景（`ClipBackdrop`，小缩略图在后台按 `Crop` 倍率做一次性边缘钳位盒式预模糊并有界缓存，避免播放期常驻全屏实时 `Modifier.blur` 离屏渲染目标）、超过 `300ms` 的缓冲指示器、暂停图标与双击点赞星爆动效。
   3. **顶层固定控件层**：顶栏、左下角文件与目录说明、右侧动作栏及底边独立重组隔离的进度条（`ActiveClipProgressBar`）固定在翻页器上方，不随页面上下滑走，换段时以 `Crossfade` 就地切换，拖动进度条时说明与动作栏自动淡出让出画面。
 - **回滑进度记忆、自动续播与自动连刷**：
   - **回滑记忆（`rememberedPositions` 与 `rememberedLengths`）**：切出槽位前及播放途中持续记录每个 `Clip` 已扩展的窗口长度与当前相对进度（距全片可用末尾不足 `5 秒` 或已播完则归零）；往回翻过多个槽位重新装入时，自动放开代理预读并直接定位至上次离开的进度与窗口长度，首帧未出前进度条亦保持该读数不闪回 `0`。
@@ -46,3 +46,10 @@
   - 单击切换暂停/播放，双击为当前文件加星标（归档虚拟条目同步写入 `VaultStars`），长按按播放设置倍速加速（`playerBoostSpeedFlow`，松手或翻页即恢复 `1x`）；开启沉浸模式（`ClipFeedSession.immersive`）后隐藏顶栏与全部控件，此时禁用双击判定以使单击零延迟唤回控件。
   - 键盘支持 `↓` / `PageDown` / `MediaNext` 下一段，`↑` / `PageUp` / `MediaPrevious` 上一段，`←` / `→` 按播放设置步长快退/快进，`Space` 暂停/继续，`M` 静音，`A` 切换自动连刷（外层 `onPreviewKeyEvent` 拦截并过滤按键长按连发）。
   - 当展示区域高度不足 `480dp`（`LandscapeBelowHeight`，如横握手机）时，控件自动切换为右下角横排布局，视频一律按 `Fit` 完整显示并在两侧垫模糊背景（禁止在约 `2.2:1` 窄高屏幕上套用近似比例铺满裁切），同时主界面通过 `feedCoversWindow` 隐藏左侧边栏窄轨以独占整窗。Android 全屏顶栏提供手动横屏锁定按钮（`rememberLandscapeLock`，`SENSOR_LANDSCAPE`），点击「观看完整视频」压入主播放器前必须**先行释放**该横屏锁，确保主播放器记录并恢复进入前的真实系统方向。
+
+### 需求提权与播放器退休
+
+- 每个 `Clip` 从详情查询、`VerifiedSliceScanner` 关键帧扫描、`PreparedClip.prefetch` 到回环代理 `ReadTicket` 读取全程共享同一个 `TransferDemand`，由 `ClipDisplayDemand` 原地重投影 `ConsumerIntent`：冷启动或底部等待页尚未刷出焦点段时，首个未就绪候补段原地晋升为 `ServiceIntent.WAITING`；邻居预渲染集合保持 `ServiceIntent.PREFETCH`（`BufferBudget.NONE`），绝不抢占当前焦点段的紧迫阶段或前台车道。
+- 预读窗口（`boostWindow`）保存在片段条目中，准备完成前的扩展请求在 `PreparedClip` 就绪时自动折算为 `BufferBudget` 应用，挂起或暂停恢复后重新投影；`holdAllBut` 清空非焦点段的 `boostWindow`，且每当条目的 `BufferBudget` 降至 `0` 时立即调用 `TransferDemand.withdrawSpeculation()` 撤销投机预读。
+- `ClipPlaybackBinding` 串行管理每个原生播放器的换片与退休。`PreparedClip` 退出保留窗口时先撤回网络需求并通知播放器停止；只有 `stopAndAwaitIdle` 完成、所有播放器引用释放后才注销代理地址并关闭来源。正在打开的片段退休时取消该次打开，避免停止操作排在未完成的打开之后永久等待。
+- 桌面与 Android 的预览后端均由调用方 `release`，平台组合销毁不另行抢先关闭原生实例。回归覆盖见 `ClipPlaybackBindingTest`；Windows 真实渲染与 mpv 验证使用 `PIKO_NATIVE_CLIP_TEST=1` 运行 `ClipRetirementNativeTest`。

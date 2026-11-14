@@ -24,7 +24,6 @@ class DriveBrowserSession(
     preferences: PikoUserPreferences,
     val duplicates: DuplicateSession,
     archives: ArchiveBrowser?,
-    trash: TrashSession,
     parentScope: CoroutineScope,
     library: DriveLibrary? = null,
     initialStack: List<PikoPathBreadcrumb>? = null,
@@ -32,10 +31,9 @@ class DriveBrowserSession(
     clipboard: dev.piko.shared.presentation.DriveClipboardState = dev.piko.shared.presentation.DriveClipboardState(),
     operationScope: CoroutineScope = parentScope,
     fileWrites: FileWriteSession = FileWriteSession(repository, operationScope),
-    historyEdits: HistoryEditSession = HistoryEditSession(repository, operationScope),
-    vaultEdits: VaultEntryEditSession = VaultEntryEditSession(repository, operationScope),
+    historyEdits: HistoryMutations = HistoryMutations(repository, operationScope),
+    vaultEdits: VaultEntryMutations = VaultEntryMutations(repository, operationScope),
     folderVault: FolderVaultSession? = null,
-    shareSaves: ShareSaveSession? = null,
     receiving: dev.piko.shared.presentation.ReceivingActivity? = null,
     instantSession: InstantSession? = null,
     addLinkOwnerTabId: () -> Long? = { null },
@@ -54,21 +52,16 @@ class DriveBrowserSession(
     val state = DriveScreenState(
         repository, preferences, scope,
         sessionListing = { place ->
-            if (place == DriveLibrary.DUPLICATES) duplicates.state?.let { finder ->
-                val folder = navigation.folderStackFlow.value.lastOrNull()?.id
-                duplicateReport.listing(finder, folder?.takeUnless { it == place.id } ?: finder.root.id)
-            } else null
+            if (place == DriveLibrary.DUPLICATES) duplicates.state?.let(duplicateReport::listing) else null
         },
         archives = archives,
         navigation = navigation,
-        trashSession = trash,
         clipboard = clipboard,
         operationScope = operationScope,
         fileWriteSession = fileWrites,
         historyEditSession = historyEdits,
         vaultEditSession = vaultEdits,
         folderVault = folderVault,
-        shareSaves = shareSaves,
         receiving = receiving,
         instantSession = instantSession,
         addLinkOwnerTabId = addLinkOwnerTabId,

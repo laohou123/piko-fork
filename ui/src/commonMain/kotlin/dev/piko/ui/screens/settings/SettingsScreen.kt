@@ -47,6 +47,7 @@ import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.Key
 import androidx.compose.material.icons.outlined.Lan
 import androidx.compose.material.icons.outlined.Link
+import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.material.icons.outlined.Memory
 import androidx.compose.material.icons.outlined.Minimize
 import androidx.compose.material.icons.outlined.Palette
@@ -111,8 +112,10 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.piko.data.auth.SnailMode
 import dev.piko.shared.net.ProxySetting
+import dev.piko.shared.sync.EncryptedSyncStatus
 import dev.piko.shared.sync.PikoSettingsSync
 import dev.piko.ui.LocalPikoServices
+import dev.piko.ui.PassphraseUpdateResult
 import dev.piko.ui.adaptive.isDesktopLayout
 import dev.piko.ui.adaptive.readableWidth
 import dev.piko.ui.components.IslandHeaderSpace
@@ -147,7 +150,7 @@ import kotlinx.datetime.toLocalDateTime
  * 桌面放得下时左边是分类目录，点了滚到那一类，滚动时亮当前的一类。不做成选一类显示一类：
  * 几类都只有几组，分页后每页大半是空的，找一项还得先猜它归哪一类。
  *
- * 行与组的外观在 SettingsLayout.kt，后来加设置项照 ui/CLAUDE.md「设置页」一节。
+ * 行与组的外观在 SettingsLayout.kt，后来加设置项照 ui/AGENTS.md「设置页」一节。
  */
 @Composable
 fun SettingsScreen(
@@ -165,6 +168,7 @@ fun SettingsScreen(
     val isSpoilerBlurEnabled by sessionManager.spoilerBlurFlow.collectAsStateWithLifecycle(initialValue = true)
     val isHeuristicFilterEnabled by sessionManager.heuristicFilterFlow.collectAsStateWithLifecycle(initialValue = true)
     val isNameParsingEnabled by sessionManager.nameParsingFlow.collectAsStateWithLifecycle(initialValue = true)
+    val foldersFirst by sessionManager.foldersFirstFlow.collectAsStateWithLifecycle(initialValue = true)
     val isPerFolderSortEnabled by sessionManager.perFolderSortFlow.collectAsStateWithLifecycle(initialValue = false)
     val isBundleSubtitlesEnabled by sessionManager.bundleSubtitlesFlow.collectAsStateWithLifecycle(initialValue = true)
     val isAutoCleanNamesEnabled by sessionManager.autoCleanNamesFlow.collectAsStateWithLifecycle(initialValue = false)
@@ -179,7 +183,6 @@ fun SettingsScreen(
     val settingsSync = services.settingsSync
     val syncStatus by settingsSync.status.collectAsStateWithLifecycle()
     val lastSynced by settingsSync.lastSynced.collectAsStateWithLifecycle()
-    val isConcurrentAccelerationEnabled by sessionManager.concurrentAccelerationFlow.collectAsStateWithLifecycle(initialValue = true)
     val downloadDirPath by sessionManager.downloadDirPathFlow.collectAsStateWithLifecycle(initialValue = "")
     val isFreeAccount by services.driveRepository.isFreeAccountFlow.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
@@ -203,6 +206,15 @@ fun SettingsScreen(
     val archivePasswordVault = services.archivePasswords
     val archivePasswords by archivePasswordVault.passwords.collectAsStateWithLifecycle(initialValue = emptyList())
     var showArchivePasswords by remember { mutableStateOf(false) }
+    val encryptedSyncStatus by services.encryptedSyncStatus.collectAsStateWithLifecycle()
+    val activeClient by services.clientManager.currentClient.collectAsStateWithLifecycle()
+    var hasSyncPassphrase by remember(activeClient?.account) { mutableStateOf(false) }
+    var showEncryptedSyncDialog by remember { mutableStateOf(false) }
+    var encryptedSyncBusy by remember { mutableStateOf(false) }
+    var encryptedSyncMismatchError by remember(activeClient?.account) { mutableStateOf<String?>(null) }
+    LaunchedEffect(activeClient?.account, showEncryptedSyncDialog) {
+        hasSyncPassphrase = services.hasSyncPassphraseForCurrentAccount()
+    }
     var showPlaybackQuality by remember { mutableStateOf(false) }
     val playbackMaxHeight by sessionManager.playbackMaxHeightFlow.collectAsStateWithLifecycle(initialValue = 0)
     var showDownloadQuality by remember { mutableStateOf(false) }
@@ -256,11 +268,20 @@ fun SettingsScreen(
 
     val linkAssociation = platform.linkAssociation
     var linkAssociationState by remember { mutableStateOf(LinkAssociationState.Unavailable) }
+    val isWindowFocused = LocalWindowInfo.current.isWindowFocused
     if (linkAssociation != null) {
         // 默认应用在系统设置里改，改完切回来窗口重新获得焦点，借此刷新
-        val isWindowFocused = LocalWindowInfo.current.isWindowFocused
         LaunchedEffect(linkAssociation, isWindowFocused) {
             if (isWindowFocused) linkAssociationState = linkAssociation.state()
+        }
+    }
+    val backgroundTransferAccess = platform.backgroundTransferAccess
+    var isBackgroundUnrestricted by remember(backgroundTransferAccess) {
+        mutableStateOf(backgroundTransferAccess?.isUnrestricted() ?: true)
+    }
+    if (backgroundTransferAccess != null) {
+        LaunchedEffect(backgroundTransferAccess, isWindowFocused) {
+            if (isWindowFocused) isBackgroundUnrestricted = backgroundTransferAccess.isUnrestricted()
         }
     }
 
@@ -316,7 +337,7 @@ fun SettingsScreen(
         },
     ) { innerPadding ->
         BoxWithConstraints(modifier = Modifier.fillMaxSize().padding(innerPadding)) {
-            // 目录只在桌面：移动端照 M3 的单列列表，平板与手机一致，宽时只把内容限宽居中
+            // 左侧目录随宽窗口布局出现（>= 600×480dp 且内容区宽度不低于 SettingsIndexMinWidth，大屏平板同样适用）；窄窗保持单列列表
             val withIndex = desktop && maxWidth >= SettingsIndexMinWidth
             Row(modifier = Modifier.fillMaxSize()) {
                 if (withIndex) {
@@ -462,6 +483,13 @@ fun SettingsScreen(
                                 supporting = tr("模糊显示缩略图与封面", "Blur thumbnails and covers", "サムネイルとカバーをぼかして表示", "미리 보기 및 표지 흐리게 표시", "模糊顯示縮圖與封面"),
                                 checked = isSpoilerBlurEnabled,
                                 onCheckedChange = { scope.launch { sessionManager.setSpoilerBlurEnabled(it) } },
+                            )
+                            SettingsSwitchRow(
+                                icon = Icons.AutoMirrored.Outlined.Sort,
+                                title = tr("文件夹置顶", "Folders on top", "フォルダーを上部に固定", "폴더 상단 고정", "資料夾置頂"),
+                                supporting = tr("关闭后文件夹与文件按所选顺序混合排列", "Turn off to mix folders and files together in sort order", "オフにするとフォルダーとファイルを混在して並べ替えます", "끄면 폴더와 파일을 선택한 정렬 순서대로 함께 배열합니다", "關閉後資料夾與檔案依所選順序混合排列"),
+                                checked = foldersFirst,
+                                onCheckedChange = { scope.launch { sessionManager.setFoldersFirst(it) } },
                             )
                             SettingsSwitchRow(
                                 icon = Icons.AutoMirrored.Outlined.Sort,
@@ -644,13 +672,19 @@ fun SettingsScreen(
                                 onClick = { showDownloadQuality = true },
                                 trailingIcon = null,
                             )
-                            SettingsSwitchRow(
-                                icon = Icons.Outlined.Speed,
-                                title = tr("并发加速", "Parallel downloads", "並列ダウンロード", "병렬 다운로드", "並行加速"),
-                                supporting = tr("多连接下载，提升速度", "Use multiple connections for faster downloads", "複数接続でダウンロードを高速化", "여러 연결로 다운로드 속도 향상", "多連線下載，提升速度"),
-                                checked = isConcurrentAccelerationEnabled,
-                                onCheckedChange = { scope.launch { sessionManager.setConcurrentAccelerationEnabled(it) } },
-                            )
+                            if (backgroundTransferAccess != null) {
+                                SettingsNavigationRow(
+                                    icon = Icons.Outlined.PowerSettingsNew,
+                                    title = tr("后台持续传输", "Unrestricted background transfers", "バックグラウンド継続転送", "백그라운드 지속 전송", "背景持續傳輸"),
+                                    supporting = if (isBackgroundUnrestricted) {
+                                        tr("已允许在后台不受省电限制持续下载与上传", "Allowed to transfer in the background without battery restrictions", "省電力制限なしでバックグラウンド転送が許可されています", "배터리 제한 없이 백그라운드 전송이 허용됨", "已允許在背景不受省電限制持續下載與上傳")
+                                    } else {
+                                        tr("受系统电池优化限制，切到后台可能被暂停，点击前往允许", "Restricted by system battery optimization; tap to allow background transfers", "システムのバッテリー最適化により制限されています。タップして許可", "시스템 배터리 최적화로 제한됨. 탭하여 백그라운드 전송 허용", "受系統電池最佳化限制，切至背景可能被暫停，點擊前往允許")
+                                    },
+                                    onClick = { backgroundTransferAccess.requestUnrestricted() },
+                                    trailingIcon = if (isBackgroundUnrestricted) Icons.Outlined.Check else null,
+                                )
+                            }
                         }
                         SettingsGroup(tr("限速", "Speed limits", "速度制限", "속도 제한", "限速")) {
                             SettingsSwitchRow(
@@ -698,13 +732,7 @@ fun SettingsScreen(
                                 enabled = isSettingsSyncEnabled,
                                 status = syncStatusText(syncStatus, lastSynced),
                                 onEnabledChange = { scope.launch { sessionManager.setSettingsSyncEnabled(it) } },
-                                onSyncNow = {
-                                    scope.launch {
-                                        // 设置与「译名 + 收藏」是两份文件，一起同步，用户只点一次
-                                        settingsSync.syncNow()
-                                        services.librarySync?.syncNow()
-                                    }
-                                },
+                                onSyncNow = { scope.launch { services.syncAllNow() } },
                             )
                             SettingsSwitchRow(
                                 icon = Icons.Outlined.History,
@@ -722,6 +750,62 @@ fun SettingsScreen(
                                 onClick = { showArchivePasswords = true },
                                 trailingIcon = null,
                             )
+                            if (services.supportsEncryptedSync) {
+                                val syncPassphraseSummary = when (encryptedSyncStatus) {
+                                    EncryptedSyncStatus.LockedKeyMismatch -> tr(
+                                        "云端密文与当前密钥不匹配，已暂停覆盖，点击输入口令或重置",
+                                        "Cloud data encrypted with another key; paused to protect data. Tap to unlock or reset.",
+                                        "クラウドの暗号化データとキーが一致しません。タップして解除またはリセット",
+                                        "클라우드 암호문과 키가 일치하지 않아 보호 중. 탭하여 잠금 해제 또는 초기화",
+                                        "雲端密文與目前金鑰不符，已暫停覆寫，點選輸入口令或重設",
+                                    )
+                                    EncryptedSyncStatus.LockedNoKey -> tr(
+                                        "未设置（Google 登录账号设置后可跨设备加密同步密码与配置）",
+                                        "Not set (set a passphrase to encrypt and sync passwords & MetaTube on Google accounts)",
+                                        "未設定（設定すると解凍パスワードやMetaTubeを端末間で暗号化同期できます）",
+                                        "미설정 (설정 시 압축 해제 비밀번호 및 MetaTube를 기기 간 암호화 동기화)",
+                                        "尚未設定（Google 登入帳號設定後可跨裝置加密同步密碼與設定）",
+                                    )
+                                    EncryptedSyncStatus.CorruptOrUnsupported -> tr(
+                                        "云端同步文件需要更新版本或已损坏，已跳过同步以保护数据",
+                                        "Cloud sync file requires a newer version or is damaged; skipped to preserve data",
+                                        "クラウドの同期ファイルが新しいバージョン用か破損しているためスキップしました",
+                                        "클라우드 동기화 파일이 최신 버전용이거나 손상되어 건너뛰었습니다",
+                                        "雲端同步檔案需要較新版本或已損壞，已略過同步以保護資料",
+                                    )
+                                    EncryptedSyncStatus.Idle, EncryptedSyncStatus.Unlocked -> if (hasSyncPassphrase) {
+                                        tr(
+                                            "已启用独立同步口令",
+                                            "Custom sync passphrase enabled",
+                                            "独自の同期パスフレーズを使用中",
+                                            "별도 동기화 암호문구 사용 중",
+                                            "已啟用獨立同步口令",
+                                        )
+                                    } else {
+                                        tr(
+                                            "默认使用登录密码加密，点击可设置独立同步口令",
+                                            "Encrypted with account password by default; tap to set a custom passphrase",
+                                            "既定ではログインパスワードを使用。タップして独自パスフレーズを設定",
+                                            "기본적으로 로그인 비밀번호 사용. 탭하여 별도 암호문구 설정",
+                                            "預設使用登入密碼加密，點選可設定獨立同步口令",
+                                        )
+                                    }
+                                }
+                                SettingsRow(
+                                    icon = Icons.Outlined.Lock,
+                                    title = tr("加密同步口令", "Encrypted sync passphrase", "暗号化同期パスフレーズ", "암호화 동기화 암호문구", "加密同步口令"),
+                                    supporting = syncPassphraseSummary,
+                                    supportingColor = if (encryptedSyncStatus == EncryptedSyncStatus.LockedKeyMismatch) {
+                                        MaterialTheme.colorScheme.error
+                                    } else {
+                                        Color.Unspecified
+                                    },
+                                    onClick = {
+                                        encryptedSyncMismatchError = null
+                                        showEncryptedSyncDialog = true
+                                    },
+                                )
+                            }
                             // WebDAV 仅限会员，免费账号与等级未取到时不出现
                             if (isFreeAccount == false) {
                                 SettingsNavigationRow(
@@ -878,6 +962,115 @@ fun SettingsScreen(
             passwords = archivePasswords,
             onDelete = { scope.launch { archivePasswordVault.forget(it) } },
             onDismiss = { showArchivePasswords = false },
+        )
+    }
+
+    if (showEncryptedSyncDialog) {
+        EncryptedSyncSettingsDialog(
+            status = encryptedSyncStatus,
+            hasPassphrase = hasSyncPassphrase,
+            busy = encryptedSyncBusy,
+            mismatchError = encryptedSyncMismatchError,
+            onClearMismatchError = { encryptedSyncMismatchError = null },
+            onSavePassphrase = { passphrase ->
+                encryptedSyncBusy = true
+                encryptedSyncMismatchError = null
+                scope.launch {
+                    try {
+                        val outcome = services.updateSyncPassphrase(passphrase)
+                        hasSyncPassphrase = services.hasSyncPassphraseForCurrentAccount()
+                        when (outcome) {
+                            PassphraseUpdateResult.SavedAndSynced -> {
+                                showEncryptedSyncDialog = false
+                                snackbarHostState.showSnackbar(
+                                    tr(
+                                        "已保存同步口令并完成加密同步",
+                                        "Sync passphrase saved and synced",
+                                        "同期パスフレーズを保存して同期しました",
+                                        "동기화 암호문구를 저장하고 동기화했습니다",
+                                        "已儲存同步口令並完成加密同步",
+                                    ),
+                                    withDismissAction = true,
+                                )
+                            }
+                            PassphraseUpdateResult.SavedOffline -> {
+                                showEncryptedSyncDialog = false
+                                snackbarHostState.showSnackbar(
+                                    tr(
+                                        "已保存同步口令，待网络恢复后自动同步",
+                                        "Sync passphrase saved; will sync when online",
+                                        "同期パスフレーズを保存しました（オンライン時に同期）",
+                                        "동기화 암호문구 저장됨 (온라인 상태 시 동기화)",
+                                        "已儲存同步口令，待網路恢復後自動同步",
+                                    ),
+                                    withDismissAction = true,
+                                )
+                            }
+                            PassphraseUpdateResult.KeyMismatch -> {
+                                encryptedSyncMismatchError = tr(
+                                    "口令无法解开云端密文，请核对原口令或在上方备份重置",
+                                    "Passphrase does not match cloud ciphertext; check it or reset above",
+                                    "パスフレーズがクラウドの暗号化データと一致しません",
+                                    "암호문구가 클라우드 암호문과 일치하지 않습니다",
+                                    "口令無法解開雲端密文，請核對原口令或在上方備份重設",
+                                )
+                            }
+                            PassphraseUpdateResult.Failed -> {
+                                showEncryptedSyncDialog = false
+                                snackbarHostState.showSnackbar(
+                                    tr(
+                                        "同步口令保存失败",
+                                        "Failed to save sync passphrase",
+                                        "同期パスフレーズの保存に失敗しました",
+                                        "동기화 암호문구 저장 실패",
+                                        "同步口令儲存失敗",
+                                    ),
+                                    withDismissAction = true,
+                                )
+                            }
+                        }
+                    } finally {
+                        encryptedSyncBusy = false
+                    }
+                }
+            },
+            onClearPassphrase = {
+                encryptedSyncBusy = true
+                encryptedSyncMismatchError = null
+                scope.launch {
+                    try {
+                        services.updateSyncPassphrase("")
+                        hasSyncPassphrase = services.hasSyncPassphraseForCurrentAccount()
+                        showEncryptedSyncDialog = false
+                    } finally {
+                        encryptedSyncBusy = false
+                    }
+                }
+            },
+            onResetCloud = {
+                encryptedSyncBusy = true
+                encryptedSyncMismatchError = null
+                scope.launch {
+                    try {
+                        val ok = services.resetEncryptedSyncRemote()
+                        showEncryptedSyncDialog = false
+                        val msg = if (ok) {
+                            tr("已备份旧云端密文并用本机数据重置", "Backed up old ciphertext and reset cloud copy", "旧暗号化データをバックアップしてリセットしました", "기존 암호문을 백업하고 클라우드 데이터를 초기화했습니다", "已備份舊雲端密文並以本機資料重設")
+                        } else {
+                            tr("云端重置未完成，请检查网络或先设置口令", "Cloud reset failed. Check connection or set a passphrase first.", "リセットできませんでした。通信環境またはパスフレーズを確認してください", "초기화하지 못했습니다. 네트워크 또는 암호문구를 확인해 주세요", "雲端重設未完成，請檢查網路或先設定口令")
+                        }
+                        snackbarHostState.showSnackbar(msg, withDismissAction = true)
+                    } finally {
+                        encryptedSyncBusy = false
+                    }
+                }
+            },
+            onDismiss = {
+                if (!encryptedSyncBusy) {
+                    encryptedSyncMismatchError = null
+                    showEncryptedSyncDialog = false
+                }
+            },
         )
     }
 

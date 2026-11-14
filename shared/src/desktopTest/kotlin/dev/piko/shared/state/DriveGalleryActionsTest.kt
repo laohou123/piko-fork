@@ -50,7 +50,7 @@ class DriveGalleryActionsTest {
         assertEquals(next.id, state.clipboardFlow.value?.sources?.get(video.id))
         displayed = emptyList()
         state.putOnClipboard(listOf(video.id), cut = true)
-        assertEquals("", state.clipboardFlow.value?.sources?.get(video.id), "图库关闭后不能沿用先前的补充来源")
+        assertEquals(first.id, state.clipboardFlow.value?.sources?.get(video.id), "图库关闭后不能沿用先前的补充来源")
     }
 
     @Test fun descendantVaultRenameAndDeleteEditTheChildManifest() = smoke { scope ->
@@ -62,21 +62,20 @@ class DriveGalleryActionsTest {
         repo.vault.update("", VaultEdits.add(listOf(rootEntry))).getOrThrow()
         repo.vault.update(child.id, VaultEdits.add(listOf(childEntry))).getOrThrow()
         var displayed = repo.listBrowsable(child.id, PikoFileSortOrder.NAME_ASC).getOrThrow()
-        val edits = VaultEntryEditSession(repo, scope)
+        val edits = VaultEntryMutations(repo, scope)
+        val outcomes = dev.piko.shared.smoke.observeMutationOutcomes(scope, edits.outcomes)
         val state = DriveScreenState(repo, MemoryPreferences(), scope, vaultEditSession = edits, supplementalFiles = { displayed })
 
         state.rename(displayed.single().id, "after.mkv")
-        assertEquals(child.id, (edits.works.value.single().command as VaultEntryEditCommand.Rename).folderId)
-        awaitUntil("子目录归档改名完成") { edits.works.value.single().result != null }
-        assertEquals(VaultEntryEditCompletion.SUCCEEDED, edits.works.value.single().result?.completion)
+        awaitUntil("子目录归档改名完成") { outcomes.value.isNotEmpty() }
+        assertEquals(VaultEntryEditCompletion.SUCCEEDED, outcomes.value.single().result?.completion)
         val renamed = repo.vault.committed(child.id).getOrThrow().single()
         assertEquals("after.mkv", renamed.name)
         displayed = listOf(renamed.toFileStat(child.id))
 
         state.moveToTrash(listOf(displayed.single().id))
-        assertEquals(setOf(child.id), edits.works.value.last().command.entries.keys)
-        awaitUntil("子目录归档删除完成") { edits.works.value.size == 2 && edits.works.value.last().result != null }
-        assertEquals(VaultEntryEditCompletion.SUCCEEDED, edits.works.value.last().result?.completion)
+        awaitUntil("子目录归档删除完成") { outcomes.value.size == 2 && outcomes.value.last().result != null }
+        assertEquals(VaultEntryEditCompletion.SUCCEEDED, outcomes.value.last().result?.completion)
         assertTrue(repo.vault.committed(child.id).getOrThrow().isEmpty())
         assertEquals(listOf(rootEntry), repo.vault.committed("").getOrThrow(), "根目录清单不能被子目录操作改写")
     }

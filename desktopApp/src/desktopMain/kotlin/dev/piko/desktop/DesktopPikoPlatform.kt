@@ -1,6 +1,7 @@
 package dev.piko.desktop
 
 import dev.piko.shared.i18n.tr
+import dev.piko.shared.log.PikoLog
 
 import dev.piko.desktop.winrt.WindowsLaunchAtStartup
 import dev.piko.ui.platform.LaunchAtStartup
@@ -12,12 +13,26 @@ import androidx.compose.foundation.lazy.grid.LazyGridState
 import androidx.compose.material3.ColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Modifier
 import dev.piko.data.auth.AppLanguage
 import dev.piko.shared.i18n.PikoLocale
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asComposeImageBitmap
+import coil3.BitmapImage
+import coil3.PlatformContext
+import coil3.SingletonImageLoader
+import coil3.request.CachePolicy
+import coil3.request.ImageRequest
+import coil3.size.Precision
+import dev.piko.ui.screens.clips.BackdropBlurKernel
+import org.jetbrains.skia.Bitmap
+import org.jetbrains.skia.ColorAlphaType
+import org.jetbrains.skia.ColorType
 import org.jetbrains.skia.FontMgr
+import org.jetbrains.skia.ImageInfo
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
@@ -63,7 +78,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.openani.mediamp.compose.MediampPlayerSurface
-import org.openani.mediamp.compose.rememberMediampPlayer
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import org.openani.mediamp.MediampPlayer
 
 /** 存在 settings.properties 里的一个开关，每台设备各自的。 */
 private class StoredToggle(private val settings: DesktopSettingsStore, private val key: String, default: Boolean) : PlatformToggle {
@@ -79,7 +96,7 @@ private class StoredToggle(private val settings: DesktopSettingsStore, private v
 /** 选封面时允许的图片后缀（只用来收窄文件对话框的显示，不做校验）。 */
 private val ImageExtensions = setOf("jpg", "jpeg", "png", "webp", "bmp", "gif", "heic", "avif")
 
-/** 共享界面在 Windows 上的平台能力。 */
+/** 共享界面在 Windows、macOS 与 Linux 上的平台能力实现。 */
 class DesktopPikoPlatform(
     private val settings: DesktopSettingsStore,
     /** 入口传进注入 Recomposer 的那一份（见 Main.kt）；截图与测试不注入，用一份不接系统的。 */
@@ -110,7 +127,7 @@ class DesktopPikoPlatform(
 
     @Composable
     override fun dynamicColorScheme(dark: Boolean): ColorScheme =
-        error(tr("桌面端不支持系统取色，已回退至内置主题", "System colors are unavailable on desktop; falling back to built-in theme", "デスクトップ版はシステムカラーに非対応のため、内蔵テーマを使用します", "데스크톱에서는 시스템 색상을 지원하지 않아 내장 테마를 사용합니다", "桌面版不支援系統取色，已回退至內建主題"))
+        error("Dynamic color scheme is not supported on desktop")
 
     override val supportsBlur: Boolean = true
 
@@ -146,7 +163,7 @@ class DesktopPikoPlatform(
 
     /**
      * 系统的保存框，默认放在下载目录。Windows 上用原生保存框，放在单独的线程上：AWT 的 FileDialog
-     * 会让界面在对话框开着时停止重绘，见 SaveFilePicker。原生框弹不出来与 macOS 上才用 FileDialog。
+     * 会让界面在对话框开着时停止重绘，见 SaveFilePicker。原生框不可用或 macOS / Linux 上才用 FileDialog。
      */
     override suspend fun exportLog(fileName: String, content: String): Boolean {
         val owner = activeWindow()
@@ -154,16 +171,81 @@ class DesktopPikoPlatform(
             val picked = SaveFilePicker.pickSaveFile(owner, settings.downloadDirectory, fileName, tr("导出日志", "Export logs", "ログをエクスポート", "로그 내보내기", "匯出日誌"), tr("文本文件", "Text files", "テキストファイル", "텍스트 파일", "文字檔案"), "*.txt")
         ) {
             is FolderPickResult.Picked -> picked.folder
-            FolderPickResult.Cancelled -> return false
-            FolderPickResult.Unavailable -> AwtDialogs.chooseSaveFile(owner, tr("导出日志", "Export logs", "ログをエクスポート", "로그 내보내기", "匯出日誌"), settings.downloadDirectory, fileName) ?: return false
+            FolderPickResult.Cancelled -> return true
+            FolderPickResult.Unavailable -> AwtDialogs.chooseSaveFile(owner, tr("导出日志", "Export logs", "ログをエクスポート", "로그 내보내기", "匯出日誌"), settings.downloadDirectory, fileName) ?: return true
         }
-        return withContext(Dispatchers.IO) { runCatching { target.writeText(content) }.isSuccess }
+        return withContext(Dispatchers.IO) {
+            runCatching { target.writeText(content) }
+                .onFailure { PikoLog.w("Platform", "Failed to write exported log file", it) }
+                .isSuccess
+        }
     }
 
     override fun openUrl(url: String) = if (isLinux) LinuxDesktop.open(url) else WinRTSupport.openUrl(url)
 
     @Composable
+    override fun ProvideLocalizedEnvironment(
+        language: AppLanguage,
+        content: @Composable () -> Unit,
+    ) {
+        val locale = remember(language) { java.util.Locale.forLanguageTag(language.tag) }
+        if (java.util.Locale.getDefault() != locale) {
+            java.util.Locale.setDefault(locale)
+        }
+        key(language) {
+            content()
+        }
+    }
+
+    @Composable
     override fun isImeVisible(): Boolean = false
+
+    override suspend fun loadPreblurredBackdrop(
+        model: Any,
+        containerWidthPx: Int,
+        containerHeightPx: Int,
+        targetBlurPx: Float,
+    ): ImageBitmap? = withContext(Dispatchers.Default) {
+        runCatching {
+            val request = ImageRequest.Builder(PlatformContext.INSTANCE)
+                .data(model)
+                .size(BackdropBlurKernel.DECODE_MAX_SIDE_PX)
+                .precision(Precision.INEXACT)
+                .memoryCachePolicy(CachePolicy.DISABLED)
+                .build()
+            val skiaBitmap = (SingletonImageLoader.get(PlatformContext.INSTANCE).execute(request).image as? BitmapImage)?.bitmap
+                ?: return@runCatching null
+            val w = skiaBitmap.width
+            val h = skiaBitmap.height
+            if (w <= 0 || h <= 0) return@runCatching null
+            val info = ImageInfo(w, h, ColorType.BGRA_8888, ColorAlphaType.UNPREMUL)
+            val rawBytes = skiaBitmap.readPixels(info, w * 4, 0, 0) ?: return@runCatching null
+            val argb = IntArray(w * h) { idx ->
+                val o = idx * 4
+                val b = rawBytes[o].toInt() and 0xFF
+                val g = rawBytes[o + 1].toInt() and 0xFF
+                val r = rawBytes[o + 2].toInt() and 0xFF
+                val a = rawBytes[o + 3].toInt() and 0xFF
+                (a shl 24) or (r shl 16) or (g shl 8) or b
+            }
+            val radius = BackdropBlurKernel.equivalentRadiusPx(w, h, containerWidthPx, containerHeightPx, targetBlurPx)
+            val blurred = BackdropBlurKernel.blurArgb(argb, w, h, radius)
+            val outBytes = ByteArray(w * h * 4)
+            for (idx in blurred.indices) {
+                val c = blurred[idx]
+                val o = idx * 4
+                outBytes[o] = (c and 0xFF).toByte()
+                outBytes[o + 1] = ((c ushr 8) and 0xFF).toByte()
+                outBytes[o + 2] = ((c ushr 16) and 0xFF).toByte()
+                outBytes[o + 3] = ((c ushr 24) and 0xFF).toByte()
+            }
+            val outBitmap = Bitmap()
+            outBitmap.allocPixels(info)
+            outBitmap.installPixels(info, outBytes, w * 4)
+            outBitmap.setImmutable()
+            outBitmap.asComposeImageBitmap()
+        }.getOrNull()
+    }
 
     override fun readClipboardText(): String? = runCatching {
         Toolkit.getDefaultToolkit().systemClipboard.getData(DataFlavor.stringFlavor) as? String
@@ -301,8 +383,7 @@ class DesktopPikoPlatform(
         else -> null
     }
 
-    // macOS 按 Info.plist 的 CFBundleURLTypes 自动列为候选，改默认要调已弃用的 LaunchServices 接口，
-    // 包又没有签名，不给入口。开发版与便携版由 state 报 Unavailable，设置页同样不显示
+    // macOS 经 NSWorkspace.setDefaultApplicationAtURL 设默认应用；开发版与便携版由 state 报 Unavailable，设置页不显示入口
     override val linkAssociation: LinkAssociation? = when {
         WinRTSupport.isWindows -> WindowsLinkAssociation
         isMacOs -> MacLinkAssociation
@@ -318,16 +399,21 @@ class DesktopPikoPlatform(
     override val videoPreview: VideoPreviewSupport = object : VideoPreviewSupport {
         @Composable
         override fun rememberPreviewBackend(keyframeStart: Boolean): PreviewBackend {
-            val scope = rememberCoroutineScope()
             BundledMpvRuntime.ensure()
-            val player = rememberMediampPlayer()
+            val playerJob = remember { SupervisorJob() }
+            val playerScope = remember(playerJob) { CoroutineScope(Dispatchers.Main.immediate + playerJob) }
+            val player = remember(playerScope) { MediampPlayer(Unit, playerScope.coroutineContext) }
             val preferences = LocalPikoServices.current.preferences
             val backend = remember(player) {
                 // 偏好是 StateFlow，first() 当场返回
                 val hardwareDecoding = runBlocking { preferences.hardwareDecodingFlow.first() }
-                MediampPreviewBackend(MediampPlaybackBackend(player, scope, preview = true, keyframeStart = keyframeStart, hardwareDecoding = hardwareDecoding))
+                MediampPreviewBackend(MediampPlaybackBackend(player, playerScope, preview = true, keyframeStart = keyframeStart, hardwareDecoding = hardwareDecoding)) {
+                    playerJob.cancel()
+                    CoroutineScope(Dispatchers.IO).launch {
+                        runCatching { player.close() }.onFailure { PikoLog.w("Player", "Failed to close preview player", it) }
+                    }
+                }
             }
-            DisposableEffect(player) { onDispose { player.close() } }
             return backend
         }
 
@@ -357,9 +443,15 @@ class DesktopPikoPlatform(
     override fun ListScrollbar(state: LazyGridState, modifier: Modifier) =
         dev.piko.desktop.ListScrollbar(state, modifier)
 
-    private class MediampPreviewBackend(val inner: MediampPlaybackBackend) : PreviewBackend, PlaybackBackend by inner {
-        // 播放器本身由 rememberPreviewBackend 在离开组合时关闭，这里只停播
-        override fun release() = inner.stop()
+    private class MediampPreviewBackend(val inner: MediampPlaybackBackend, private val dispose: () -> Unit) : PreviewBackend, PlaybackBackend by inner {
+        private var released = false
+        override fun release() {
+            if (released) return
+            released = true
+            inner.stop()
+            inner.markClosing()
+            dispose()
+        }
 
         override fun setBufferAhead(seconds: Int) = inner.setBufferAhead(seconds)
 
@@ -370,7 +462,7 @@ class DesktopPikoPlatform(
 /** 点击发生在哪个窗口，对话框就模态于哪个窗口。要在点击的当下取，launch 之后焦点可能已经变了。 */
 private fun activeWindow(): Window? = KeyboardFocusManager.getCurrentKeyboardFocusManager().activeWindow
 
-/** 系统目录框。Windows 用原生框，弹不出来与 macOS 上走 [AwtDialogs]。取消时为 null。 */
+/** 系统目录框。Windows 用原生框，不可用或 macOS / Linux 上走 [AwtDialogs]。取消时为 null。 */
 private suspend fun pickFolder(owner: Window?, initial: File?, title: String): File? {
     if (isMacOs) return AwtDialogs.chooseDirectory(owner, initial, title)
     return when (val result = FolderPicker.pickFolder(owner, initial, title)) {
@@ -380,7 +472,7 @@ private suspend fun pickFolder(owner: Window?, initial: File?, title: String): F
     }
 }
 
-internal fun desktopPrimaryFontCandidates(
+private fun desktopPrimaryFontCandidates(
     isMacOs: Boolean,
     isLinux: Boolean,
     effectiveLanguage: AppLanguage,

@@ -15,9 +15,18 @@ internal class OpenResponse(val socket: Socket, val status: Int, val headers: Ma
     val body: InputStream get() = socket.getInputStream()
 }
 
-internal fun openRequest(url: String, method: String = "GET", range: String? = null): OpenResponse {
+internal fun openRequest(
+    url: String,
+    method: String = "GET",
+    range: String? = null,
+    receiveBufferSize: Int? = null,
+): OpenResponse {
     val uri = URI(url)
-    val socket = Socket(uri.host, uri.port)
+    val socket = Socket()
+    if (receiveBufferSize != null) {
+        socket.receiveBufferSize = receiveBufferSize
+    }
+    socket.connect(java.net.InetSocketAddress(uri.host, uri.port))
     val request = buildString {
         append("$method ${uri.rawPath} HTTP/1.1\r\nHost: ${uri.host}\r\nConnection: close\r\n")
         if (range != null) append("Range: $range\r\n")
@@ -43,7 +52,12 @@ internal fun request(url: String, method: String = "GET", range: String? = null)
     val open = openRequest(url, method, range)
     open.socket.use {
         val length = if (method == "HEAD") 0 else open.headers["content-length"]?.toInt() ?: 0
-        return HttpResponse(open.status, open.headers, open.body.readNBytes(length))
+        val body = open.body.readNBytes(length)
+        if (method != "HEAD") {
+            // 等待服务端 Connection: close 的 FIN（在 session.stream 的 finally 释放票据之后发出）
+            open.body.read()
+        }
+        return HttpResponse(open.status, open.headers, body)
     }
 }
 

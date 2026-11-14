@@ -32,6 +32,12 @@ sealed interface Screen : NavKey {
     data object MyShares : Screen
 
     @Serializable
+    data class SpaceMap(
+        val rootFolderId: String = "",
+        val rootFolderName: String = "",
+    ) : Screen
+
+    @Serializable
     data class Library(val libraryId: String) : Screen
 
     /** 海报墙的根：扫描目录、按番号收的作品网格。 */

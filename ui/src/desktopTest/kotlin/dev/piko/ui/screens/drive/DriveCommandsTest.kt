@@ -1,9 +1,16 @@
 package dev.piko.ui.screens.drive
 
 import androidx.compose.ui.unit.dp
+import dev.piko.shared.data.ArchiveEntryId
+import dev.piko.shared.data.ImportPreviewLocation
+import dev.piko.shared.data.LocalLocation
 import dev.piko.ui.adaptive.WidthClass
+import io.github.nihildigit.pikpak.FileKind
+import io.github.nihildigit.pikpak.FileStat
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertTrue
 
 class DriveCommandsTest {
     @Test
@@ -45,10 +52,6 @@ class DriveCommandsTest {
         nameParsing = nameParsing,
     )
 
-    /**
-     * 查找重复与按番号规范命名作用于眼前这个目录的子树，窄窗口统一放在浏览顶栏的「更多」里。搜索结果、库、回收站、
-     * 压缩包里没有一个能扫的目录，给了就扫到别处去；关了文件名解析认不出番号，规范命名扫出来必然是空的。
-     */
     @Test
     fun `place commands only in a real folder and naming follows the parser switch`() {
         val folders = setOf(CommandPlace.ROOT, CommandPlace.FOLDER)
@@ -69,15 +72,14 @@ class DriveCommandsTest {
             assertEquals(idle.copy(create = false, selectAll = selecting.selectAll, gallery = false, feed = false), selecting, "$place")
         }
     }
+
     @Test
     fun `selected videos open a fixed feed from browsable places`() {
         val nonFeedPlaces = setOf(CommandPlace.TRASH, CommandPlace.ARCHIVE, CommandPlace.IMPORT_PREVIEW)
         for (place in CommandPlace.entries) {
             val selected = inputs(place, selecting = true, selectedVideoCount = 2)
-            assertEquals(place !in nonFeedPlaces,
-                driveCommands(selected).gallery, "$place")
-            assertEquals(place !in nonFeedPlaces,
-                driveCommands(selected).feed, "$place")
+            assertEquals(place !in nonFeedPlaces, driveCommands(selected).gallery, "$place")
+            assertEquals(place !in nonFeedPlaces, driveCommands(selected).feed, "$place")
             assertEquals(false, driveCommands(inputs(place, selecting = true, selectedVideoCount = 2, feedSupported = false)).feed)
             assertEquals(false, driveCommands(inputs(place, selecting = true)).gallery)
             assertEquals(false, driveCommands(inputs(place, selecting = true)).feed)
@@ -108,4 +110,76 @@ class DriveCommandsTest {
         }
     }
 
+    @Test
+    fun `viewSpaceMap is enabled only for a single real cloud folder`() {
+        val cloudFolder = FileStat(kind = FileKind.FOLDER, id = "cloud-folder-1", name = "Movies")
+        val cloudFile = FileStat(kind = FileKind.FILE, id = "cloud-file-1", name = "movie.mkv")
+        val localFolder = FileStat(kind = FileKind.FOLDER, id = LocalLocation("mount-1").id, name = "Local")
+        val archiveFolder = FileStat(kind = FileKind.FOLDER, id = ArchiveEntryId.of("arc", "", 0, "sub"), name = "Sub")
+        val importFolder = FileStat(kind = FileKind.FOLDER, id = ImportPreviewLocation("root", "sub").id, name = "Preview")
+
+        assertTrue(itemCommands(CommandPlace.ROOT, listOf(cloudFolder)).viewSpaceMap)
+        assertTrue(itemCommands(CommandPlace.FOLDER, listOf(cloudFolder)).viewSpaceMap)
+        assertTrue(itemCommands(CommandPlace.SEARCH, listOf(cloudFolder)).viewSpaceMap)
+        assertTrue(itemCommands(CommandPlace.LIBRARY, listOf(cloudFolder)).viewSpaceMap)
+
+        assertFalse(itemCommands(CommandPlace.FOLDER, listOf(cloudFile)).viewSpaceMap)
+        assertFalse(itemCommands(CommandPlace.FOLDER, listOf(cloudFolder, cloudFile)).viewSpaceMap)
+        assertFalse(itemCommands(CommandPlace.TRASH, listOf(cloudFolder)).viewSpaceMap)
+        assertFalse(itemCommands(CommandPlace.ARCHIVE, listOf(cloudFolder)).viewSpaceMap)
+        assertFalse(itemCommands(CommandPlace.ARCHIVE, listOf(archiveFolder)).viewSpaceMap)
+        assertFalse(itemCommands(CommandPlace.LOCAL, listOf(localFolder)).viewSpaceMap)
+        assertFalse(itemCommands(CommandPlace.FOLDER, listOf(localFolder)).viewSpaceMap)
+        assertFalse(itemCommands(CommandPlace.IMPORT_PREVIEW, listOf(importFolder)).viewSpaceMap)
+        assertFalse(itemCommands(CommandPlace.FOLDER, listOf(importFolder)).viewSpaceMap)
+    }
+
+    @Test
+    fun `mounted roots nested files and mixed selections never expose cloud writes while keeping read-only tools`() {
+        val root = FileStat(id = LocalLocation("mount-1").id, kind = FileKind.FOLDER, name = "Local")
+        val video = FileStat(id = LocalLocation("mount-1", listOf("movie.mkv"), false).id, name = "movie.mkv")
+        val cloud = FileStat(id = "cloud", name = "cloud.mkv")
+        for (place in listOf(CommandPlace.ROOT, CommandPlace.FOLDER, CommandPlace.LOCAL, CommandPlace.SEARCH)) {
+            for (targets in listOf(listOf(root), listOf(video), listOf(root, cloud), listOf(video, cloud))) {
+                val commands = itemCommands(place, targets)
+                assertFalse(commands.cutCopy)
+                assertFalse(commands.rename)
+                assertFalse(commands.share)
+                assertFalse(commands.moveToTrash)
+                assertFalse(commands.restoreOrDelete)
+                assertFalse(commands.moveCopyTo)
+                assertFalse(commands.download)
+                assertFalse(commands.downloadAtQuality)
+                assertFalse(commands.extract)
+                assertFalse(commands.removeRecord)
+                assertFalse(commands.vault)
+                assertFalse(commands.unvault)
+            }
+        }
+        val local = driveCommands(CommandInputs(CommandPlace.LOCAL, false, false, true, 5, false, 2, false, true, true))
+        assertFalse(local.create)
+        assertFalse(local.paste)
+        assertFalse(local.addLink)
+        assertFalse(local.canonicalNaming)
+        assertFalse(local.findDuplicates)
+        assertTrue(local.sort)
+        assertTrue(local.filter)
+        assertTrue(local.gallery)
+        assertTrue(local.feed)
+    }
+
+    @Test
+    fun `fully vaulted selection hides archive only when every target is a full folder`() {
+        val full = FileStat(kind = FileKind.FOLDER, id = "full", name = "full")
+        val partial = FileStat(kind = FileKind.FOLDER, id = "partial", name = "partial")
+        val file = FileStat(kind = FileKind.FILE, id = "file", name = "file")
+        val fullIds = setOf(full.id)
+        val allowed = setOf(CommandPlace.ROOT, CommandPlace.FOLDER, CommandPlace.SEARCH)
+        for (place in CommandPlace.entries) {
+            assertFalse(itemCommands(place, listOf(full), fullIds).vault, "$place")
+            assertEquals(place in allowed, itemCommands(place, listOf(full), fullIds).unvault, "$place")
+            assertEquals(place in allowed, itemCommands(place, listOf(full, partial), fullIds).vault, "$place")
+            assertEquals(place in allowed, itemCommands(place, listOf(full, file), fullIds).vault, "$place")
+        }
+    }
 }

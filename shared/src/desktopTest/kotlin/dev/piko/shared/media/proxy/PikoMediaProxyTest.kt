@@ -2,27 +2,145 @@ package dev.piko.shared.media.proxy
 
 import dev.piko.shared.media.testing.openRequest
 import dev.piko.shared.media.testing.request
+import io.github.nihildigit.pikpak.ReadEndReason
+import io.github.nihildigit.pikpak.ReadTicket
+import io.github.nihildigit.pikpak.StreamRole
+import io.github.nihildigit.pikpak.TransferDemand
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 /**
- * 代理协议层的冒烟：起真实的回环代理，用原始 socket 发请求。
- *
- * 数据源的 reader 会检测自己被并发调用：SDK 的 reader 一个读位置一个调用方，被并发调用时不会报错，
- * 只会悄悄交出错位的字节，所以每个请求用各自的 reader 这一点只能在这里抓。
+ * 代理协议层的冒烟：起真实的回环代理，用原始 socket 发请求，并核对每条 HTTP 请求与独立 [ReadTicket] 生命周期的零延迟解耦。
  */
 class PikoMediaProxyTest {
     private val proxy = PikoMediaProxy()
 
     @AfterTest
     fun tearDown() = proxy.close()
+
+    @Test
+    fun eachStreamOpensBoundedReadTicketAndEndsImmediatelyWithoutGraceTimer() = runBlocking {
+        val source = FakeSource(8L * 1024 * 1024)
+        val demand = TransferDemand()
+        val session = ProxySession(source, demand = demand)
+        try {
+            session.stream(4096L, 12_288L) { bytes, offset, count ->
+                assertEquals(1, source.activeTickets.get())
+                assertContentEquals(source.expected(4096L, 4096L + count), bytes.copyOfRange(offset, offset + count))
+            }
+            // 请求完成当即释放票据（无 1500ms 延迟），但会话级 TransferDemand 保持打开
+            assertEquals(0, source.activeTickets.get())
+            assertFalse(demand.isClosed)
+            val recorded = source.ticketHistory.single()
+            assertSame(demand, recorded.owner)
+            assertEquals(4096L, recorded.startOffset)
+            assertEquals(12_288L, recorded.endExclusive)
+            assertEquals(ReadEndReason.RangeCompleted, recorded.endReason)
+            assertEquals(true, recorded.allowFinishInFlightOnEnd)
+
+            session.stream(2L * 1024 * 1024, 2L * 1024 * 1024 + 2048L) { _, _, _ ->
+                assertEquals(1, source.activeTickets.get())
+                // 会话内 seek 推进 epoch 时不断开当前流；ProxySession 纯粹上报协议层 RangeCompleted 事实，由底层缓存按 epoch 决定收尾策略
+                demand.updateIntent { it.copy(epoch = it.epoch + 1L) }
+            }
+            assertEquals(0, source.activeTickets.get())
+            assertEquals(2, source.ticketHistory.size)
+            assertEquals(ReadEndReason.RangeCompleted, source.ticketHistory.last().endReason)
+            assertFalse(demand.isClosed)
+
+            assertFailsWith<ProxySession.ClientGone> {
+                session.stream(3L * 1024 * 1024, 3L * 1024 * 1024 + 64L * 1024L) { _, _, _ ->
+                    throw IllegalStateException("simulated socket write failure")
+                }
+            }
+            assertEquals(ReadEndReason.ConsumerClosed, source.ticketHistory.last().endReason)
+
+            val sinkEntered = CompletableDeferred<Unit>()
+            val holdSink = CompletableDeferred<Unit>()
+            val cancelledJob = async {
+                session.stream(4L * 1024 * 1024, 4L * 1024 * 1024 + 64L * 1024L) { _, _, _ ->
+                    sinkEntered.complete(Unit)
+                    holdSink.await()
+                }
+            }
+            withTimeout(5_000) { sinkEntered.await() }
+            cancelledJob.cancelAndJoin()
+            assertEquals(ReadEndReason.Cancelled, source.ticketHistory.last().endReason)
+            assertFalse(demand.isClosed)
+        } finally {
+            session.close()
+        }
+        assertTrue(demand.isClosed)
+    }
+
+    @Test
+    fun withdrawTransportEndsActiveTicketsWithoutFinishInFlightAndKeepsUrlUntilClose() = runBlocking {
+        val source = FakeSource(2L * 1024 * 1024)
+        val demand = TransferDemand()
+        val stream = proxy.register(source, "movie.mp4", demand)
+        val enteredRead = CompletableDeferred<Unit>()
+        val unblockSink = CompletableDeferred<Unit>()
+        source.onTicketRead = {
+            enteredRead.complete(Unit)
+        }
+
+        val inFlight = async {
+            stream.session.stream(0L, 512L * 1024L) { _, _, _ ->
+                enteredRead.complete(Unit)
+                unblockSink.await()
+            }
+        }
+        withTimeout(5_000) { enteredRead.await() }
+        assertEquals(1, source.activeTickets.get())
+
+        stream.withdrawTransport()
+        assertEquals(0, source.activeTickets.get(), "withdrawTransport 必须立即撤销在途 ReadTicket")
+        assertEquals(ReadEndReason.Cancelled, source.ticketHistory.single().endReason)
+        assertEquals(false, source.ticketHistory.single().allowFinishInFlightOnEnd)
+        assertTrue(demand.isClosed)
+        assertEquals(200, request(stream.url, "HEAD").status)
+        assertEquals(503, request(stream.url).status)
+        assertFalse(source.closed)
+
+        unblockSink.complete(Unit)
+        runCatching { inFlight.await() }
+
+        stream.close()
+        assertEquals(404, request(stream.url).status)
+        assertTrue(source.closed)
+    }
+
+    @Test
+    fun sourceFailureEndsTicketWithAllowFinishInFlightFalse() = runBlocking {
+        val source = FakeSource(64L * 1024L).apply { failReads = true }
+        val session = ProxySession(source)
+        try {
+            assertFailsWith<IllegalStateException> {
+                session.stream(0L, 4096L) { _, _, _ -> }
+            }
+            assertEquals(0, source.activeTickets.get())
+            assertEquals(ReadEndReason.SourceFailed, source.ticketHistory.single().endReason)
+            assertEquals(false, source.ticketHistory.single().allowFinishInFlightOnEnd)
+        } finally {
+            session.close()
+        }
+    }
 
     @Test
     fun servesRangesWithCorrectHeadersAndBytes() = runBlocking {
@@ -58,12 +176,12 @@ class PikoMediaProxyTest {
         assertEquals("1000000", head.headers["content-length"])
 
         assertEquals(0, source.concurrencyViolations.get())
+        assertEquals(0, source.activeTickets.get())
     }
 
-    // 交错得不好的 MP4 一直在两处来回读，一个请求掐断另一个，两边都读不完
+    // 交错得不好的 MP4 一直在两处来回读，一个请求不能掐断另一个
     @Test
     fun overlappingRequestsAreServedSideBySide() = runBlocking {
-        // 读得慢，保证第一个请求在第二个到来时还在读
         val source = FakeSource(size = 16 * 1024 * 1024, readDelayMillis = 5)
         val url = proxy.register(source, "movie.mp4").url
 
@@ -78,30 +196,31 @@ class PikoMediaProxyTest {
         assertContentEquals(source.expected(100_000, 1_000_000), rest, "the earlier request was cut off")
         first.socket.close()
 
-        assertEquals(0, source.concurrencyViolations.get(), "one reader was used by two requests")
+        assertEquals(0, source.concurrencyViolations.get(), "one ticket was used concurrently by two requests")
     }
 
     @Test
-    fun clientDisconnectReleasesTheReaderForTheNextRequest() = runBlocking {
+    fun clientDisconnectReleasesTheTicketForTheNextRequest() = runBlocking {
         val source = FakeSource(size = 16 * 1024 * 1024, readDelayMillis = 5)
         val url = proxy.register(source, "movie.mp4").url
 
         val dropped = openRequest(url, range = "bytes=0-")
         dropped.body.readNBytes(50_000)
         dropped.socket.close()
-        // 断开之后读端的看门协程应当取消响应，reader 上不再有人读
+        // 断开之后读端的看门协程应当取消响应，票据立即以 ConsumerClosed 结束，不再有人读
         withTimeout(5_000) {
-            while (source.activeReads.get() > 0) delay(10)
+            while (source.activeReads.get() > 0 || source.activeTickets.get() > 0) delay(10)
         }
+        assertEquals(ReadEndReason.ConsumerClosed, source.ticketHistory.first().endReason)
 
         val next = request(url, range = "bytes=100-199")
         assertContentEquals(source.expected(100, 200), next.body)
         assertEquals(0, source.concurrencyViolations.get())
+        assertEquals(0, source.activeTickets.get())
     }
 
-    // 错一个偏移，播放器拿到的是另一处的字节，TS 照样能解，只是画面不在该在的时刻
     @Test
-    fun aSliceServesItsWindowAsAWholeFile() = runBlocking {
+    fun aSliceServesItsWindowAsAWholeFileAndTranslatesBoundedTicketOffsets() = runBlocking {
         val source = FakeSource(size = 1_000_000)
         val url = proxy.register(SlicedByteSource(source, offset = 300_000, size = 200_000), "clip.ts").url
 
@@ -112,32 +231,50 @@ class PikoMediaProxyTest {
         val tail = request(url, range = "bytes=199000-")
         assertEquals("bytes 199000-199999/200000", tail.headers["content-range"])
         assertContentEquals(source.expected(499_000, 500_000), tail.body)
+
+        assertEquals(0, source.activeTickets.get())
+        val firstTicket = source.ticketHistory[0]
+        assertEquals(300_000L, firstTicket.startOffset)
+        assertEquals(500_000L, firstTicket.endExclusive)
+        val tailTicket = source.ticketHistory[1]
+        assertEquals(499_000L, tailTicket.startOffset)
+        assertEquals(500_000L, tailTicket.endExclusive)
     }
 
     @Test
-    fun sequentialAndInterleavedShortRangesReusePooledReadersWithoutExtraSeeks() = runBlocking {
+    fun overlappingDistantRequestsUseIndependentTicketsAndReleaseIndependently() = runBlocking {
         val source = FakeSource(size = 32 * 1024 * 1024)
-        val url = proxy.register(source, "interleaved.mp4").url
+        val session = ProxySession(source)
+        val firstEntered = CompletableDeferred<Unit>()
+        val finishFirst = CompletableDeferred<Unit>()
+        try {
+            val first = async {
+                session.stream(1_000_000L, 1_004_096L) { _, _, _ ->
+                    firstEntered.complete(Unit)
+                    finishFirst.await()
+                }
+            }
+            withTimeout(5_000) { firstEntered.await() }
+            session.stream(16_000_000L, 16_004_096L) { bytes, offset, count ->
+                assertEquals(2, source.activeTickets.get())
+                assertContentEquals(source.expected(16_000_000L, 16_004_096L), bytes.copyOfRange(offset, offset + count))
+            }
+            assertEquals(1, source.activeTickets.get())
 
-        // 模拟交错不良的 MP4 在视频轨（1 MiB 起）与音轨（16 MiB 起）之间交替发短 Range 请求
-        var videoPos = 1_000_000L
-        var audioPos = 16_000_000L
-        repeat(10) {
-            val vChunk = request(url, range = "bytes=$videoPos-${videoPos + 16_383}")
-            assertEquals(206, vChunk.status)
-            assertContentEquals(source.expected(videoPos, videoPos + 16_384), vChunk.body)
-            videoPos += 16_384
+            session.stream(16_004_096L, 16_008_192L) { bytes, offset, count ->
+                assertEquals(1 + 1, source.activeTickets.get())
+                assertContentEquals(source.expected(16_004_096L, 16_008_192L), bytes.copyOfRange(offset, offset + count))
+            }
+            assertEquals(1, source.activeTickets.get())
 
-            val aChunk = request(url, range = "bytes=$audioPos-${audioPos + 4_095}")
-            assertEquals(206, aChunk.status)
-            assertContentEquals(source.expected(audioPos, audioPos + 4_096), aChunk.body)
-            audioPos += 4_096
+            finishFirst.complete(Unit)
+            first.await()
+            assertEquals(0, source.activeTickets.get())
+            assertEquals(0, source.concurrencyViolations.get())
+        } finally {
+            finishFirst.complete(Unit)
+            session.close()
         }
-
-        // 20 个交替短请求只应建起视频、音频两个游标，且各自仅首次定位一次，后续全部原地零 seek 接续
-        assertEquals(2, source.openedReaders.get(), "openedReaders=${source.openedReaders.get()}")
-        assertEquals(2, source.seekCalls.get(), "seekCalls=${source.seekCalls.get()}")
-        assertEquals(0, source.concurrencyViolations.get())
     }
 
     @Test
@@ -149,19 +286,33 @@ class PikoMediaProxyTest {
         assertTrue(source.closed)
     }
 
-    /**
-     * 内容可预测的来源。每个 reader 在自己的调用重叠时记一次违规，模拟 SDK reader 的单调用方约束。
-     */
+    private class RecordedTicket(
+        val owner: TransferDemand,
+        val startOffset: Long,
+        val endExclusive: Long,
+    ) {
+        @Volatile
+        var endReason: ReadEndReason? = null
+
+        val allowFinishInFlightOnEnd: Boolean?
+            get() = endReason?.allowsFinishInFlight
+    }
+
     private class FakeSource(
         override val size: Long,
         private val readDelayMillis: Long = 0,
     ) : ProxyByteSource {
         val concurrencyViolations = AtomicInteger(0)
-        val openedReaders = AtomicInteger(0)
-        val seekCalls = AtomicInteger(0)
-
-        /** 所有 reader 上正在进行的读。 */
+        val activeTickets = AtomicInteger(0)
         val activeReads = AtomicInteger(0)
+        val prefetchCalls = AtomicInteger(0)
+        val ticketHistory = CopyOnWriteArrayList<RecordedTicket>()
+
+        @Volatile
+        var failReads = false
+
+        @Volatile
+        var onTicketRead: (() -> Unit)? = null
 
         @Volatile
         var closed = false
@@ -169,23 +320,67 @@ class PikoMediaProxyTest {
         fun expected(start: Long, endExclusive: Long) =
             ByteArray((endExclusive - start).toInt()) { byteAt(start + it) }
 
-        override suspend fun openReader(): ProxyReader {
-            openedReaders.incrementAndGet()
-            return FakeReader()
+        override suspend fun prefetch(ranges: List<LongRange>, role: StreamRole, priority: Int?): Deferred<Unit> {
+            prefetchCalls.incrementAndGet()
+            return CompletableDeferred(Unit)
         }
 
-        override fun close() {
-            closed = true
+        override fun beginRead(owner: TransferDemand, startOffset: Long, endExclusive: Long): ReadTicket {
+            val clampedStart = startOffset.coerceIn(0L, size)
+            val clampedEnd = endExclusive.coerceIn(clampedStart, size)
+            val record = RecordedTicket(owner, clampedStart, clampedEnd)
+            ticketHistory.add(record)
+            activeTickets.incrementAndGet()
+            return object : ReadTicket {
+                private val ownReads = AtomicInteger(0)
+                private val ended = AtomicInteger(0)
+
+                override val owner: TransferDemand = owner
+                override val epoch: Long = owner.intent.epoch
+                override val startOffset: Long = clampedStart
+                override val endExclusive: Long = clampedEnd
+
+                @Volatile
+                override var position: Long = clampedStart
+                    private set
+
+                override suspend fun readSome(buffer: ByteArray, offset: Int, length: Int): Int {
+                    if (ended.get() != 0 || owner.isClosed) throw CancellationException("ticket closed")
+                    if (ownReads.incrementAndGet() > 1) concurrencyViolations.incrementAndGet()
+                    activeReads.incrementAndGet()
+                    try {
+                        onTicketRead?.invoke()
+                        if (readDelayMillis > 0) delay(readDelayMillis)
+                        if (ended.get() != 0 || owner.isClosed) throw CancellationException("ticket closed")
+                        if (failReads) throw IllegalStateException("simulated upstream read error")
+                        val remaining = endExclusive - position
+                        if (remaining <= 0L) return -1
+                        if (length == 0) return 0
+                        val count = minOf(length.toLong(), remaining, 64L * 1024L).toInt()
+                        for (i in 0 until count) buffer[offset + i] = byteAt(position + i)
+                        position += count
+                        return count
+                    } finally {
+                        activeReads.decrementAndGet()
+                        ownReads.decrementAndGet()
+                    }
+                }
+
+                override fun endRead(reason: ReadEndReason) {
+                    if (ended.compareAndSet(0, 1)) {
+                        record.endReason = reason
+                        activeTickets.decrementAndGet()
+                    }
+                }
+            }
         }
 
-        private inner class FakeReader : ProxyReader {
+        override suspend fun openReader(): ProxyReader = object : ProxyReader {
             private val ownReads = AtomicInteger(0)
-
             override var position = 0L
                 private set
 
             override suspend fun seekTo(position: Long) {
-                seekCalls.incrementAndGet()
                 this.position = position
             }
 
@@ -194,8 +389,9 @@ class PikoMediaProxyTest {
                 activeReads.incrementAndGet()
                 try {
                     if (readDelayMillis > 0) delay(readDelayMillis)
+                    if (failReads) throw IllegalStateException("simulated upstream read error")
                     if (position >= size) return -1
-                    val count = minOf(length.toLong(), size - position, 64L * 1024).toInt()
+                    val count = minOf(length.toLong(), size - position, 64L * 1024L).toInt()
                     for (i in 0 until count) buffer[offset + i] = byteAt(position + i)
                     position += count
                     return count
@@ -206,6 +402,10 @@ class PikoMediaProxyTest {
             }
 
             override fun close() = Unit
+        }
+
+        override fun close() {
+            closed = true
         }
 
         private fun byteAt(position: Long): Byte = (position % 251).toByte()

@@ -92,6 +92,30 @@ class PlayerScreenStateSmokeTest {
     }
 
     @Test
+    fun unverifiedInitialSeekNearZeroDoesNotClobberSavedResumePosition() = runBlocking {
+        positions.saved["f1"] = 8_185_177L
+        val state = newState()
+
+        val opened = backend.awaitOpens(1).single()
+        assertEquals(8_185_177L, opened.startMillis)
+
+        // 模拟容器尾部索引读取失败：后端丢失初始 seek，duration=0 并从 0:00 附近输出前几秒画面
+        backend.emit(PlaybackBackendEvent.Ready)
+        backend.progress(positionMillis = 6_260L, durationMillis = 0L)
+
+        // 此时切档或重连仍须携带原续播点，离开播放器也绝不能用 6_260 ms 覆盖 8_185_177 ms
+        withContext(stateThread) { state.retry() }
+        val retried = backend.awaitOpens(2)[1]
+        assertEquals(8_185_177L, retried.startMillis)
+
+        backend.emit(PlaybackBackendEvent.Ready)
+        backend.progress(positionMillis = 6_260L, durationMillis = 0L)
+        leavePlayer(state)
+
+        assertEquals(8_185_177L, positions.saved["f1"])
+    }
+
+    @Test
     fun endOfFileResetsTheResumePosition() = runBlocking {
         positions.saved["f1"] = 120_000L
         val state = newState()
@@ -185,6 +209,8 @@ class PlayerScreenStateSmokeTest {
             }.useCode()
         }
         assertEquals(200, statusDuringDrain, "后端尚未完成停止排空前代理会话不应提前关闭")
+        assertEquals(503, dev.piko.shared.media.testing.request(proxyUrl).status,
+            "排空之前应已撤回传输需求，但不能注销 URL")
 
         drainGate.complete(Unit)
         eventually("后端排空完成后代理会话关闭并返回 404") {
@@ -221,6 +247,9 @@ class PlayerScreenStateSmokeTest {
         // 排空尚未结束时立即触发下一次 reload（取消上一轮 prepareJob），旧代理流必须在 finally 中安全关闭，绝不泄漏
         blockNextStop = false
         withContext(stateThread) { state.retry() }
+        assertEquals(200, dev.piko.shared.media.testing.request(firstProxyUrl, "HEAD").status)
+        assertEquals(503, dev.piko.shared.media.testing.request(firstProxyUrl).status)
+        drainBlock.complete(Unit)
         eventually("取消排空后旧代理会话仍被可靠关闭并返回 404") {
             val code = java.net.URI(firstProxyUrl).toURL().openConnection().let { conn ->
                 (conn as java.net.HttpURLConnection).apply {
@@ -231,8 +260,172 @@ class PlayerScreenStateSmokeTest {
             }
             code == 404
         }
-        drainBlock.complete(Unit)
         backend.awaitOpens(2)
+    }
+
+    @Test
+    fun transcodeQualitySwitchUsesStreamTsAndPrewarmsHeadMidpointAndTail() = runBlocking {
+        val state = newState()
+        val firstOpen = backend.awaitOpens(1).single()
+        val firstUrl = assertIs<PlaybackTarget.Url>(firstOpen.target)
+        assertTrue(firstUrl.url.endsWith("/media.mkv"), "原画代理 URL 应保留原始扩展名后缀: ${firstUrl.url}")
+        assertEquals(false, firstUrl.isMpegTsTranscode)
+        assertEquals(1024L * 1024L, state.mediaInfo?.sizeBytes)
+
+        backend.emit(PlaybackBackendEvent.Ready)
+        backend.progress(positionMillis = 180_000L, durationMillis = 600_000L)
+        withContext(stateThread) { state.selectQuality("480P") }
+
+        val secondOpen = backend.awaitOpens(2)[1]
+        val secondUrl = assertIs<PlaybackTarget.Url>(secondOpen.target)
+        assertTrue(secondUrl.url.endsWith("/media.ts"), "转码代理 URL 应携带 .ts 扩展名供 FFmpeg 直接识别 mpegts: ${secondUrl.url}")
+        assertEquals(true, secondUrl.isMpegTsTranscode)
+        assertEquals(180_000L, secondOpen.startMillis)
+        assertEquals(512L * 1024L, state.mediaInfo?.sizeBytes)
+
+        val block = 256L * 1024L
+        assertEquals(
+            listOf(0L until block),
+            repository.playbackPrewarmRanges(streamSize = 10L * block, isOrigin = true, startPositionMillis = 180_000L, durationMillis = 600_000L),
+        )
+        assertEquals(
+            listOf(0L until block),
+            repository.playbackPrewarmRanges(streamSize = 10L * block, isOrigin = false, startPositionMillis = 0L, durationMillis = 600_000L),
+        )
+        assertEquals(
+            listOf(
+                0L until 2L * block,
+                3L * block until 4L * block,
+                9L * block until 10L * block,
+            ),
+            repository.playbackPrewarmRanges(streamSize = 10L * block, isOrigin = false, startPositionMillis = 180_000L, durationMillis = 600_000L),
+        )
+    }
+
+    @Test
+    fun releaseDrainsOnMainDispatcherWithoutOffThreadStop() = runBlocking {
+        backend.requiresAsyncStopDrain = true
+        val state = newState()
+        val opened = backend.awaitOpens(1).single()
+        val proxyUrl = assertNotNull(opened.urlOrNull())
+
+        val afterClosed = kotlinx.coroutines.CompletableDeferred<Unit>()
+        withContext(stateThread) {
+            state.release { afterClosed.complete(Unit) }
+        }
+        afterClosed.await()
+
+        // 排空关闭完成后回环代理端点已注销（404），且全过程未在 IO 线程裸调 stop()
+        val code = java.net.URI(proxyUrl).toURL().openConnection().let { (it as java.net.HttpURLConnection).useCode() }
+        assertEquals(404, code)
+        assertTrue(backend.stopCalls >= 2)
+    }
+
+    @Test
+    fun openKeepsUnknownBufferNullWithoutMidOpenEpochBumpAndSeekDropsStaleFeedback() = runBlocking {
+        backend.simulateNativeGenerations = true
+        val state = newState()
+        backend.awaitOpens(1)
+        val active = assertNotNull(state.prepared)
+
+        // 1. 开播尚未采样到真实缓冲前 bufferedDuration 必须为 null（绝不能伪装成 0ms），且 backend.open 内部 generation 0->1 不触发二次递增
+        val initialIntent = active.demand.intent
+        assertEquals(1L, initialIntent.epoch)
+        assertEquals(io.github.nihildigit.pikpak.ServiceIntent.WAITING, initialIntent.service)
+        kotlin.test.assertNull(assertNotNull(initialIntent.playbackSample).bufferedDuration)
+
+        // 2. 出首帧进入稳态播放并上报 native generation=1 的真实缓冲读数，重映射到同一 epoch=1
+        backend.emit(PlaybackBackendEvent.Ready)
+        backend.progress(positionMillis = 5_000L, durationMillis = 600_000L)
+        val clock = kotlin.time.TestTimeSource()
+        backend.publishBuffer(
+            io.github.nihildigit.pikpak.PlaybackBufferSnapshot(
+                generation = 1L,
+                bufferedDuration = kotlin.time.Duration.parse("4s"),
+                sampledAt = clock.markNow(),
+            ),
+        )
+        eventually("首帧后稳态意图与缓冲样本生效") {
+            val cur = active.demand.intent
+            cur.service == io.github.nihildigit.pikpak.ServiceIntent.PLAYING &&
+                cur.playbackSample?.bufferedDuration == kotlin.time.Duration.parse("4s")
+        }
+        assertEquals(1L, active.demand.intent.epoch)
+
+        // 3. 用户主动 seekTo：立即递增至 epoch=2、清空旧缓冲读数为 null，并丢弃迟到的 generation=1 旧样本
+        withContext(stateThread) {
+            state.seekTo(240_000L)
+            Snapshot.sendApplyNotifications()
+        }
+        assertEquals(2L, active.demand.intent.epoch)
+        assertEquals(io.github.nihildigit.pikpak.ServiceIntent.WAITING, active.demand.intent.service)
+        kotlin.test.assertNull(assertNotNull(active.demand.intent.playbackSample).bufferedDuration)
+
+        backend.publishBuffer(
+            io.github.nihildigit.pikpak.PlaybackBufferSnapshot(
+                generation = 1L,
+                bufferedDuration = kotlin.time.Duration.parse("15s"),
+                sampledAt = clock.markNow(),
+            ),
+        )
+        kotlin.test.assertNull(assertNotNull(active.demand.intent.playbackSample).bufferedDuration, "定位前的过期缓冲样本必须被丢弃")
+
+        // 4. 定位后的新世代 generation=2 样本干净映射到 epoch=2，不产生额外 epoch 抖动；暂停时立即收起投机预算
+        backend.publishBuffer(
+            io.github.nihildigit.pikpak.PlaybackBufferSnapshot(
+                generation = 2L,
+                bufferedDuration = kotlin.time.Duration.parse("3s"),
+                sampledAt = clock.markNow(),
+            ),
+        )
+        eventually("定位后新世代缓冲样本被接纳") {
+            active.demand.intent.playbackSample?.bufferedDuration == kotlin.time.Duration.parse("3s")
+        }
+        assertEquals(2L, active.demand.intent.epoch)
+
+        withContext(stateThread) {
+            backend.positionMillis = 241_000L
+            backend.isPlaying = false
+            Snapshot.sendApplyNotifications()
+        }
+        eventually("暂停后切换为 PAUSED 且清零缓冲预算") {
+            active.demand.intent.service == io.github.nihildigit.pikpak.ServiceIntent.PAUSED &&
+                active.demand.intent.bufferBudget.maxReadAheadBytes == 0L
+        }
+        leavePlayer(state)
+    }
+
+    @Test
+    fun preparePlaybackConfiguresWaitingBurstBudgetAndCancelsPrewarmOnSeek() = runBlocking {
+        backend.simulateNativeGenerations = true
+        val state = newState()
+        backend.awaitOpens(1)
+        val active = assertNotNull(state.prepared)
+
+        assertTrue(
+            active.defaultBufferBudget.waitingReadAheadBytes >= dev.piko.shared.media.PLAYBACK_WAITING_READ_AHEAD_FLOOR_BYTES,
+            "全屏播放应配置至少 2.5 MiB 的 WAITING 突发预读窗口，实际为 ${active.defaultBufferBudget.waitingReadAheadBytes}",
+        )
+        assertEquals(
+            active.defaultBufferBudget.waitingReadAheadBytes,
+            active.demand.intent.bufferBudget.waitingReadAheadBytes,
+        )
+
+        val syntheticPrewarm = kotlinx.coroutines.Job()
+        active.attachPrewarmJob(syntheticPrewarm)
+        assertTrue(syntheticPrewarm.isActive, "初始绑定后挂载的预热任务应保持存活")
+
+        withContext(stateThread) {
+            state.seekTo(120_000L)
+            Snapshot.sendApplyNotifications()
+        }
+        assertTrue(syntheticPrewarm.isCancelled, "用户 seek 推进世代后必须立即取消启动预热任务")
+        assertEquals(
+            active.defaultBufferBudget.waitingReadAheadBytes,
+            active.demand.intent.bufferBudget.waitingReadAheadBytes,
+            "seek 后的 WAITING 意图必须继续携带 waitingReadAheadBytes 突发窗口",
+        )
+        leavePlayer(state)
     }
 
     private fun java.net.HttpURLConnection.useCode(): Int = try {
@@ -250,11 +443,13 @@ class PlayerScreenStateSmokeTest {
 
     /** 按脚本回事件的假后端。位置变化后手动发快照通知，替代 Compose 帧时钟。 */
     private inner class FakeBackend : PlaybackBackend {
+        override var playbackGeneration by mutableLongStateOf(0L)
+        override var bufferSnapshot by mutableStateOf<io.github.nihildigit.pikpak.PlaybackBufferSnapshot?>(null)
         override var positionMillis by mutableLongStateOf(0L)
         override var durationMillis by mutableLongStateOf(0L)
         override val bufferedPositionMillis: Long = 0L
         override var isPlaying by mutableStateOf(true)
-        override val isBuffering: Boolean = false
+        override var isBuffering by mutableStateOf(false)
         override val speed: Float = 1f
         override val supportsSpeed: Boolean = true
         override val aspectRatio: PlayerAspectRatio = PlayerAspectRatio.Fit
@@ -266,12 +461,24 @@ class PlayerScreenStateSmokeTest {
 
         val opens = CopyOnWriteArrayList<Opened>()
         var onOpen: suspend FakeBackend.() -> Unit = {}
+        var simulateNativeGenerations: Boolean = false
         override var requiresAsyncStopDrain: Boolean = false
         @Volatile var stopCalls: Int = 0
         var onStopDrain: suspend () -> Unit = {}
 
         fun emit(event: PlaybackBackendEvent) {
             check(_events.tryEmit(event))
+        }
+
+        suspend fun publishBuffer(snapshot: io.github.nihildigit.pikpak.PlaybackBufferSnapshot?) {
+            withContext(stateThread) {
+                if (simulateNativeGenerations && snapshot?.bufferedDuration != null && snapshot.generation == playbackGeneration) {
+                    isBuffering = false
+                }
+                bufferSnapshot = snapshot
+                Snapshot.sendApplyNotifications()
+            }
+            delay(50)
         }
 
         suspend fun progress(positionMillis: Long, durationMillis: Long) {
@@ -297,20 +504,48 @@ class PlayerScreenStateSmokeTest {
         ) {
             opens += Opened(target, startMillis)
             positionMillis = 0L
+            if (simulateNativeGenerations) {
+                playbackGeneration += 1L
+                bufferSnapshot = io.github.nihildigit.pikpak.PlaybackBufferSnapshot(
+                    generation = playbackGeneration,
+                    bufferedDuration = null,
+                    sampledAt = kotlin.time.TimeSource.Monotonic.markNow(),
+                )
+                Snapshot.sendApplyNotifications()
+            }
             onOpen()
         }
 
         override fun stop() {
+            check(Thread.currentThread().name.startsWith("player-state")) {
+                "PlaybackBackend.stop() must be invoked on the main state thread, was ${Thread.currentThread().name}"
+            }
             stopCalls += 1
         }
-        override suspend fun stopAndAwaitIdle() {
+        override suspend fun beginStop() = withContext(stateThread) {
             stop()
+        }
+        override suspend fun stopAndAwaitIdle() {
+            withContext(stateThread) { stop() }
             onStopDrain()
         }
-        override fun play() = Unit
-        override fun pause() = Unit
+        override fun play() {
+            isPlaying = true
+        }
+        override fun pause() {
+            isPlaying = false
+        }
         override fun seekTo(positionMillis: Long) {
             this.positionMillis = positionMillis
+            if (simulateNativeGenerations) {
+                playbackGeneration += 1L
+                isBuffering = true
+                bufferSnapshot = io.github.nihildigit.pikpak.PlaybackBufferSnapshot(
+                    generation = playbackGeneration,
+                    bufferedDuration = null,
+                    sampledAt = kotlin.time.TimeSource.Monotonic.markNow(),
+                )
+            }
         }
         override fun setSpeed(speed: Float) = Unit
         override fun setAspectRatio(mode: PlayerAspectRatio) = Unit

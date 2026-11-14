@@ -7,6 +7,7 @@ import dev.piko.shared.data.SavedAccount
 import dev.piko.shared.data.SavedAccounts
 import dev.piko.shared.log.PikoLog
 import io.github.nihildigit.pikpak.Session
+import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
@@ -42,6 +43,7 @@ class DesktopSessionStore(
     private val mutex = Mutex()
     private val cache = HashMap<String, AccountSecrets>()
     private var migrated = false
+    private var lastSavedAccounts: SavedAccounts? = null
 
     /** 旧格式迁移没做完时由旧文件得出的账号列表，只在本进程内顶替 accounts.json，下次启动重做迁移。 */
     private var legacyAccounts: SavedAccounts? = null
@@ -63,6 +65,13 @@ class DesktopSessionStore(
 
     override suspend fun saveArchivePasswords(account: String, serialized: String) =
         update(account) { it.copy(archivePasswords = serialized.ifEmpty { null }) }
+
+    override suspend fun loadSyncSecret(account: String): String? = secrets(account).syncSecret?.takeIf { it.isNotEmpty() }
+
+    override suspend fun saveSyncSecret(account: String, secret: String) =
+        update(account) { it.copy(syncSecret = secret.ifEmpty { null }) }
+
+    override suspend fun clearSyncSecret(account: String) = update(account) { it.copy(syncSecret = null) }
 
     override suspend fun loadAccounts(): SavedAccounts = locked { readAccountsFile() ?: legacyAccounts ?: SavedAccounts() }
 
@@ -100,7 +109,7 @@ class DesktopSessionStore(
         withContext(Dispatchers.IO) {
             if (!migrated) {
                 // 失败也不在本进程内重试：旧文件原样留着，下次启动再来
-                runCatching { migrateLegacy() }.onFailure { PikoLog.w(TAG, "旧格式的登录信息迁移失败，保留旧文件", it) }
+                runCatching { migrateLegacy() }.onFailure { PikoLog.w(TAG, "Failed to migrate legacy credentials; keeping legacy files for next startup", it) }
                 migrated = true
             }
             block()
@@ -109,8 +118,9 @@ class DesktopSessionStore(
 
     private fun readSecrets(key: String): AccountSecrets {
         val data = vault.read(key) ?: return AccountSecrets()
+        // SerializationException 消息可能截出含明文 token/密码的 JSON 片段，仅记录异常类型与哈希键名
         return runCatching { json.decodeFromString(AccountSecrets.serializer(), data.decodeToString()) }
-            .onFailure { PikoLog.w(TAG, "凭据内容无法解析，当作没有", it) }
+            .onFailure { PikoLog.w(TAG, "Failed to parse stored credentials for key=$key (${it::class.simpleName}); treating as empty") }
             .getOrDefault(AccountSecrets())
     }
 
@@ -123,18 +133,31 @@ class DesktopSessionStore(
         if (!Files.isRegularFile(accountsFile)) return null
         // 解析不了当作不存在：旧文件还在的话迁移会重写它，比退回登录页好
         return runCatching { json.decodeFromString(SavedAccounts.serializer(), Files.readString(accountsFile)) }
-            .onFailure { PikoLog.w(TAG, "账号列表无法解析", it) }
+            .onFailure { PikoLog.w(TAG, "Failed to parse accounts.json (${it::class.simpleName})") }
             .getOrNull()
+            ?.also { lastSavedAccounts = it }
     }
 
     private fun writeAccountsFile(accounts: SavedAccounts) {
-        Files.createDirectories(root)
+        if (accounts == lastSavedAccounts && Files.isRegularFile(accountsFile)) return
+        if (!Files.isDirectory(root)) {
+            Files.createDirectories(root)
+        }
         val staging = Files.createTempFile(root, "accounts", ".tmp")
+        var moved = false
         try {
             Files.writeString(staging, json.encodeToString(SavedAccounts.serializer(), accounts))
-            Files.move(staging, accountsFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+            try {
+                Files.move(staging, accountsFile, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+            } catch (_: AtomicMoveNotSupportedException) {
+                Files.move(staging, accountsFile, StandardCopyOption.REPLACE_EXISTING)
+            }
+            moved = true
+            lastSavedAccounts = accounts
         } finally {
-            Files.deleteIfExists(staging)
+            if (!moved) {
+                Files.deleteIfExists(staging)
+            }
         }
     }
 
@@ -164,13 +187,17 @@ class DesktopSessionStore(
         }
 
         val key = vaultKey(account)
+        val password = passwordFile.readTextOrNull()
         val legacy = AccountSecrets(
             session = sessionFile.readTextOrNull()?.let { text ->
                 runCatching { json.decodeFromString(Session.serializer(), text) }
-                    .onFailure { PikoLog.w(TAG, "旧会话文件无法解析，只迁移密码") }
+                    .onFailure {
+                        val fallbackNote = if (password != null) "migrating password only" else "no legacy password present"
+                        PikoLog.w(TAG, "Failed to parse legacy session file (${it::class.simpleName}); $fallbackNote")
+                    }
                     .getOrNull()
             },
-            password = passwordFile.readTextOrNull(),
+            password = password,
         )
         val accounts = listed ?: if (legacy.isEmpty) SavedAccounts() else SavedAccounts(current = account, accounts = listOf(SavedAccount(account)))
         cache[key] = legacy
@@ -179,7 +206,7 @@ class DesktopSessionStore(
         val stored = readSecrets(key)
         if (stored.isEmpty) {
             writeSecrets(key, legacy)
-            check(readSecrets(key) == legacy) { "迁移后读回的凭据与旧文件不一致" }
+            check(readSecrets(key) == legacy) { "Migrated credentials read-back did not match legacy files" }
         } else {
             // 新存储里已有：上次迁移写进去了但没删成旧文件，之后可能又刷新过令牌，以新存储为准
             cache[key] = stored
@@ -189,23 +216,24 @@ class DesktopSessionStore(
             legacyAccounts = null
         }
         deleteLegacyFiles()
-        PikoLog.i(TAG, "旧格式的登录信息已迁移")
+        PikoLog.i(TAG, "Migrated legacy desktop session files into secret vault")
     }
 
     private companion object {
-        const val TAG = "credentials"
+        const val TAG = "Credentials"
         val json = Json { ignoreUnknownKeys = true }
     }
 }
 
-/** 退出登录只清 [session] 与 [password]，[archivePasswords] 留着，这一份随之不为空、不删。 */
+/** 退出登录清 [session]、[password] 与 [syncSecret]，[archivePasswords] 留着，这一份随之不为空、不删。 */
 @Serializable
 internal data class AccountSecrets(
     val session: Session? = null,
     val password: String? = null,
     val archivePasswords: String? = null,
+    val syncSecret: String? = null,
 ) {
-    val isEmpty: Boolean get() = session == null && password == null && archivePasswords == null
+    val isEmpty: Boolean get() = session == null && password == null && archivePasswords == null && syncSecret == null
 }
 
 /** 账号名可能是邮箱或手机号，不直接进文件名与钥匙串属性，取其摘要。 */

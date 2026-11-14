@@ -4,9 +4,11 @@ import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.grid.LazyGridState
 import androidx.compose.material3.ColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Modifier
+import dev.piko.data.auth.AppLanguage
 import dev.piko.shared.media.player.PlaybackBackend
 import dev.piko.ui.adaptive.FormFactor
 import dev.piko.ui.theme.MotionStyle
@@ -15,7 +17,7 @@ import dev.piko.update.AppUpdateService
 import kotlinx.coroutines.flow.StateFlow
 
 /**
- * 共享界面向所在平台要的能力。Android 与 Desktop 各实现一份，按 CLAUDE.md 的约定用接口而不用
+ * 共享界面向所在平台要的能力。各宿主端各自实现一份，按 AGENTS.md 的约定用接口而不用
  * expect/actual：实现要拿 Context、窗口与各自的播放后端，这些都是运行时对象，不是编译期的平台差异。
  */
 interface PikoPlatform {
@@ -77,8 +79,8 @@ interface PikoPlatform {
     val deviceSummary: String
 
     /**
-     * 把导出的日志交给用户：Android 调起系统分享，直接发进聊天或邮件；桌面端弹保存对话框。
-     * 返回 false 表示没有交出去（取消或失败）。
+     * 把导出的日志交给用户：移动端调起系统分享，直接发进聊天、文件或邮件；桌面端弹保存对话框。
+     * 返回 false 表示写出或分享失败；用户在保存框中主动取消视为已处理，返回 true。
      */
     suspend fun exportLog(fileName: String, content: String): Boolean
 
@@ -116,6 +118,9 @@ interface PikoPlatform {
     /** 打开系统设置里的「默认打开」页（Android），添加支持的分享与深链域名。不支持的平台为 null。 */
     /** 跳转系统「默认打开 -> 添加链接」设置页（Android 12+），不支持的平台为 null。 */
     val openAppLinkSettings: (() -> Unit)? get() = null
+
+    /** 后台不受限运行（Android 电池优化白名单），桌面端为 null。 */
+    val backgroundTransferAccess: BackgroundTransferAccess? get() = null
 
     /** 当前是否尚未在系统「默认打开」中添加 PikPak 分享与跳转域名，用于「我的」页提醒卡片。 */
     suspend fun needsAppLinkPrompt(): Boolean = false
@@ -159,6 +164,29 @@ interface PikoPlatform {
 
     @Composable
     fun ListScrollbar(state: LazyGridState, modifier: Modifier)
+
+    /**
+     * 将当前有效语言同步注入平台的资源环境（Android 的 LocalConfiguration、JVM 的 Locale.getDefault），
+     * 确保 Compose Multiplatform 的 stringResource 与内存 tr() 在同一帧内完全一致，不出现双语混排。
+     */
+    @Composable
+    fun ProvideLocalizedEnvironment(
+        language: AppLanguage,
+        content: @Composable () -> Unit,
+    ) {
+        content()
+    }
+
+    /**
+     * 在后台解码小尺寸缩略图并按目标容器放大倍率执行一次性边缘钳位预模糊，返回可直接静态绘制的 [ImageBitmap]。
+     * 返回 null 时由界面回退常规图片加载。
+     */
+    suspend fun loadPreblurredBackdrop(
+        model: Any,
+        containerWidthPx: Int,
+        containerHeightPx: Int,
+        targetBlurPx: Float,
+    ): ImageBitmap? = null
 }
 
 /** 已下载到本机的文件的外部动作。路径可能是普通路径，也可能是 Android SAF 的 content: URI。 */
@@ -258,7 +286,14 @@ interface LandscapeLock {
     fun release()
 }
 
+interface BackgroundTransferAccess {
+    fun isUnrestricted(): Boolean
+    fun requestUnrestricted()
+}
+
 fun interface ExternalVideoPlayer {
+    /** A player outside this process cannot rely on a suspended local proxy. */
+    val requiresDirectUrl: Boolean get() = false
     suspend fun open(url: String, fileName: String): Boolean
 }
 
