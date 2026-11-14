@@ -990,14 +990,28 @@ fun PikoMainScaffold(
                                             onBackClick = ::popBack,
                                             onPlay = { file -> playLocal(file.fileId, file.name, null) },
                                             onFilterActor = { actor ->
-                                                services.posterWall?.selectFilter(PosterWallState.Filter.ACTOR, actor)
-                                                postersReturnDetail = PosterWallJumpSource(screen, PosterWallState.Filter.ACTOR, actor)
+                                                val wall = services.posterWall
+                                                postersReturnDetail = PosterWallJumpSource(
+                                                    detail = screen,
+                                                    filter = PosterWallState.Filter.ACTOR,
+                                                    name = actor,
+                                                    previousFilter = wall?.filter ?: PosterWallState.Filter.ALL,
+                                                    previousName = wall?.filterName,
+                                                )
+                                                wall?.selectFilter(PosterWallState.Filter.ACTOR, actor)
                                                 while (backStack.size > 1) backStack.removeLastOrNull()
                                                 currentTab = MainTab.POSTERS
                                             },
                                             onFilterTag = { tag ->
-                                                services.posterWall?.selectFilter(PosterWallState.Filter.TAG, tag)
-                                                postersReturnDetail = PosterWallJumpSource(screen, PosterWallState.Filter.TAG, tag)
+                                                val wall = services.posterWall
+                                                postersReturnDetail = PosterWallJumpSource(
+                                                    detail = screen,
+                                                    filter = PosterWallState.Filter.TAG,
+                                                    name = tag,
+                                                    previousFilter = wall?.filter ?: PosterWallState.Filter.ALL,
+                                                    previousName = wall?.filterName,
+                                                )
+                                                wall?.selectFilter(PosterWallState.Filter.TAG, tag)
                                                 while (backStack.size > 1) backStack.removeLastOrNull()
                                                 currentTab = MainTab.POSTERS
                                             },
@@ -1103,6 +1117,9 @@ fun PikoMainScaffold(
                 if (wallReturnAlive && pendingWallReturn != null) {
                     postersReturnDetail = null
                     backStack.add(pendingWallReturn.detail)
+                    // 跳转时海报墙被换成了这一位演员/标签的列表，回到详情页的同时把列表恢复成
+                    // 进筛选前的样子（通常是「全部」），从详情页再返回时才不会又落在筛选里。
+                    wallForBack?.selectFilter(pendingWallReturn.previousFilter, pendingWallReturn.previousName)
                 } else {
                     postersReturnDetail = null
                     wallForBack?.selectFilter(PosterWallState.Filter.ALL)
@@ -1261,4 +1278,7 @@ private data class PosterWallJumpSource(
     val detail: Screen.WorkDetail,
     val filter: PosterWallState.Filter,
     val name: String?,
+    /** 跳转前海报墙的筛选，返回详情页时据此恢复列表。 */
+    val previousFilter: PosterWallState.Filter,
+    val previousName: String?,
 )
