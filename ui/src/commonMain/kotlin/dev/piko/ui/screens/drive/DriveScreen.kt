@@ -1746,6 +1746,15 @@ private fun rememberDriveTaskSheet(
     onPreview: (String, String) -> Unit,
 ): TaskSheetModel? {
     val discardAddLink = rememberDiscardAddLink(addLink)
+    // 保存被接受后，会话会把编辑区换成一个新的空白编辑器（桌面侧栏接着贴下一条链接用）。
+    // 手机上这一层 sheet 就是整个「添加链接」界面，换了空白编辑器等于面板没关：
+    // 用户点了保存，看到的却还是一个空的输入框。所以手机上换到空白编辑器时直接收起。
+    val lastInstantState = remember { mutableStateOf(instantState) }
+    LaunchedEffect(instantState) {
+        val previous = lastInstantState.value
+        lastInstantState.value = instantState
+        if (previous != null && previous !== instantState && instantState?.isBlank == true) addLink.collapse()
+    }
     return when {
         !isWorkspaceBrowser -> null
         addLinkInSidePanel -> null
