@@ -783,6 +783,91 @@ class LibraryStore(
         !exists
     }?.also { _changes.tryEmit(Unit) } ?: false
 
+    // ---------------------------------------------------------------- 元数据备份
+
+    /**
+     * 导出一份完整快照，给「备份元数据」按钮用。
+     *
+     * 只带刮到过元数据的作品：`scraped_at = 0` 的是刚扫到、还没刮的空壳，备份它没有意义，
+     * 恢复回来也照样要重刮。译名与自定义项不在这份里（见 [MetadataBackup] 的说明）。
+     */
+    suspend fun exportMetadataBackup(createdAt: Long, appVersion: String = ""): MetadataBackup? = withQueries { q ->
+        val images = q.selectAllImageRows().executeAsList().groupBy({ it.work_code }, { it.url })
+        val actors = q.selectScrapedActorRows().executeAsList().groupBy({ it.work_code }, { it.actor_name })
+        val tags = q.selectScrapedTagRows().executeAsList().groupBy({ it.work_code }, { it.tag_name })
+        MetadataBackup(
+            createdAt = createdAt,
+            appVersion = appVersion,
+            works = q.selectAllWorkRows().executeAsList()
+                .filter { it.scraped_at > 0 }
+                .map { row ->
+                    MetadataWork(
+                        code = row.code,
+                        title = row.title,
+                        coverUrl = row.cover_url,
+                        releaseDate = row.release_date,
+                        duration = row.duration?.toInt(),
+                        summary = row.summary,
+                        studio = row.studio,
+                        series = row.series,
+                        provider = row.provider,
+                        mtProvider = row.mt_provider,
+                        mtId = row.mt_id,
+                        previewVideoUrl = row.preview_video_url,
+                        scrapedAt = row.scraped_at,
+                        origin = row.origin,
+                        images = images[row.code].orEmpty(),
+                        actors = actors[row.code].orEmpty(),
+                        tags = tags[row.code].orEmpty(),
+                    )
+                },
+        )
+    }
+
+    /**
+     * 把快照并进本机。逐部比 `scraped_at`：本机不早于备份的就跳过，不拿旧的把新刮的盖回去；
+     * 本机没有的直接插入，只有空壳的（`scraped_at = 0`）也会被补全。
+     *
+     * 演员、标签、截图随元数据一起替换，但只清 `custom = 0` 的那些——详情页手加的留着。
+     * 译名、收藏一行不动：它们归 `library-` 增量同步管，这里改会和那边打架。
+     */
+    suspend fun restoreMetadataBackup(backup: MetadataBackup): MetadataRestoreResult? = withQueries { q ->
+        val local = q.selectAllWorkRows().executeAsList().associateBy { it.code }
+        var restored = 0
+        var skipped = 0
+        q.transaction {
+            backup.works.forEach { work ->
+                val existing = local[work.code]
+                if (existing != null && existing.scraped_at >= work.scrapedAt) {
+                    skipped++
+                    return@forEach
+                }
+                // 插入与更新都只管元数据列，两条语句都不碰 title_zh
+                if (existing == null) {
+                    q.insertRestoredWork(
+                        work.code, work.title, work.coverUrl, work.releaseDate, work.duration?.toLong(),
+                        work.summary, work.studio, work.series, work.provider, work.mtProvider,
+                        work.mtId, work.previewVideoUrl, work.scrapedAt, work.origin,
+                    )
+                } else {
+                    q.updateRestoredWork(
+                        work.title, work.coverUrl, work.releaseDate, work.duration?.toLong(),
+                        work.summary, work.studio, work.series, work.provider, work.mtProvider,
+                        work.mtId, work.previewVideoUrl, work.scrapedAt, work.origin, work.code,
+                    )
+                }
+                q.deleteScrapedActorsFor(work.code)
+                q.deleteScrapedTagsFor(work.code)
+                q.deleteWorkImagesFor(work.code)
+                work.actors.forEach { q.insertWorkActor(work.code, it) }
+                work.tags.forEach { q.insertWorkTag(work.code, it) }
+                work.images.forEachIndexed { index, url -> q.insertWorkImage(work.code, url, index.toLong()) }
+                restored++
+            }
+        }
+        MetadataRestoreResult(restored = restored, skipped = skipped, total = backup.works.size)
+    }
+
     // ---------------------------------------------------------------- 兼容修补
 
     /**

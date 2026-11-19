@@ -55,6 +55,7 @@ import androidx.compose.material.icons.outlined.Palette
 import androidx.compose.material.icons.outlined.PlayCircle
 import androidx.compose.material.icons.outlined.PowerSettingsNew
 import androidx.compose.material.icons.outlined.Public
+import androidx.compose.material.icons.outlined.Restore
 import androidx.compose.material.icons.outlined.Router
 import androidx.compose.material.icons.outlined.SlowMotionVideo
 import androidx.compose.material.icons.outlined.Speed
@@ -114,6 +115,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.piko.data.auth.SnailMode
 import dev.piko.shared.net.ProxySetting
 import dev.piko.shared.sync.EncryptedSyncStatus
+import dev.piko.shared.sync.MetadataBackupSync
 import dev.piko.shared.sync.PikoSettingsSync
 import dev.piko.ui.LocalPikoServices
 import dev.piko.ui.PassphraseUpdateResult
@@ -248,6 +250,9 @@ fun SettingsScreen(
     val translationConcurrency by sessionManager.translationConcurrencyFlow.collectAsStateWithLifecycle(initialValue = 0)
     var showTranslationDialog by remember { mutableStateOf(false) }
     val posterWall = services.posterWall
+    // 元数据整份备份/恢复：两个按钮共用一个「进行中」标志，避免同时点两次
+    val metadataBackup = services.metadataBackup
+    var metadataJob by remember { mutableStateOf<MetadataBackupJob?>(null) }
 
     var showDownloadDirDialog by remember { mutableStateOf(false) }
     val proxySetting by sessionManager.proxySettingFlow.collectAsStateWithLifecycle(initialValue = ProxySetting())
@@ -759,6 +764,112 @@ fun SettingsScreen(
                                 onCheckedChange = { scope.launch { sessionManager.setSyncPlayHistoryEnabled(it) } },
                             )
                         }
+                        SettingsGroup(tr("元数据备份", "Metadata backup", "メタデータのバックアップ", "메타데이터 백업", "中繼資料備份")) {
+                            SettingsRow(
+                                icon = Icons.Outlined.CloudSync,
+                                title = tr("备份元数据", "Back up metadata", "メタデータをバックアップ", "메타데이터 백업", "備份中繼資料"),
+                                supporting = when (metadataJob) {
+                                    MetadataBackupJob.BACKUP -> tr(
+                                        "正在整理并上传，作品多时要等一会儿…",
+                                        "Collecting and uploading; this takes a while with a large library…",
+                                        "整理してアップロード中。作品が多いと少し時間がかかります…",
+                                        "정리 후 업로드 중입니다. 작품이 많으면 시간이 걸립니다…",
+                                        "整理並上傳中，作品較多時需要一點時間…",
+                                    )
+                                    else -> tr(
+                                        "把刮削到的标题、简介、封面与截图地址传到网盘 .piko，每次新建一份，旧备份不删",
+                                        "Upload scraped titles, summaries, cover and screenshot URLs to .piko; each run adds a file and keeps older ones",
+                                        "刮削したタイトル・あらすじ・カバー・スクリーンショットのURLを .piko に保存します。毎回新しいファイルを作り、古いバックアップは残します",
+                                        "스크래핑한 제목·줄거리·표지·스크린샷 주소를 .piko에 업로드합니다. 실행할 때마다 새 파일을 만들고 이전 백업은 남깁니다",
+                                        "把刮削到的標題、簡介、封面與截圖位址傳到網盤 .piko，每次新增一份，舊備份不刪",
+                                    )
+                                },
+                                enabled = metadataJob == null && metadataBackup != null,
+                                onClick = {
+                                    val service = metadataBackup
+                                    if (service != null && metadataJob == null) {
+                                        metadataJob = MetadataBackupJob.BACKUP
+                                        scope.launch {
+                                            when (val outcome = service.backupNow()) {
+                                                is MetadataBackupSync.BackupOutcome.Success -> snackbarHostState.showSnackbar(
+                                                    tr(
+                                                        "已备份 ${outcome.works} 部作品（${outcome.bytes / 1024 / 1024} MB）",
+                                                        "Backed up ${outcome.works} works (${outcome.bytes / 1024 / 1024} MB)",
+                                                        "${outcome.works} 作品をバックアップしました（${outcome.bytes / 1024 / 1024} MB）",
+                                                        "${outcome.works}개 작품을 백업했습니다 (${outcome.bytes / 1024 / 1024} MB)",
+                                                        "已備份 ${outcome.works} 部作品（${outcome.bytes / 1024 / 1024} MB）",
+                                                    ),
+                                                    withDismissAction = true,
+                                                )
+                                                is MetadataBackupSync.BackupOutcome.Failure -> snackbarHostState.showSnackbar(
+                                                    tr("备份失败：", "Backup failed: ", "バックアップに失敗しました：", "백업 실패: ", "備份失敗：") +
+                                                        metadataFailureText(outcome.reason),
+                                                    withDismissAction = true,
+                                                )
+                                            }
+                                            metadataJob = null
+                                        }
+                                    }
+                                },
+                            )
+                            SettingsRow(
+                                icon = Icons.Outlined.Restore,
+                                title = tr("恢复元数据", "Restore metadata", "メタデータを復元", "메타데이터 복원", "還原中繼資料"),
+                                supporting = when (metadataJob) {
+                                    MetadataBackupJob.RESTORE -> tr(
+                                        "正在读取并写回…",
+                                        "Reading and applying…",
+                                        "読み込んで反映中…",
+                                        "읽어서 적용 중…",
+                                        "讀取並寫回中…",
+                                    )
+                                    else -> tr(
+                                        "用网盘上最新的一份备份补全本机；本机已有且更新过的作品会跳过。文件需重扫目录后才可播放",
+                                        "Apply the newest backup from the drive; works already newer here are skipped. Re-scan the folder to play files again",
+                                        "ドライブ上の最新バックアップを適用します。端末側が新しい作品はスキップします。再生にはフォルダの再スキャンが必要です",
+                                        "드라이브의 최신 백업을 적용합니다. 기기에 더 최신인 작품은 건너뜁니다. 재생하려면 폴더를 다시 스캔하세요",
+                                        "用網盤上最新的一份備份補全本機；本機已有且較新的作品會略過。檔案需重新掃描目錄後才可播放",
+                                    )
+                                },
+                                enabled = metadataJob == null && metadataBackup != null,
+                                onClick = {
+                                    val service = metadataBackup
+                                    if (service != null && metadataJob == null) {
+                                        metadataJob = MetadataBackupJob.RESTORE
+                                        scope.launch {
+                                            when (val outcome = service.restoreLatest()) {
+                                                is MetadataBackupSync.RestoreOutcome.Success -> snackbarHostState.showSnackbar(
+                                                    tr(
+                                                        "已恢复 ${outcome.restored} 部，跳过 ${outcome.skipped} 部",
+                                                        "Restored ${outcome.restored}, skipped ${outcome.skipped}",
+                                                        "${outcome.restored} 作品を復元、${outcome.skipped} 作品をスキップ",
+                                                        "${outcome.restored}개 복원, ${outcome.skipped}개 건너뜀",
+                                                        "已還原 ${outcome.restored} 部，略過 ${outcome.skipped} 部",
+                                                    ),
+                                                    withDismissAction = true,
+                                                )
+                                                MetadataBackupSync.RestoreOutcome.NoBackup -> snackbarHostState.showSnackbar(
+                                                    tr(
+                                                        "网盘里还没有元数据备份",
+                                                        "No metadata backup found in the drive",
+                                                        "ドライブにメタデータのバックアップがありません",
+                                                        "드라이브에 메타데이터 백업이 없습니다",
+                                                        "網盤裡還沒有中繼資料備份",
+                                                    ),
+                                                    withDismissAction = true,
+                                                )
+                                                is MetadataBackupSync.RestoreOutcome.Failure -> snackbarHostState.showSnackbar(
+                                                    tr("恢复失败：", "Restore failed: ", "復元に失敗しました：", "복원 실패: ", "還原失敗：") +
+                                                        metadataFailureText(outcome.reason),
+                                                    withDismissAction = true,
+                                                )
+                                            }
+                                            metadataJob = null
+                                        }
+                                    }
+                                },
+                            )
+                        }
                         SettingsGroup(tr("密码与凭据", "Passwords and credentials", "パスワードと認証情報", "비밀번호 및 인증 정보", "密碼與憑證")) {
                             SettingsNavigationRow(
                                 icon = Icons.Outlined.Key,
@@ -1188,8 +1299,37 @@ internal fun <T> activeSettingsSection(
     return sections.lastOrNull { (offsets[it] ?: Int.MAX_VALUE) <= scroll + slack } ?: sections.first()
 }
 
-private fun syncStatusText(status: PikoSettingsSync.Status, lastSynced: Long?): String = when (status) {
-    PikoSettingsSync.Status.SYNCING -> tr("同步中…", "Syncing…", "同期中…", "동기화 중…", "同步中…")
+/** 元数据备份两行共用的「正在做什么」：用来禁用按钮并换掉说明文字。 */
+private enum class MetadataBackupJob { BACKUP, RESTORE }
+
+/** 服务层给的是稳定短码，这里翻成人话；认不出的直接显示原文，方便排查。 */
+private fun metadataFailureText(reason: String): String = when (reason) {
+    "not-signed-in" -> tr("未登录", "not signed in", "未ログイン", "로그인하지 않음", "尚未登入")
+    "no-library" -> tr(
+        "本机还没有索引库，请先扫描一次海报墙",
+        "No local index yet; scan the poster wall first",
+        "端末に索引がありません。先にポスターウォールをスキャンしてください",
+        "기기에 인덱스가 없습니다. 먼저 포스터 월을 스캔하세요",
+        "本機還沒有索引庫，請先掃描一次海報牆",
+    )
+    "newer-version" -> tr(
+        "备份来自更新版本的应用，请升级后再恢复",
+        "The backup comes from a newer app version; update before restoring",
+        "バックアップが新しいバージョンのものです。アプリを更新してから復元してください",
+        "백업이 더 새로운 버전의 앱에서 생성되었습니다. 업데이트 후 복원하세요",
+        "備份來自較新版本的應用程式，請更新後再還原",
+    )
+    "invalid-backup" -> tr(
+        "备份文件读不懂，可能已损坏",
+        "The backup file could not be parsed; it may be damaged",
+        "バックアップファイルを読み取れません。破損している可能性があります",
+        "백업 파일을 읽을 수 없습니다. 손상되었을 수 있습니다",
+        "備份檔案無法解析，可能已損壞",
+    )
+    else -> reason
+}
+
+private fun syncStatusText(status: PikoSettingsSync.Status, lastSynced: Long?): String = when (status) {    PikoSettingsSync.Status.SYNCING -> tr("同步中…", "Syncing…", "同期中…", "동기화 중…", "同步中…")
     PikoSettingsSync.Status.FAILED -> tr("同步失败，将在更改设置或下次启动时重试", "Sync failed; will retry when settings change or on next launch", "同期に失敗しました。設定変更時または次回起動時に再試行します", "동기화 실패. 설정 변경 시 또는 다음 실행 시 다시 시도합니다", "同步失敗，將於變更設定或下次啟動時重試")
     else -> lastSynced?.let {
         val time = Instant.fromEpochMilliseconds(it).toLocalDateTime(TimeZone.currentSystemDefault())

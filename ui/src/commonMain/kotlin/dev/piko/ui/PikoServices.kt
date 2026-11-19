@@ -5,6 +5,7 @@ import dev.piko.shared.sync.DriveSettingsStore
 import dev.piko.shared.sync.EncryptedSyncApplyOutcome
 import dev.piko.shared.sync.EncryptedSyncStatus
 import dev.piko.shared.sync.LibrarySync
+import dev.piko.shared.sync.MetadataBackupSync
 import dev.piko.shared.sync.PikoSettingsSync
 import dev.piko.shared.sync.PinnedTabSync
 import dev.piko.shared.sync.SyncCipher
@@ -33,6 +34,7 @@ import dev.piko.shared.download.PikoDownloadCoordinator
 import dev.piko.shared.library.LibraryDriverFactory
 import dev.piko.shared.library.LibraryScraper
 import dev.piko.shared.library.LibraryStore
+import dev.piko.shared.library.MetadataBackup
 import dev.piko.shared.translate.TranslationGateway
 import dev.piko.shared.library.MetaTubeScraper
 import dev.piko.shared.library.SubtitleFileSaver
@@ -480,6 +482,22 @@ class PikoServices(
             // 别的设备改了译名或收藏：让海报墙重读一遍，不用退出去再进来
             onApplied = { posterWall?.refreshList() },
         ).also { it.start() }
+    }
+
+    /**
+     * 元数据整份备份/恢复（设置 → 数据 → 元数据备份）。
+     *
+     * 与 [librarySync] 分工：那个是增量（译名、收藏），这份是手动拍的整份快照，
+     * 每次新建 `.piko/meta-backup-<时间戳>.json`，不删旧份。
+     */
+    val metadataBackup: MetadataBackupSync? = libraryStore?.let { store ->
+        MetadataBackupSync(
+            clients = clientManager,
+            remote = DriveSettingsStore(clientManager, driveRepository, MetadataBackup.FILE_PREFIX),
+            store = store,
+            // 恢复后海报墙要重读：不然退出去再进来才看得到新数据
+            onRestored = { posterWall?.refreshList() },
+        )
     }
 
     val instantSaveRecords = InstantSaveRecords(clientManager, cacheStore, backgroundScope)

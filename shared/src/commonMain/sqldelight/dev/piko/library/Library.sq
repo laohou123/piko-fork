@@ -506,3 +506,37 @@ DELETE FROM favorite_tags WHERE tag_name = ?;
 
 selectFavoriteTagNames:
 SELECT tag_name FROM favorite_tags;
+
+-- ---------------------------------------------------------------- 元数据备份
+
+-- 整库导出刮削结果。译名、自定义标签/女优、收藏各有自己的同步文件（library-*.json），
+-- 备份里不再重复带，恢复时也不会碰它们。
+
+selectAllWorkRows:
+SELECT code, title, title_zh, cover_url, release_date, duration, summary, studio, series,
+       provider, mt_provider, mt_id, preview_video_url, scraped_at, origin
+FROM works;
+
+selectAllImageRows:
+SELECT work_code, url, position FROM work_images ORDER BY work_code, position;
+
+-- 只导源站带来的：custom = 1 的那部分由 library- 同步负责
+selectScrapedActorRows:
+SELECT work_code, actor_name FROM work_actors WHERE custom = 0 ORDER BY work_code, actor_name;
+
+selectScrapedTagRows:
+SELECT work_code, tag_name FROM work_tags WHERE custom = 0 ORDER BY work_code, tag_name;
+
+-- 恢复时不能 REPLACE 整行：那会用 NULL 盖掉本机已有的译名（译名不由这份备份管）。
+-- 所以分插入与更新两条，更新只管元数据列，不碰 title_zh。
+insertRestoredWork:
+INSERT OR IGNORE INTO works (
+    code, title, cover_url, release_date, duration, summary, studio, series,
+    provider, mt_provider, mt_id, preview_video_url, scraped_at, origin
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+updateRestoredWork:
+UPDATE works SET title = ?, cover_url = ?, release_date = ?, duration = ?, summary = ?,
+    studio = ?, series = ?, provider = ?, mt_provider = ?, mt_id = ?,
+    preview_video_url = ?, scraped_at = ?, origin = ?
+WHERE code = ?;

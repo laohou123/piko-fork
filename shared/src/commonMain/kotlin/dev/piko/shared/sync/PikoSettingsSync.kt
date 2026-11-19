@@ -400,6 +400,18 @@ class DriveSettingsStore(
         PikoLog.i(tag, "Saved encrypted sync backup before reset: $name")
     }
 
+    /**
+     * 元数据备份用：往 `.piko` 里放一份文件，**不清理**同前缀的旧文件。
+     *
+     * 和 [write] 的区别就在这里：同步文件只留最新一份（旧的留着会拖慢每次读取），
+     * 备份则要保留历史，删了就挑不回来了。文件名由调用方拼好，含毫秒时间戳。
+     */
+    suspend fun uploadPreserving(account: String, name: String, bytes: ByteArray): String {
+        val folder = folderOf(account)
+        requireCurrent(account)
+        return driveRepo.uploadBytes(folder, name, bytes).getOrThrow()
+    }
+
     // 记着的文件夹可能已被删掉或移走：列不出来就忘掉它，重新找一次。多个同步器在登录后并发启动，
     // 查找与创建共用静态 folderLock，防止并发在根目录建出重复的 .piko 文件夹。
     private suspend fun folderAndEntriesOf(account: String): Pair<String, List<FileStat>> = folderLock.withLock {
