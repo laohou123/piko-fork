@@ -237,12 +237,15 @@ SELECT code FROM works;
 selectScanWorkCodes:
 SELECT code FROM works WHERE origin = 'scan';
 
--- 待刮削的番号：从没刮过的（scraped_at = 0），加上刮到了但封面为空的。
--- 后者是「刮削源不通/页面改版导致封面没解析出来」的自愈通道：网络恢复或用户换了
+-- 待刮削的番号：从没刮过的（scraped_at = 0），加上刮到了但封面或标题为空的。
+-- 封面为空是「刮削源不通/页面改版导致封面没解析出来」的自愈通道：网络恢复或用户换了
 -- 域名之后，下一轮 enrich（启动进海报墙、换源、扫描后都会跑）自动把这些补上，
 -- 不会永远停在占位图上。markScraped 照常写 scraped_at，靠 cover_url 判空再纳入。
+-- 标题为空同理：封面是按 provider/id 拼出来的，永远非空，所以「搜索有命中、详情是空的」
+-- 那种记录以前打上 scraped_at 之后再也不会被选中，只能一直当空壳；按标题判空把它们救回来。
 codesNeedingScrape:
-SELECT code FROM works WHERE scraped_at = 0 OR cover_url IS NULL OR cover_url = '';
+SELECT code FROM works WHERE scraped_at = 0 OR cover_url IS NULL OR cover_url = ''
+    OR title IS NULL OR title = '';
 
 insertWorkActor:
 -- OR IGNORE：用户已经手动加过同名演员时保留它（custom = 1），别被刮削覆盖回去
