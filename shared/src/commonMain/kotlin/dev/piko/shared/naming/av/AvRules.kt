@@ -8,7 +8,7 @@ package dev.piko.shared.naming.av
 // caribbeancompr 的厂牌名。这里只取规则的思路，正则按本文件的约定重写。
 
 /** 规则表版本号。识别结果（番号字符串、分段写法、旗标）发生变化时递增，供后续按版本迁移派生数据使用。 */
-const val AV_RULES_VERSION = 5
+const val AV_RULES_VERSION = 6
 
 // 番号只在文件名开头找：站点前缀（xxx.com@、kcf9.com-、[site.net]、123456_site_）与标签方括号
 // （[中文字幕]、[HD]）剥掉之后，番号必须是第一个记号。在全文里找会把动画文件名里的
@@ -78,6 +78,20 @@ internal val HEYZO = Regex("""^HEYZO[\s_-]*(?:HD[\s_-]*)?([0-9]{3,5})(?![0-9])""
 // 普通单词不是番号
 internal val SEPARATED = Regex("""^([A-Za-z]{2,6})[-_]([0-9]{2,5})(?![0-9])""")
 
+// 单字母厂牌：R-670（UGANDA 的 R 系列）、A-123、C-045。单字母前缀太宽——S-01 是季集号、
+// V-02 是分段、K-1080p 是画质——所以要求数字三位以上、数字后必须是结尾或分隔符，
+// 并把 720/1080/2160 这类分辨率数字排除（见 RESOLUTION_NUMBERS）。大小写都收，输出统一大写
+internal val SINGLE_LETTER_LABEL = Regex("""^([A-Za-z])[-_]([0-9]{3,5})(?![0-9])(?=$|[\s_.\-\[(【])""")
+
+/** 分辨率数字。不排除的话「V-1080」「H-2160」会被当成番号。 */
+internal val RESOLUTION_NUMBERS = setOf("480", "576", "720", "1080", "1440", "2160", "4320")
+
+/**
+ * 既是厂牌、又常被用作分段标记的词：PT-148 是番号，PT-02 是第二段；EP、SP、CD 同理。
+ * 出现在分隔写法的前缀位置时，只有数字达到三位才按番号处理。
+ */
+internal val AMBIGUOUS_PREFIX = setOf("PT", "PART", "EP", "SP", "CD", "CH", "DISC", "VOL", "TRACK", "SC")
+
 // 连写：XYZ123、xyz123、abcd00123pl、ABCD123C、ABCD1234。
 // 通过三重约束与普通文件名、哈希串、相机文件名、年份区分：
 // 1. 字母段须全大写或全小写（过滤 Area88、Gundam0083 等首字母大写作品名）且不在 NOT_A_PREFIX（过滤 DBZ153、IMG123、VID001 等）；
@@ -100,7 +114,7 @@ internal val DATE_CONTINUATION = Regex("""[._-](0[1-9]|1[0-2])[._-][0-9]{2}(?![0
 
 internal val NOT_A_PREFIX = setOf(
     "HEVC", "AVC", "AAC", "FLAC", "DTS", "AC", "EAC", "MP", "FHD", "UHD", "HD", "SD", "BD", "DVD", "WEB", "CD",
-    "DISC", "DISK", "VOL", "PART", "PT", "EP", "SP", "OP", "ED", "NCOP", "NCED", "PV", "CM", "OVA", "OAD", "MA",
+    "DISC", "DISK", "VOL", "PART", "EP", "SP", "OP", "ED", "NCOP", "NCED", "PV", "CM", "OVA", "OAD", "MA",
     "HI", "MAIN", "BIT", "FPS", "BS", "AT", "NHK", "TVK", "BSP", "CR", "NF", "TV", "TS", "OST", "VER", "VTS",
     "VIDEO", "AUDIO", "SEASON", "EPISODE", "MPEG", "MENU", "SCAN", "IMG", "DSC", "BOX", "SET", "CH", "MOVIE",
     "ENDING", "OPENING", "TRACK", "CAM", "DB", "DBZ", "DBS", "DBGT", "AT-X",

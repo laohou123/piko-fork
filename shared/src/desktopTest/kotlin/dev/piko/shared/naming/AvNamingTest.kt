@@ -69,6 +69,28 @@ class AvNamingTest {
     }
 
     @Test
+    fun `single letter labels and ambiguous two letter labels are recognised`() {
+        // 单字母厂牌：R-670（UGANDA 的 R 系列）以前所有规则都要求两个字母以上，直接漏掉
+        listOf("R-670.mp4", "R-670-C.mp4", "R-670 桃乃木かな.mp4", "r-670.mp4").forEach {
+            assertEquals("R-670", parseMediaName(it).av?.code, it)
+        }
+        assertEquals("A-123", parseMediaName("A-123.mp4").av?.code)
+        // 分辨率数字不是番号
+        assertNull(parseMediaName("V-1080.mp4").av)
+        assertNull(parseMediaName("H-2160.mkv").av)
+        // 数字不足三位：S-01 是季集号，PT-02 是分段
+        assertNull(parseMediaName("S-01.mp4").av)
+        assertNull(parseMediaName("PT-02.mp4").av)
+        // PT 既是厂牌又是分段标记：到三位才按番号
+        assertEquals("PT-148", parseMediaName("PT-148.mp4").av?.code)
+        assertEquals("PT-148", parseMediaName("PT-148-C.mp4").av?.code)
+        assertEquals("PT-148", normalizeAvCode("pt-148"))
+        assertEquals("PT-148", normalizeAvCode("pt148"))
+        // 同一次搜索里的邻近番号不能被认成同一个
+        assertNotEquals(parseMediaName("PTS-148.mp4").av?.code, "PT-148")
+    }
+
+    @Test
     fun `ordinary codes drop leading zeros down to three digits while label codes keep theirs`() {
         assertEquals("HEYZO-0123", normalizeAvCode("HEYZO_0123"))
         assertEquals("HEYZO-0123", normalizeAvCode("heyzo_hd_0123_full"))

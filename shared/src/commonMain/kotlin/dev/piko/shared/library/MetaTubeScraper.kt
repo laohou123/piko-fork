@@ -45,18 +45,21 @@ class MetaTubeScraper(
 
     override suspend fun scrape(code: String): ScrapedMovie? {
         // 文件名认不出番号的作品（key 就是文件名）不可能搜到，直接跳过，不发无谓请求
-        if (matchAvFile(code) == null) return null
+        val av = matchAvFile(code) ?: return null
+        // 用解析出的规范番号去搜，不用原始 code：库里可能还留着「R-670-C」这种带旗标的旧 key，
+        // 原样拿它去搜既会少命中，也会让下面的番号比对全部落空
+        val query = av.code
         val base = preferences.metaTubeUrlFlow.first().trim()
         if (base.isEmpty()) return null
         val client = MetaTubeClient(http, base, preferences.metaTubeTokenFlow.first())
 
-        val found = client.search(code).getOrElse { error ->
+        val found = client.search(query).getOrElse { error ->
             PikoLog.w(TAG, "$code: 搜索失败 ${error.message}")
             return null
         }
         // 同一番号可能在多个源上都有，各源字段覆盖差别很大（同一个番号，A 源有简介/演员/截图，
         // B 源只有标题甚至只有番号）。先按源优先级排，再逐个拉详情比较完整度。
-        val candidates = found.filter { matches(it.number, code) }
+        val candidates = found.filter { matches(it.number, query) }
             .sortedBy { providerRank(it.provider) }
         if (candidates.isEmpty()) {
             PikoLog.i(TAG, "$code: 没有数据源命中")

@@ -135,11 +135,18 @@ private fun matchCode(text: String, strict: Boolean): CodeMatch? {
         if (acceptablePrefix(match.groupValues[1])) return CodeMatch(match.groupValues[1], match.groupValues[2], AvKind.STANDARD, match.range.last + 1)
     }
     HEYZO.find(text)?.let { return CodeMatch("HEYZO", it.groupValues[1], AvKind.UNCENSORED_LABEL, it.range.last + 1) }
+    SINGLE_LETTER_LABEL.find(text)?.let { match ->
+        val digits = match.groupValues[2]
+        if (digits !in RESOLUTION_NUMBERS) {
+            return CodeMatch(match.groupValues[1].uppercase(), standardNumber(digits), AvKind.STANDARD, match.range.last + 1)
+        }
+    }
     SEPARATED.find(text)?.let { match ->
         val letters = match.groupValues[1]
+        val digits = match.groupValues[2]
         val date = DATE_CONTINUATION.matchesAt(text, match.range.last + 1)
-        if (acceptablePrefix(letters) && !date) {
-            return CodeMatch(letters.uppercase(), standardNumber(match.groupValues[2]), AvKind.STANDARD, match.range.last + 1)
+        if (acceptableSeparatedPrefix(letters, digits) && !date) {
+            return CodeMatch(letters.uppercase(), standardNumber(digits), AvKind.STANDARD, match.range.last + 1)
         }
     }
     for (glued in listOf(GLUED_DMM, GLUED_PADDED, GLUED_THREE_DIGIT)) {
@@ -169,6 +176,17 @@ private fun matchCode(text: String, strict: Boolean): CodeMatch? {
 
 private fun acceptablePrefix(letters: String): Boolean =
     (letters == letters.uppercase() || letters == letters.lowercase()) && letters.uppercase() !in NOT_A_PREFIX
+
+/**
+ * 分隔写法的前缀校验。比 [acceptablePrefix] 多一层：PT、EP 这些既是厂牌又是分段标记的词，
+ * 数字不足三位时仍当分段处理——「PT-02」是第二段，「PT-148」才是番号。
+ */
+private fun acceptableSeparatedPrefix(letters: String, digits: String): Boolean {
+    val upper = letters.uppercase()
+    if (letters != upper && letters != letters.lowercase()) return false
+    if (upper in AMBIGUOUS_PREFIX) return digits.length >= 3
+    return upper !in NOT_A_PREFIX
+}
 
 private fun partOfLetter(letter: Char): String = "CD${letter.uppercaseChar() - 'A' + 1}"
 

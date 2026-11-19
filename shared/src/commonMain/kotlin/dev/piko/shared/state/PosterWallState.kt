@@ -20,6 +20,7 @@ import dev.piko.shared.library.ScannedWorkFile
 import dev.piko.shared.library.WorkRow
 import dev.piko.shared.log.PikoLog
 import dev.piko.shared.naming.av.matchAv
+import dev.piko.shared.naming.av.matchAvFile
 import dev.piko.shared.translate.TranslationGateway
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -594,7 +595,14 @@ class PosterWallState(
         return try {
             val movie = runCatching { scraper.scrape(code) }.getOrNull()
             if (movie == null) {
-                _messages.tryEmit("$code 没刮到，检查设置里的 MetaTube 地址与令牌")
+                // 认不出番号时 scrape 根本不会发请求，这时候说「检查地址与令牌」是误导
+                _messages.tryEmit(
+                    if (matchAvFile(code) == null) {
+                        "$code 认不出番号，先把文件名改成 ABC-123 这种写法"
+                    } else {
+                        "$code 没刮到，检查设置里的 MetaTube 地址与令牌"
+                    },
+                )
                 false
             } else {
                 store.markScraped(

@@ -23,6 +23,11 @@ import java.util.concurrent.ConcurrentHashMap
 
 /** 内存偏好。只有被测路径读写的几项有真实行为，其余给固定值。 */
 class MemoryPreferences : PikoUserPreferences {
+    override val vaultSizeFilterFlow: Flow<String> = MutableStateFlow("OFF")
+    override suspend fun setVaultSizeFilter(mode: String) = Unit
+    override val vaultSizeLimitGbFlow: Flow<Int> = MutableStateFlow(0)
+    override suspend fun setVaultSizeLimitGb(gb: Int) = Unit
+
     override val saveAsReferenceFlow = MutableStateFlow(false)
     override suspend fun setSaveAsReference(enabled: Boolean) { saveAsReferenceFlow.value = enabled }
 
