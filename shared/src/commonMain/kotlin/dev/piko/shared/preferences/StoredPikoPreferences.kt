@@ -79,6 +79,7 @@ class StoredPikoPreferences(
     private val spoiler = MutableStateFlow(settings.get(KEY_SPOILER, "true").toBoolean())
     private val autoCheckUpdates = MutableStateFlow(settings.get(KEY_AUTO_CHECK_UPDATES, "true").toBoolean())
     private val autoDetectClipboardLinks = MutableStateFlow(settings.get("ui.autoDetectClipboardLinks") == "true")
+    private val autoEnrichOnLaunch = MutableStateFlow(settings.get(KEY_AUTO_ENRICH_ON_LAUNCH, "true").toBoolean())
     private val reduceMotion = MutableStateFlow(settings.get(KEY_REDUCE_MOTION) == "true")
     private val hardwareDecoding = MutableStateFlow(settings.get(KEY_HARDWARE_DECODING, "true").toBoolean())
     private val playbackMaxHeight = MutableStateFlow(settings.get(KEY_PLAYBACK_MAX_HEIGHT).toIntOrNull() ?: 0)
@@ -173,6 +174,12 @@ class StoredPikoPreferences(
     override suspend fun setAutoDetectClipboardLinks(enabled: Boolean) {
         settings.set("ui.autoDetectClipboardLinks", enabled.toString())
         autoDetectClipboardLinks.value = enabled
+    }
+
+    override val autoEnrichOnLaunchFlow: Flow<Boolean> = autoEnrichOnLaunch.asStateFlow()
+    override suspend fun setAutoEnrichOnLaunch(enabled: Boolean) {
+        settings.set(KEY_AUTO_ENRICH_ON_LAUNCH, enabled.toString())
+        autoEnrichOnLaunch.value = enabled
     }
 
     override val reduceMotionFlow: Flow<Boolean> = reduceMotion.asStateFlow()
@@ -628,6 +635,7 @@ class StoredPikoPreferences(
         const val KEY_IGNORED_UPDATE = "update.ignoredVersion"
         const val KEY_SPOILER = "ui.spoilerBlur"
         const val KEY_AUTO_CHECK_UPDATES = "update.autoCheck"
+        const val KEY_AUTO_ENRICH_ON_LAUNCH = "poster.autoEnrichOnLaunch"
         const val KEY_REDUCE_MOTION = "ui.reduceMotion"
         const val KEY_HARDWARE_DECODING = "player.hardwareDecoding"
         const val KEY_PLAYBACK_MAX_HEIGHT = "player.maxHeight"

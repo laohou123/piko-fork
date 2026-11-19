@@ -308,6 +308,16 @@ interface PikoUserPreferences {
     val autoDetectClipboardLinksFlow: Flow<Boolean>
     suspend fun setAutoDetectClipboardLinks(enabled: Boolean)
 
+    /**
+     * 每次打开应用（进海报墙、换账号）时自动补刮缺标题/封面的作品，默认开。
+     *
+     * 关掉后启动不再向刮削源发请求：作品照样按番号显示，只是没有片名与封面；
+     * 扫描完成、更换刮削源、手动点「补刮元数据」这三处不受影响。
+     * 每台设备各自的，不同步：手机想省流量、桌面无所谓。
+     */
+    val autoEnrichOnLaunchFlow: Flow<Boolean> get() = flowOf(true)
+    suspend fun setAutoEnrichOnLaunch(enabled: Boolean) {}
+
     /** 设置里的「减少动画」，默认关，与系统的减少动画取或。每台设备各自的，不同步：系统那一半本来就按设备。 */
     val reduceMotionFlow: Flow<Boolean>
     suspend fun setReduceMotion(enabled: Boolean)

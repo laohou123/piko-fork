@@ -138,6 +138,8 @@ class SessionManager(private val context: Context) : PikoUserPreferences {
         val SPOILER_BLUR_ENABLED = booleanPreferencesKey("spoiler_blur_enabled")
         val AUTO_CHECK_UPDATES = booleanPreferencesKey("auto_check_updates")
         val AUTO_DETECT_CLIPBOARD_LINKS = booleanPreferencesKey("auto_detect_clipboard_links")
+        /** 每次打开应用自动补刮元数据，默认开。 */
+        val AUTO_ENRICH_ON_LAUNCH = booleanPreferencesKey("auto_enrich_on_launch")
         val REDUCE_MOTION = booleanPreferencesKey("reduce_motion")
         /** 作品详情页顶部自动播放预览片，默认开。 */
         val POSTER_AUTO_PREVIEW = booleanPreferencesKey("poster_auto_preview")
@@ -273,6 +275,15 @@ class SessionManager(private val context: Context) : PikoUserPreferences {
     override suspend fun setAutoDetectClipboardLinks(enabled: Boolean) {
         context.dataStore.edit { preferences ->
             preferences[PreferencesKeys.AUTO_DETECT_CLIPBOARD_LINKS] = enabled
+        }
+    }
+
+    override val autoEnrichOnLaunchFlow: Flow<Boolean> =
+        preference { it[PreferencesKeys.AUTO_ENRICH_ON_LAUNCH] ?: true }
+
+    override suspend fun setAutoEnrichOnLaunch(enabled: Boolean) {
+        context.dataStore.edit { preferences ->
+            preferences[PreferencesKeys.AUTO_ENRICH_ON_LAUNCH] = enabled
         }
     }
 

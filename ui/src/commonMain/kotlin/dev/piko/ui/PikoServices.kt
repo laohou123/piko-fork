@@ -460,6 +460,8 @@ class PikoServices(
                 preferences.vaultSizeLimitGbFlow,
                 driveRepository.quotaFlow,
             ) { _, _, _ -> Unit },
+            // 设置里的「启动时自动补刮元数据」：启动与换号时各读一次，改完下次启动生效
+            autoEnrichOnLaunch = { preferences.autoEnrichOnLaunchFlow.first() },
             scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate),
         )
     }

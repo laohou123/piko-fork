@@ -31,6 +31,7 @@ import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.automirrored.outlined.Sort
 import androidx.compose.material.icons.outlined.AccountCircle
 import androidx.compose.material.icons.outlined.Animation
+import androidx.compose.material.icons.outlined.AutoAwesome
 import androidx.compose.material.icons.outlined.AutoFixHigh
 import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.CleaningServices
@@ -588,6 +589,22 @@ fun SettingsScreen(
                                     trailingIcon = null,
                                 )
                             }
+                            // 开屏补刮会向刮削源发一轮请求（缺标题/封面的作品多时能跑上好几分钟），
+                            // 想省流量或不想被限流的用户可以关掉；扫描与手动补刮不受影响
+                            val autoEnrich by sessionManager.autoEnrichOnLaunchFlow.collectAsStateWithLifecycle(initialValue = true)
+                            SettingsSwitchRow(
+                                icon = Icons.Outlined.AutoAwesome,
+                                title = tr("启动时自动补刮元数据", "Enrich metadata on launch", "起動時にメタデータを自動補完", "실행 시 메타데이터 자동 보완", "啟動時自動補刮中繼資料"),
+                                supporting = tr(
+                                    "每次打开应用时把缺片名或封面的作品补齐；关闭后启动不再请求刮削源，扫描、更换刮削源与手动补刮仍然有效",
+                                    "Fills in missing titles and covers whenever Piko opens. Turned off, launch makes no metadata requests; scanning, switching sources and manual enrich still work",
+                                    "アプリを開くたびにタイトルや表紙が欠けている作品を補います。オフにすると起動時にスクレイパーへ問い合わせません（スキャン・ソース変更・手動補完は有効）",
+                                    "앱을 열 때마다 제목이나 표지가 없는 작품을 채웁니다. 끄면 실행 시 스크레이퍼에 요청하지 않으며, 스캔·소스 변경·수동 보완은 그대로 동작합니다",
+                                    "每次開啟應用程式時把缺片名或封面的作品補齊；關閉後啟動不再請求刮削來源，掃描、更換刮削來源與手動補刮仍然有效",
+                                ),
+                                checked = autoEnrich,
+                                onCheckedChange = { scope.launch { sessionManager.setAutoEnrichOnLaunch(it) } },
+                            )
                             if (translationGateway != null) {
                                 val configured = activeProfile?.complete == true
                                 SettingsNavigationRow(

@@ -70,6 +70,12 @@ class PosterWallState(
      * 在 init 里收集，状态活多久就听多久。
      */
     private val vaultSizeFilterChanges: Flow<Unit>? = null,
+    /**
+     * 启动（进海报墙）与换账号时是否自动补刮元数据，对应设置里的开关。
+     * 传取值函数而不是布尔：状态在 App 启动时就建好，那时偏好可能还没读出来。
+     * 注意只管这两处；扫描完成、换刮削源、手动点「补刮元数据」都不受它影响。
+     */
+    private val autoEnrichOnLaunch: suspend () -> Boolean = { true },
     private val scope: CoroutineScope,
 ) {
     enum class Phase { IDLE, SCANNING, DONE, FAILED }
@@ -232,7 +238,8 @@ class PosterWallState(
             vaultSizeFilterChanges?.let { changes -> launch { changes.collect { refresh() } } }
             // 上一轮扫描有没刮到的作品（MetaTube 不通、查询失败）：进海报墙就补，
             // 不用等用户手动再扫一轮。没有待刮作品时 enrich 空转返回，不弹消息
-            enrich(silent = true)
+            // 设置里关掉「启动时自动补刮」就跳过：不向刮削源发任何请求，等用户自己点
+            if (autoEnrichOnLaunch()) enrich(silent = true)
         }
     }
 
@@ -253,7 +260,8 @@ class PosterWallState(
             filterName = null
             refresh()
             // 换号后同样把没刮到的补上：新账号的库可能是旧版本扫的，一样会留着没封面的作品
-            enrich(silent = true)
+            // 这个开关也管它：关着时换号不自动发请求，免得切账号顺手跑一轮大批刮削
+            if (autoEnrichOnLaunch()) enrich(silent = true)
         }
     }
 
