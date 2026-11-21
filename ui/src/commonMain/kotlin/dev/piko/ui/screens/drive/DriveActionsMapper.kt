@@ -139,6 +139,8 @@ internal class DriveItemActionIntents(
     val onRevealFromGalleryOrLibrary: (FileStat) -> Unit,
     val onRevealLocalInFileManager: (String) -> Unit,
     val onUnmountLocal: (String) -> Unit,
+    /** 翻译一份字幕文件：fileId 与所在目录由实现方自己查。为 null 表示翻译功能不可用。 */
+    val onTranslateSubtitle: ((FileStat) -> Unit)? = null,
 )
 
 internal fun buildArchiveEntryActions(
@@ -461,6 +463,9 @@ internal fun buildDriveOperations(
         togglePreview = { state.toggleSpoiler(file.id) },
         putOnClipboard = { cut -> state.putOnClipboard(listOf(file.id), cut) },
         copyDownloadLink = if (!file.isFolder && !file.isVaulted && !file.isUploading) ({ intents.onCopyDownloadLink(file) }) else null,
+        translateSubtitle = intents.onTranslateSubtitle
+            ?.takeIf { !file.isUploading && !file.isVaulted }
+            ?.let { { it(file) } },
     )
     return reveal + removeRecord + fileActions(file, commands, handlers)
 }

@@ -887,6 +887,18 @@ private fun DriveScreenContent(
         events.onRevealInDrive?.invoke(file) ?: state.revealInDrive(file)
     }
 
+    // 文件页里点「翻译字幕」时打开的那份字幕；null 表示对话框关着
+    var translateSubtitleFile by remember { mutableStateOf<FileStat?>(null) }
+
+    translateSubtitleFile?.let { target ->
+        SubtitleTranslateDialog(
+            file = target,
+            onDismiss = { translateSubtitleFile = null },
+            // 译文落在当前目录：刷一次列表，让 `<番号>.zh.srt` 立刻出现
+            onUploaded = { state.load(refresh = true) },
+        )
+    }
+
     val actionIntents = DriveItemActionIntents(
         desktop = desktop,
         isWorkspaceBrowser = snapshot.isWorkspaceBrowser,
@@ -945,6 +957,12 @@ private fun DriveScreenContent(
         onRevealFromGalleryOrLibrary = ::revealFromGalleryOrLibrary,
         onRevealLocalInFileManager = events.onRevealLocalInFileManager,
         onUnmountLocal = events.onUnmountLocalFolder,
+        // 翻译模型没配好就不显示这一项：点了也只能看到「还没配置」
+        onTranslateSubtitle = if (LocalPikoServices.current.translation != null) {
+            { translateSubtitleFile = it }
+        } else {
+            null
+        },
     )
     val latestIntents by rememberUpdatedState(actionIntents)
     val latestEvents by rememberUpdatedState(events)

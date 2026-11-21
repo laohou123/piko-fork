@@ -1,5 +1,7 @@
 package dev.piko.ui.screens.player
 
+import dev.piko.data.repository.FileCategory
+import dev.piko.data.repository.fileCategory
 import dev.piko.shared.i18n.tr
 
 import androidx.compose.animation.AnimatedVisibility
@@ -838,6 +840,10 @@ internal fun TracksPanel(
     driveSubtitleFiles: List<DriveSubtitleFile> = emptyList(),
     /** 删除一条网盘字幕文件；为 null 时字幕行不给删除按钮。 */
     onDeleteSubtitle: ((fileId: String) -> Unit)? = null,
+    /** 直接翻某一份网盘字幕（fileId）；为 null 时字幕行不给翻译按钮。 */
+    onTranslateSubtitleFile: ((fileId: String) -> Unit)? = null,
+    /** 本机字幕只能按文件名翻：同一份文件通常也在视频所在的网盘目录里。 */
+    onTranslateSubtitleByName: ((name: String) -> Unit)? = null,
 ) {
     Column(
         modifier = modifier
@@ -861,15 +867,37 @@ internal fun TracksPanel(
             TrackRow(label = tr("关闭", "Close", "閉じる", "닫기", "關閉"), selected = selectedSubtitleTrackId == null, onClick = { onSelectSubtitle(null) })
             // 取成局部 val：下面的 lambda 会延后执行，参数的智能转换在 lambda 里不成立
             val delete = onDeleteSubtitle
+            val translateFile = onTranslateSubtitleFile
+            val translateByName = onTranslateSubtitleByName
             subtitleTracks.forEachIndexed { index, track ->
-                // 只有网盘来的外挂字幕有文件可删；本机字幕与容器内轨道没有 fileId
-                val file = driveSubtitleFiles.firstOrNull { it.title == track.title }
+                // 网盘来的外挂字幕有 fileId；本机挑的字幕只有文件名，按名字去视频目录里对
+                val trackTitle = track.title.orEmpty()
+                val file = driveSubtitleFiles.firstOrNull { it.title == trackTitle }
+                val canTranslate = if (file != null) {
+                    translateFile != null
+                } else {
+                    translateByName != null && trackTitle.fileCategory() == FileCategory.SUBTITLE
+                }
+                // 只有网盘文件能删；本机字幕没有可删的东西
+                val canDelete = delete != null && file != null
                 TrackRow(
                     label = trackDisplayName(track, index),
                     selected = track.id == selectedSubtitleTrackId,
                     onClick = { onSelectSubtitle(track) },
-                    trailing = if (file != null && delete != null) {
-                        { SubtitleDeleteButton(onClick = { delete(file.fileId) }) }
+                    trailing = if (canTranslate || canDelete) {
+                        {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                if (canTranslate) {
+                                    SubtitleTranslateButton {
+                                        if (file != null) translateFile?.invoke(file.fileId)
+                                        else translateByName?.invoke(trackTitle)
+                                    }
+                                }
+                                if (canDelete && file != null) {
+                                    SubtitleDeleteButton(onClick = { delete?.invoke(file.fileId) })
+                                }
+                            }
+                        }
                     } else {
                         null
                     },
@@ -902,6 +930,31 @@ internal fun TracksPanel(
                 )
             }
         }
+    }
+}
+
+/**
+ * 字幕行的翻译按钮：点一下就把这份字幕（通常在网盘里）翻成中文，译文传回同一目录。
+ *
+ * 与 [SubtitleDeleteButton] 同为 30dp 点击区、18dp 图标：字幕行只有 48dp 高，
+ * 用 IconButton 的 48dp 最小触控区会让两个按钮几乎贴在一起，容易点错——翻译和删除挨着，
+ * 点错的代价太大。
+ */
+@Composable
+internal fun SubtitleTranslateButton(onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .size(30.dp)
+            .clip(CircleShape)
+            .clickable(role = Role.Button, onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(
+            Icons.Outlined.Translate,
+            contentDescription = tr("翻译这份字幕", "Translate this subtitle", "この字幕を翻訳", "이 자막 번역", "翻譯這份字幕"),
+            tint = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.size(18.dp),
+        )
     }
 }
 

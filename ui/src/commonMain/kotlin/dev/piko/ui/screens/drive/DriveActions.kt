@@ -30,6 +30,7 @@ import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.outlined.StarOutline
 import androidx.compose.material.icons.outlined.AddToPhotos
 import androidx.compose.material.icons.outlined.Timelapse
+import androidx.compose.material.icons.outlined.Translate
 import androidx.compose.material.icons.outlined.Unarchive
 import androidx.compose.material.icons.outlined.Visibility
 import androidx.compose.material.icons.outlined.VisibilityOff
@@ -147,6 +148,15 @@ internal object DriveActions {
     fun restoreFromVault(onClick: () -> Unit) = SheetAction(Icons.Outlined.CloudDownload, tr("恢复到网盘", "Restore to drive", "ドライブに復元", "드라이브로 복원", "還原至雲端硬碟"), onClick, group = ActionGroup.Open)
 
     fun revealInDrive(onClick: () -> Unit) = SheetAction(Icons.Outlined.FolderOpen, tr("在网盘中显示", "Show in drive", "ドライブで表示", "드라이브에서 보기", "在雲端硬碟中顯示"), onClick, group = ActionGroup.Open)
+
+    /** 字幕文件的 AI 翻译：译文传回同一目录，文件名用从字幕名解析出的番号。 */
+    fun translateSubtitle(onClick: () -> Unit) = SheetAction(
+        Icons.Outlined.Translate,
+        tr("翻译字幕…", "Translate subtitles…", "字幕を翻訳…", "자막 번역…", "翻譯字幕…"),
+        onClick,
+        group = ActionGroup.Open,
+        shortLabel = tr("翻译", "Translate", "翻訳", "번역", "翻譯"),
+    )
 
     // 圆盘里的一角，取「时间轴上的一段」。原用 ContentCut，与桌面菜单图标行的「剪切」同形
     fun downloadSegment(onClick: () -> Unit, onPrepare: (() -> Unit)?) = SheetAction(

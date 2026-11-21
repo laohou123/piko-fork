@@ -82,6 +82,9 @@ class SubtitleCatSource(
 
         val candidates = mutableListOf<SubtitleCandidate>()
         val seen = mutableSetOf<String>()
+        // 「语言码|原始字幕路径」，给可翻译条目去重用（不能与上面的 seen 共用：
+        // 多个语言指向同一份原始字幕是正常的，key 必须带上语言）
+        val seenTranslatable = mutableSetOf<String>()
         // 站点把「能翻但还没人翻」的语言也列出来（一百多个），全列出来会刷屏，
         // 所以只有中文进列表当一行，其余的只报个总数
         val translatable = mutableListOf<SubtitleCandidate>()
@@ -129,6 +132,12 @@ class SubtitleCatSource(
                 path = originPath,
                 translatable = true,
             )
+            // 同一个语言、同一份原始字幕在页面上可能出现两次（站点改版后新旧两套按钮并存）。
+            // 以前不去重：列表里会有两行一模一样的「中文（简体）」，而 Compose 用 path 当 key，
+            // 重复 key 直接抛 IllegalArgumentException 把播放器整个带崩——日志里
+            // 「Key "/subs/1803/xxx-orig.srt" was already used」就是这个。
+            val key = "$code|$originPath"
+            if (!seenTranslatable.add(key)) continue
             if (code.startsWith("zh")) translatable.add(entry) else otherTranslatable++
         }
 

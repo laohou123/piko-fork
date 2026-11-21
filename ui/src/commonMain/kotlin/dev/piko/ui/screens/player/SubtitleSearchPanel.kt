@@ -15,7 +15,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
@@ -215,7 +215,9 @@ private fun HintLine(text: String, isError: Boolean = false) {
 private fun HitList(state: SubtitleSearchState) {
     if (state.hits.isEmpty()) return
     LazyColumn(contentPadding = PaddingValues(start = 12.dp, end = 12.dp, bottom = 24.dp)) {
-        items(state.hits, key = { it.pagePath }) { hit ->
+        // 不加 key：索引本身就是唯一键。站点偶尔返回两条同 pagePath 的结果（同一个分享页挂了
+        // 两个标题），用 pagePath 当 key 会重复，Compose 抛异常把播放器带崩。
+        itemsIndexed(state.hits) { _, hit ->
             HitRow(hit) { state.openDetail(hit) }
         }
     }
@@ -277,7 +279,9 @@ private fun DetailList(
         return
     }
     LazyColumn(contentPadding = PaddingValues(start = 12.dp, end = 12.dp, bottom = 24.dp)) {
-        items(detail.candidates, key = { it.path }) { candidate ->
+        // 同上：path 不保证唯一（多个语言共用一份原始字幕、页面重复块都会撞车），
+        // 索引当 key 才不会触发 "Key ... was already used" 崩溃。
+        itemsIndexed(detail.candidates) { _, candidate ->
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier

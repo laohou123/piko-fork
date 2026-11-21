@@ -100,6 +100,10 @@ internal fun PlayerSheetsOverlay(
     driveSubtitleFiles: List<DriveSubtitleFile> = emptyList(),
     onDeleteDriveSubtitle: ((fileId: String) -> Unit)? = null,
 ) {
+    // 字幕行点「翻译」时记住是哪一份，进面板直接开翻；面板接手后清空，
+    // 否则关掉再点「AI 翻译字幕…」会莫名其妙又翻一遍。
+    var pendingTranslateFileId by remember { mutableStateOf<String?>(null) }
+    var pendingTranslateName by remember { mutableStateOf<String?>(null) }
     PlayerSheetHost(
         sheet = openSheet,
         isLandscape = isLandscape,
@@ -164,6 +168,20 @@ internal fun PlayerSheetsOverlay(
                 onTranslateSubtitle = subtitleTranslateCode?.let { { onOpenSheet(PlayerSheet.TranslateSubtitle) } },
                 driveSubtitleFiles = driveSubtitleFiles,
                 onDeleteSubtitle = onDeleteDriveSubtitle,
+                // 字幕行直接翻这一份：不先设 pending 就切面板，面板拿不到要翻哪个文件
+                onTranslateSubtitleFile = subtitleTranslateCode?.let {
+                    { fileId ->
+                        pendingTranslateFileId = fileId
+                        onOpenSheet(PlayerSheet.TranslateSubtitle)
+                    }
+                },
+                // 本机字幕没有 fileId，只能按文件名在视频所在目录里找同名文件
+                onTranslateSubtitleByName = subtitleTranslateCode?.let {
+                    { name ->
+                        pendingTranslateName = name
+                        onOpenSheet(PlayerSheet.TranslateSubtitle)
+                    }
+                },
             )
             PlayerSheet.DriveSubtitles -> DriveSubtitlePanel(
                 videoFileId = currentFileId,
@@ -183,6 +201,12 @@ internal fun PlayerSheetsOverlay(
                         onOpenSheet(PlayerSheet.Tracks)
                     },
                     modifier = Modifier.weight(1f),
+                    autoTranslateFileId = pendingTranslateFileId,
+                    autoTranslateName = pendingTranslateName,
+                    onAutoTranslateHandled = {
+                        pendingTranslateFileId = null
+                        pendingTranslateName = null
+                    },
                 )
             }
             // 搜索字幕：与 AI 翻译同款内嵌面板，搜到并传完就回到字幕列表

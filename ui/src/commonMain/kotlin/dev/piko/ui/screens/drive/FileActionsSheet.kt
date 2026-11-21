@@ -24,6 +24,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import dev.piko.data.repository.isPlayableVideo
+import dev.piko.data.repository.fileCategory
+import dev.piko.data.repository.FileCategory
 import dev.piko.shared.data.FolderUsage
 import dev.piko.shared.log.PikoLog
 import dev.piko.shared.log.logFolder
@@ -166,6 +168,8 @@ internal class FileActionHandlers(
     val putOnClipboard: ((cut: Boolean) -> Unit)?,
     val downloadAtQuality: () -> Unit,
     val copyDownloadLink: (() -> Unit)? = null,
+    /** 字幕文件的 AI 翻译；没配置翻译模型时（或不是字幕文件）为 null。 */
+    val translateSubtitle: (() -> Unit)? = null,
 )
 
 /**
@@ -188,6 +192,10 @@ internal fun fileActions(file: FileStat, commands: ItemCommands, on: FileActionH
     if (commands.extract) add(DriveActions.extract(on.extract))
     if (commands.downloadAtQuality) add(DriveActions.downloadAtQuality(on.prepareQualities.takeIf { video }, on.downloadAtQuality))
     if (video) add(DriveActions.downloadSegment(on.downloadSegment, on.prepareQualities))
+    // 字幕：直接翻这一份，译文传回字幕所在目录。文件夹、压缩包、归档条目不走这里
+    if (!file.isFolder && file.fileCategory() == FileCategory.SUBTITLE) {
+        on.translateSubtitle?.let { add(DriveActions.translateSubtitle(it)) }
+    }
     if (!file.isFolder && commands.download) on.copyDownloadLink?.let { add(DriveActions.copyDownloadLink(it)) }
     if (video) on.openInExternalPlayer?.let { add(DriveActions.openInExternalPlayer(it)) }
     if (file.isFolder) on.openInNewTab?.let { add(DriveActions.openInNewTab(it)) }

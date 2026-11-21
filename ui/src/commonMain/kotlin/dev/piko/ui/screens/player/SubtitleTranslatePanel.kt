@@ -20,8 +20,10 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.backhandler.BackHandler
@@ -33,6 +35,8 @@ import dev.piko.shared.state.SubtitleTranslateState
 import dev.piko.ui.platform.LocalPikoPlatform
 import dev.piko.ui.LocalPikoServices
 import dev.piko.ui.components.PikoEmptyState
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * AI 翻译网盘里的字幕：先在这个面板里选一份原字幕（通常是日文），翻好的
@@ -46,6 +50,12 @@ internal fun SubtitleTranslatePanel(
     code: String,
     onUploaded: (fileId: String, name: String) -> Unit,
     modifier: Modifier = Modifier,
+    /** 从字幕行或文件菜单直接点「翻译」时带进来：进面板就翻这一份，不用再手动找。 */
+    autoTranslateFileId: String? = null,
+    /** 本机字幕没有 fileId，只能按文件名在视频所在目录里找同名文件来翻。 */
+    autoTranslateName: String? = null,
+    /** 自动翻已经发起（或无法发起）时回调，避免关掉再进来时重复触发。 */
+    onAutoTranslateHandled: (() -> Unit)? = null,
 ) {
     val services = LocalPikoServices.current
     val scope = rememberCoroutineScope()
@@ -85,6 +95,22 @@ internal fun SubtitleTranslatePanel(
     }
 
     BackHandler(enabled = browser.path.size > 1) { browser.navigateUp() }
+
+    // 带着字幕文件进来：等目录定位好（译文要传回视频所在目录）就立刻开翻。
+    // 只等 8 秒——定位失败时退回手动挑一份，比一直转圈强。
+    LaunchedEffect(autoTranslateFileId, autoTranslateName, state) {
+        val target = autoTranslateFileId
+        val byName = autoTranslateName
+        if (target == null && byName == null) return@LaunchedEffect
+        val ready = withTimeoutOrNull(8_000) {
+            snapshotFlow { browser.current to browser.isLoading }.first { it.first != null && !it.second }
+        }
+        if (state != null && ready != null) {
+            // 有 fileId 就直翻；本机字幕只有文件名，按名字在目录里对上再翻
+            if (target != null) state.translate(target) else state.translateByName(requireNotNull(byName))
+        }
+        onAutoTranslateHandled?.invoke()
+    }
 
     Column(modifier.fillMaxSize()) {
         Text(
@@ -137,11 +163,11 @@ internal fun SubtitleTranslatePanel(
                     icon = Icons.Outlined.Subtitles,
                     label = file.name,
                     // 已经在翻的时候整行不可点，避免同时发两份
-                    onClick = { if (state.canTranslate()) state.translate(file) },
+                    onClick = { if (state.canTranslate()) state.translate(file.id) },
                     trailing = {
                         IconButton(
                             enabled = state.canTranslate(),
-                            onClick = { state.translate(file) },
+                            onClick = { state.translate(file.id) },
                         ) {
                             Icon(
                                 Icons.Outlined.Translate,

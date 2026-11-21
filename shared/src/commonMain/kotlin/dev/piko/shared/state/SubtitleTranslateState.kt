@@ -67,14 +67,36 @@ class SubtitleTranslateState(
     /** 现在能不能用翻译：模型配好了、也不是没空闲。 */
     fun canTranslate(): Boolean = translatingId == null
 
-    /** 翻 [file]。[code] 用来拼译文名，一般是作品的番号。 */
-    fun translate(file: FileStat) {
+    /**
+     * 按文件名翻字幕。
+     *
+     * 播放器里从本机挑的字幕没有 fileId（播放器只知道本地路径），但同一份文件通常也躺在
+     * 视频所在的网盘目录里——按名字对上就能翻。对不上时把原因写进 [error]，不会静默失败。
+     */
+    fun translateByName(name: String) {
+        if (translatingId != null) return
+        val match = browser.subtitles.firstOrNull { it.name == name }
+            ?: browser.subtitles.firstOrNull { it.name.equals(name, ignoreCase = true) }
+        if (match == null) {
+            error = "网盘这个文件夹里没有「$name」，先把它传上去再翻"
+            return
+        }
+        translate(match.id)
+    }
+
+    /**
+     * 翻网盘里的 [fileId]。[code] 用来拼译文名，一般是作品的番号。
+     *
+     * 只收 fileId 而不是整个 FileStat：调用方常常只有一个网盘文件 id（播放器字幕行、
+     * 文件页菜单），拿不到完整的文件对象，而这里除了 id 也用不到别的字段。
+     */
+    fun translate(fileId: String) {
         if (translatingId != null) return
         error = null
         result = null
         progress = null
         job = scope.launch {
-            translatingId = file.id
+            translatingId = fileId
             try {
                 val translator = gateway.subtitleTranslator()
                 if (translator == null) {
@@ -82,7 +104,7 @@ class SubtitleTranslateState(
                     return@launch
                 }
                 stage = Stage.DOWNLOADING
-                val source = readSubtitle(file.id)
+                val source = readSubtitle(fileId)
                 if (source.isNullOrBlank()) {
                     error = "读不到这个字幕文件"
                     return@launch
