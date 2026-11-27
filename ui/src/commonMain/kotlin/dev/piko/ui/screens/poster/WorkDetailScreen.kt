@@ -77,6 +77,7 @@ import dev.piko.shared.data.VaultEntry
 import dev.piko.shared.library.NamedCount
 import dev.piko.shared.library.ScannedWorkFile
 import dev.piko.shared.library.WorkDetail
+import dev.piko.shared.media.PikoMediaRepository
 import dev.piko.shared.media.PreparedPlayback
 import dev.piko.shared.media.player.PlaybackTarget
 import dev.piko.ui.LocalPikoServices
@@ -552,7 +553,9 @@ fun WorkDetailScreen(
                                     services.postAppNotice("移除失败：${e.message ?: "请稍后再试"}")
                                 }
                             } else {
-                                val result = services.mediaRepository.trashFiles(realIds)
+                                val repo = services.mediaRepository as? PikoMediaRepository
+                                val result: Result<Unit> = repo?.trashFiles(realIds)
+                                    ?: Result.failure(UnsupportedOperationException("trash not supported"))
                                 // 引用条目网盘里没有文件，trash 不能碰：单独从清单里摘掉。
                                 // 摘不掉也只是下次扫描又出现，不该让已经成功的删除报失败
                                 if (result.isSuccess && mixed) {

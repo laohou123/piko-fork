@@ -1,0 +1,1259 @@
+package dev.piko.ui.screens.drive
+
+import dev.piko.ui.resources.*
+import dev.piko.ui.i18n.stringResource
+
+import dev.piko.shared.i18n.PikoLocale
+import dev.piko.shared.i18n.tr
+
+import dev.piko.ui.components.LocalFileDrag
+import dev.piko.ui.components.AdaptiveBar
+import dev.piko.ui.components.BarItem
+import dev.piko.ui.components.connectedToggleShapes
+import dev.piko.shared.data.PikoPathBreadcrumb
+import dev.piko.ui.components.fileDropTarget
+import dev.piko.ui.components.fileDragSource
+import dev.piko.ui.components.FileDragPayload
+import dev.piko.ui.components.fileDragAutoScroll
+import dev.piko.ui.components.marqueeSelection
+import dev.piko.ui.components.LocalFocusFallback
+import dev.piko.ui.components.OwnClicks
+import dev.piko.ui.components.LocalOwnClicks
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.EnterTransition
+import androidx.compose.animation.ExitTransition
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.LazyGridState
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.itemsIndexed
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ViewList
+import androidx.compose.material.icons.automirrored.outlined.Sort
+import androidx.compose.material.icons.filled.GridView
+import androidx.compose.material.icons.filled.PhotoLibrary
+import androidx.compose.material.icons.automirrored.outlined.ViewList
+import androidx.compose.material.icons.outlined.GridView
+import androidx.compose.material.icons.outlined.PhotoLibrary
+import androidx.compose.material.icons.outlined.FilterList
+import androidx.compose.material.icons.outlined.ArrowDownward
+import androidx.compose.material.icons.outlined.ArrowUpward
+import androidx.compose.material.icons.outlined.AutoAwesome
+import androidx.compose.material.icons.outlined.Check
+import androidx.compose.material.icons.outlined.ExpandLess
+import androidx.compose.material.icons.outlined.ExpandMore
+import androidx.compose.material3.ButtonGroupDefaults
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.LocalContentColor
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.ToggleButton
+import androidx.compose.material3.PlainTooltip
+import androidx.compose.material3.TooltipAnchorPosition
+import androidx.compose.material3.TooltipBox
+import androidx.compose.material3.TooltipDefaults
+import androidx.compose.material3.rememberTooltipState
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.Immutable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.Stable
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.snapshotFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.layout
+import androidx.compose.ui.layout.onPlaced
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
+import dev.piko.ui.adaptive.WidthClass
+import dev.piko.ui.adaptive.currentWidthClass
+import dev.piko.data.repository.FileCategory
+import dev.piko.data.repository.FileSortOrder
+import dev.piko.data.repository.label
+import dev.piko.shared.data.PikoSortField
+import dev.piko.shared.data.field
+import dev.piko.shared.data.isAscending
+import dev.piko.shared.data.isDriveFolderId
+import dev.piko.ui.LocalPikoServices
+import dev.piko.ui.components.ContextMenuArea
+import dev.piko.shared.state.DriveFolderView
+import dev.piko.shared.state.DriveItemName
+import dev.piko.shared.state.driveItemName
+import dev.piko.shared.state.DriveListItem
+import dev.piko.ui.components.FileListItem
+import dev.piko.ui.components.FileRowSkeleton
+import dev.piko.ui.components.SkeletonBlock
+import dev.piko.ui.components.SkeletonGroup
+import dev.piko.ui.components.icon
+import dev.piko.ui.components.MediaTagRow
+import dev.piko.ui.components.PikoDropdownMenu
+import dev.piko.ui.components.ActionGroup
+import dev.piko.ui.components.SheetAction
+import dev.piko.ui.components.menuItemShape
+import dev.piko.ui.components.selectionClicks
+import dev.piko.ui.components.verticalWheelScrollsRow
+import dev.piko.ui.components.zoomOnWheel
+import dev.piko.ui.components.TooltipIconButton
+import dev.piko.ui.platform.LocalPikoPlatform
+import dev.piko.ui.platform.ShortcutModifier
+import dev.piko.ui.theme.LocalAppearance
+import dev.piko.ui.theme.LocalPikoMotion
+import dev.piko.ui.theme.isEInk
+import dev.piko.ui.theme.tabular
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.isAltPressed
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
+import io.github.nihildigit.pikpak.FileStat
+
+/**
+ * 网盘列表的三种排列。名字存进偏好（PikoUserPreferences.driveViewModeFlow），不要改名；
+ * 先后即菜单里的顺序，海报墙是默认，排在最后。
+ * 信息流不在这里，它的开关在网盘页顶栏上，见 FeedToggle。
+ */
+internal enum class DriveViewMode {
+    LIST,
+    POSTER,
+    ;
+
+    /** 海报墙是带页边距的网格，整行项与页眉的排布相同。 */
+    val isGrid: Boolean get() = this != LIST
+
+    companion object {
+        fun of(name: String): DriveViewMode = entries.firstOrNull { it.name == name } ?: POSTER
+    }
+}
+
+/**
+ * 三种视图都用按行对齐的 LazyVerticalGrid，共用同一个状态与作品头、分区标题这些整行项。
+ * 不用瀑布流：它把每一项放进当前最矮的一栏，各栏宽度因除不尽差一两个像素时，按宽度算高度的海报与方块
+ * 就高低不齐，第二行的第一项落到最右边；列表行高不一时顺序更是在各栏间乱跳。文件要能按行读。
+ *
+ * 三种视图一行几栏随尺寸分三档，见 [tileColumns]；列表在手机上保持一列，宽窗口可调栏宽。
+ */
+
+private const val DraggedAlpha = 0.4f
+
+private const val KEY_HEADER = "drive_header"
+private const val KEY_FOLD = "drive_fold"
+
+/** 列表或海报墙里的每一项需要的回调，由 DriveScreen 按条目绑定。 */
+@Stable
+internal class DriveItemCallbacks(
+    val onOpen: (FileStat) -> Unit,
+    /** mac 上焦点在这一项时按回车，照 Finder 是改名。 */
+    val onRename: ((FileStat) -> Unit)?,
+    /** 条目上的更多按钮与菜单键：打开操作面板。 */
+    val onMore: (FileStat) -> Unit,
+    /** 焦点在这一项时按 Alt+Enter：打开它的属性。由条目自己接住，否则条目的单击先把回车当成打开。 */
+    val onProperties: (FileStat) -> Unit,
+    /** 条目排好位置时交出它的布局坐标，属性卡片据此贴在它旁边。只存不重组，见 ItemPanelAnchors。 */
+    val onPlaced: (FileStat, LayoutCoordinates) -> Unit,
+    /** 进入多选并选中这一项：悬停复选框与右键菜单里的「选择」共用。 */
+    val onStartSelection: ((FileStat) -> Unit)?,
+    /** 触摸长按；默认与更多按钮一样打开操作面板。 */
+    val onLongClick: (FileStat) -> Unit = onMore,
+    val onSelect: (FileStat, Boolean) -> Unit,
+    /**
+     * Ctrl（⌘）点选，见 [selectionClicks]。这两个与 [onBoxSelect] 交的是行的 key（DriveListItem.File.key），
+     * 不是文件 ID：查找重复里同一个文件占两行，连选从哪一行数起要分得清。
+     */
+    val onToggleSelect: (rowKey: String) -> Unit,
+    /** Shift 点选。 */
+    val onExtendSelect: (rowKey: String) -> Unit,
+    /** 按住这一项拖动时拖出去的那一批，见 [fileDragSource]。 */
+    val dragPayload: (FileStat) -> FileDragPayload?,
+    /** 鼠标中键点了这一项：文件夹在新标签页里打开。 */
+    val onMiddleClick: (FileStat) -> Unit,
+    /** 框选，见 [marqueeSelection]。[base] 是文件 ID，[boxedRows] 是行的 key。 */
+    val onBoxSelect: (base: Set<String>, boxedRows: Set<String>) -> Unit,
+    /** 鼠标单击了网格的空白处。 */
+    val onBackgroundClick: () -> Unit,
+    /** 焦点进出这一项（含它里面的更多按钮），键盘操作据此知道作用于哪一项。 */
+    val onFocusChanged: (FileStat, Boolean) -> Unit,
+    /** 右键菜单的内容，与操作面板相同。 */
+    val contextActions: (FileStat) -> List<SheetAction>,
+    val onToggleSection: (blockId: String) -> Unit,
+    /** 文件夹在可见区域里，挂起到预取完成，离开时随行的协程取消，见 DriveScreenState.onFolderVisible。 */
+    val onFolderVisible: suspend (FileStat) -> Unit,
+)
+
+/** 列表前面固定的几项：页眉，以及有时出现的折叠横幅。分区跳转与副标题反查要扣掉它们。 */
+internal fun driveLeadingItemCount(hasFoldBanner: Boolean): Int = 1 + (if (hasFoldBanner) 1 else 0)
+
+@Composable
+internal fun DriveFileGrid(
+    items: List<DriveListItem>,
+    viewMode: DriveViewMode,
+    /** 列表栏宽或海报墙、图库的卡片大小。 */
+    tileSize: TileSize,
+    /** 主修饰键加滚轮，见 [zoomOnWheel]。 */
+    onZoom: (larger: Boolean) -> Unit,
+    gridState: LazyGridState,
+    isSelectionMode: Boolean,
+    selectedIds: Set<String>,
+    highlightedIds: Set<String>,
+    highlightRevision: Int,
+    structureReady: Boolean,
+    locatedItemId: String?,
+    isBlurred: (FileStat) -> Boolean,
+    hitLocations: Map<String, String>,
+    /** 文件夹的解析结果；原始文件名模式下恒为 null。 */
+    folderView: (FileStat) -> DriveFolderView?,
+    callbacks: DriveItemCallbacks,
+    bottomPadding: Dp,
+    /** 条目上画不画打开操作面板的更多按钮，见 DriveScreen 的 itemMoreButton。 */
+    moreButton: Boolean,
+    /** 网格空白处的右键菜单。 */
+    backgroundActions: () -> List<SheetAction>,
+    /** 连同右侧侧栏在内的宽度，栏数按它定，见 [StableColumns]；null 时按网格自己的宽度。 */
+    columnReferenceWidth: Dp?,
+    /** 鼠标最近点过、取得焦点的一项。按住它拖动是移动，按住别的没选中的条目拖动是框选。 */
+    activeItemId: String?,
+    /** 列过的文件夹空不空，海报墙给空文件夹画空的封面，见 PikoDriveRepository.folderEmptiness。 */
+    emptyFolders: Map<String, Boolean> = emptyMap(),
+    /** 挂归档标记的文件夹，见 PikoDriveRepository.vaultedFolders。 */
+    vaultedFolders: Set<String> = emptySet(),
+    /** 已在本地下载完成的文件 ID 集合，用于元信息行尾部绿色对勾标记。 */
+    downloadedFileIds: Set<String> = emptySet(),
+    downloadingFileIds: Set<String> = emptySet(),
+    /** 要把键盘焦点移到的那一行（行的 key），移过去后回调 [onKeyboardFocusMoved]。 */
+    keyboardFocusTarget: String?,
+    onKeyboardFocusMoved: () -> Unit,
+    header: @Composable () -> Unit,
+    foldBanner: (@Composable () -> Unit)?,
+    modifier: Modifier = Modifier,
+    cutIds: Set<String> = emptySet(),
+) {
+    val leadingItemCount = driveLeadingItemCount(foldBanner != null)
+    val focusManager = LocalFocusManager.current
+    val focusFallback = LocalFocusFallback.current
+    LaunchedEffect(isSelectionMode) {
+        if (!isSelectionMode) {
+            if (focusFallback != null) focusFallback.restore() else focusManager.clearFocus()
+        }
+    }
+    val latestItems by rememberUpdatedState(items)
+    val latestStructureReady by rememberUpdatedState(structureReady)
+    val latestLeadingItemCount by rememberUpdatedState(leadingItemCount)
+    val horizontalPadding = gridHorizontalPadding(viewMode)
+    val itemSpacing = gridItemSpacing(viewMode)
+    // 整行项在网格视图里已有页边距，列表视图里自己缩进
+    val rowInset = if (viewMode.isGrid) 0.dp else 16.dp
+
+    // 定位的描边等滚动停下再亮：它亮起时闪两下引开视线，赶上内容刚换、列表还在滚的那一刻就白闪了。
+    // 从信息流跳过去时新目录要列一两秒，内容一到，滚动与闪烁同时开始（2026-10-06 桌面端日志）
+    var highlightSettled by remember { mutableStateOf(true) }
+
+    Box(modifier = modifier.fillMaxSize().zoomOnWheel(onZoom)) {
+        // 有条目要定位时滚到它（刚秒传的、从别处「在网盘中显示」的）。视图模式是异步读出来的偏好，首帧拿到的还是默认值，
+        // 所以它也要进 key，否则真值到达前的滚动会停在错误的位置。
+        LaunchedEffect(highlightRevision, highlightedIds, viewMode) {
+            if (highlightedIds.isEmpty()) return@LaunchedEffect
+            highlightSettled = false
+            try {
+                val index = snapshotFlow {
+                    if (!latestStructureReady) -1 else latestItems.indexOfFirst { it is DriveListItem.File && it.file.id in highlightedIds }
+                        .takeIf { it >= 0 }?.let { latestLeadingItemCount + it } ?: -1
+                }.first { it >= 0 }
+                gridState.animateScrollToItem(index)
+            } finally {
+                highlightSettled = true
+            }
+        }
+
+        val fileIdByRow = remember(items) { items.filterIsInstance<DriveListItem.File>().associate { it.key to it.file.id } }
+        // 空白处的右键菜单：查看、排序、刷新、粘贴、新建这些作用于整个文件夹的操作，照资源管理器。
+        // 命令栏上照样都有，这里是鼠标用户就近的捷径；条目自己的菜单在里层，先接住
+        ContextMenuArea(actions = backgroundActions, modifier = Modifier.fillMaxSize()) {
+        LazyVerticalGrid(
+            state = gridState,
+            // 网格的可用宽度扣掉了两侧边距，参照宽度也扣掉，侧栏关着时两者相等
+            columns = gridCells(viewMode, tileSize, columnReferenceWidth?.minus(horizontalPadding * 2)),
+            modifier = modifier
+                .fillMaxSize()
+                .fileDragAutoScroll(gridState)
+                .marqueeSelection(
+                    gridState = gridState,
+                    selectedIds = selectedIds,
+                    boxedKey = { key -> (key as? String)?.takeIf { it in fileIdByRow } },
+                    onSelect = callbacks.onBoxSelect,
+                    onBackgroundClick = callbacks.onBackgroundClick,
+                    // 点过的那一项（取得焦点）与选中的一样，按住它拖是移动
+                    movable = { row -> fileIdByRow[row]?.let { id -> id in selectedIds || id == activeItemId } == true },
+                ),
+            contentPadding = PaddingValues(
+                start = horizontalPadding,
+                end = horizontalPadding,
+                bottom = bottomPadding,
+            ),
+            horizontalArrangement = Arrangement.spacedBy(itemSpacing),
+            verticalArrangement = Arrangement.spacedBy(itemSpacing),
+        ) {
+            item(key = KEY_HEADER, span = { GridItemSpan(maxLineSpan) }, contentType = KEY_HEADER) {
+                // 页眉总是整行宽，内边距由它自己决定，各视图下排布一致。网格视图的
+                // contentPadding 会把它缩进 16dp，这里向两侧撑回去
+                Box(modifier = if (viewMode.isGrid) Modifier.bleedHorizontal(horizontalPadding) else Modifier) {
+                    header()
+                }
+            }
+            if (foldBanner != null) {
+                item(key = KEY_FOLD, span = { GridItemSpan(maxLineSpan) }, contentType = KEY_FOLD) {
+                    Box(modifier = Modifier.padding(horizontal = rowInset)) {
+                        foldBanner()
+                    }
+                }
+            }
+
+            itemsIndexed(
+                items,
+                key = { _, item -> item.key },
+                span = { _, item -> GridItemSpan(if (item is DriveListItem.File) 1 else maxLineSpan) },
+                contentType = { _, item ->
+                    when (item) {
+                        is DriveListItem.WorkHeader -> "work"
+                        is DriveListItem.SectionHeader -> "section"
+                        is DriveListItem.File -> if (item.file.isFolder) "folder" else "file"
+                    }
+                },
+            ) { index, item ->
+                when (item) {
+                    is DriveListItem.WorkHeader -> WorkHeaderRow(
+                        header = item,
+                        modifier = Modifier.animateItem().padding(horizontal = rowInset),
+                    )
+                    is DriveListItem.SectionHeader -> SectionHeaderRow(
+                        header = item,
+                        // 网格视图已有 16dp 边距，文字与卡片左缘对齐即可
+                        inset = if (viewMode.isGrid) 4.dp else 16.dp,
+                        onClick = { callbacks.onToggleSection(item.blockId) },
+                        modifier = Modifier.animateItem(),
+                    )
+                    is DriveListItem.File -> {
+                        val file = item.file
+                        if (file.isFolder) LaunchedEffect(file.id) { callbacks.onFolderVisible(file) }
+                        val folderInfo = if (file.isFolder) folderView(file) else null
+                        val text = remember(item, folderInfo, PikoLocale.effectiveLanguage) { cellText(item, folderInfo) }
+                        DriveCell(
+                            file = file,
+                            rowKey = item.key,
+                            text = text,
+                            viewMode = viewMode,
+                            isSelectionMode = isSelectionMode,
+                            isSelected = file.id in selectedIds,
+                            isHighlighted = highlightSettled && (file.id in highlightedIds || file.id == locatedItemId),
+                            isBlurred = isBlurred(file),
+                            isCut = file.id in cutIds,
+                            locationLabel = hitLocations[file.id],
+                            callbacks = callbacks,
+                            moreButton = moreButton,
+                            isEmptyFolder = file.isFolder && emptyFolders[file.id] == true,
+                            folderHasVault = file.isFolder && file.id in vaultedFolders,
+                            isDownloaded = !file.isFolder && file.id in downloadedFileIds,
+                            isDownloading = !file.isFolder && file.id in downloadingFileIds,
+                            requestFocus = item.key == keyboardFocusTarget,
+                            onFocusRequested = onKeyboardFocusMoved,
+                            modifier = Modifier.animateItem(),
+                        )
+                    }
+                }
+            }
+        }
+        }
+        DriveBackToTopPill(
+            gridState = gridState,
+            leadingItemCount = leadingItemCount,
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .padding(top = 12.dp),
+        )
+        LocalPikoPlatform.current.ListScrollbar(gridState, Modifier.align(Alignment.CenterEnd))
+    }
+}
+
+internal const val BACK_TO_TOP_MIN_ITEMS = 6
+
+/**
+ * 判断列表/网格是否应浮出「回到顶部」胶囊按钮：
+ * 当向下滚动超过首屏可见条数（且至少滚过 [BACK_TO_TOP_MIN_ITEMS] 个内容条目）时显示，回到顶部附近自动隐藏。
+ */
+internal fun shouldShowBackToTop(
+    firstVisibleItemIndex: Int,
+    leadingItemCount: Int,
+    visibleItemCount: Int,
+): Boolean {
+    if (visibleItemCount <= 0) return false
+    val scrolledContentItems = firstVisibleItemIndex - leadingItemCount
+    if (scrolledContentItems < BACK_TO_TOP_MIN_ITEMS) return false
+    val threshold = maxOf(BACK_TO_TOP_MIN_ITEMS, visibleItemCount)
+    return scrolledContentItems >= threshold
+}
+
+/**
+ * 顶部居中轻量浮出胶囊「回到顶部」：
+ * 独立叶子组件内聚 `derivedStateOf` 滚动阈值读取，避免滚动期间触发外层 `DriveFileGrid` 重组；
+ * 顶部居中定位永不与窄窗口右下角 `FloatingActionButtonMenu`、底部多选浮动工具栏及右侧滚动条冲突。
+ */
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+private fun DriveBackToTopPill(
+    gridState: LazyGridState,
+    leadingItemCount: Int,
+    modifier: Modifier = Modifier,
+) {
+    val visible by remember(gridState, leadingItemCount) {
+        derivedStateOf {
+            shouldShowBackToTop(
+                firstVisibleItemIndex = gridState.firstVisibleItemIndex,
+                leadingItemCount = leadingItemCount,
+                visibleItemCount = gridState.layoutInfo.visibleItemsInfo.size,
+            )
+        }
+    }
+    val reducedMotion = LocalPikoMotion.current.reduced
+    val isEInk = LocalAppearance.current.isEInk
+    val colors = MaterialTheme.colorScheme
+    val motion = MaterialTheme.motionScheme
+    val scope = rememberCoroutineScope()
+
+    AnimatedVisibility(
+        visible = visible,
+        enter = if (reducedMotion) EnterTransition.None else slideInVertically(motion.fastSpatialSpec()) { -it } + fadeIn(motion.fastEffectsSpec()),
+        exit = if (reducedMotion) ExitTransition.None else slideOutVertically(motion.fastSpatialSpec()) { -it } + fadeOut(motion.fastEffectsSpec()),
+        modifier = modifier,
+    ) {
+        Surface(
+            onClick = {
+                scope.launch {
+                    if (reducedMotion) gridState.scrollToItem(0) else gridState.animateScrollToItem(0)
+                }
+            },
+            shape = CircleShape,
+            color = if (isEInk) Color.White else colors.surfaceContainerHigh,
+            contentColor = if (isEInk) Color.Black else colors.onSurface,
+            shadowElevation = if (isEInk) 0.dp else 3.dp,
+            border = if (isEInk) {
+                BorderStroke(1.dp, Color.Black)
+            } else {
+                BorderStroke(0.5.dp, colors.outlineVariant.copy(alpha = 0.5f))
+            },
+        ) {
+            Row(
+                modifier = Modifier
+                    .heightIn(min = 36.dp)
+                    .padding(horizontal = 14.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(
+                    imageVector = Icons.Outlined.ArrowUpward,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp),
+                )
+                Text(
+                    text = tr("回到顶部", "Back to top", "トップへ戻る", "맨 위로", "回到頂部"),
+                    style = MaterialTheme.typography.labelLarge,
+                    maxLines = 1,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun gridCells(viewMode: DriveViewMode, tileSize: TileSize, referenceWidth: Dp? = null): GridCells {
+    val widthClass = currentWidthClass()
+    return remember(viewMode, tileSize, widthClass, referenceWidth) {
+        TileColumns(tileColumns(viewMode, tileSize, widthClass), tileMaxWidth(viewMode, tileSize), referenceWidth)
+    }
+}
+
+/**
+ * 海报墙与图库：一行 [columns] 栏，卡宽由宽度除出来；宽到卡片超过 [maxSize] 时多排几栏，见 tileColumns。
+ * 栏数照 [StableColumns] 按 [referenceWidth] 定，信息流侧栏滑出时卡片一起收窄、不换行，窄过七成才少排一栏。
+ */
+@Immutable
+private class TileColumns(private val columns: Int, private val maxSize: Dp, private val referenceWidth: Dp?) : GridCells {
+    override fun Density.calculateCrossAxisCellSizes(availableSize: Int, spacing: Int): List<Int> {
+        val max = maxSize.roundToPx()
+        val reference = maxOf(referenceWidth?.roundToPx() ?: 0, availableSize)
+        // 每栏不超过 max 至少要几栏：向上取整
+        val capped = (reference + spacing + max + spacing - 1) / (max + spacing)
+        var count = maxOf(columns, capped)
+        val floor = ((reference - spacing * (count - 1)) / count * MIN_FRACTION).toInt()
+        while (count > 1 && (availableSize - spacing * (count - 1)) / count < floor) count--
+        val total = availableSize - spacing * (count - 1)
+        return List(count) { index -> total / count + if (index < total % count) 1 else 0 }
+    }
+
+    override fun equals(other: Any?) =
+        other is TileColumns && other.columns == columns && other.maxSize == maxSize && other.referenceWidth == referenceWidth
+
+    override fun hashCode() = (31 * columns + maxSize.hashCode()) * 31 + referenceWidth.hashCode()
+
+    private companion object {
+        const val MIN_FRACTION = 0.7f
+    }
+}
+
+/**
+ * 按 [referenceWidth]（列表连同右侧信息流栏的总宽度）定栏数，网格自己的宽度只决定每栏多宽。
+ * 按网格自己的宽度定的话，侧栏滑出的动画里网格每一帧都在变窄，五栏掉到四栏再到三栏，每掉一栏整屏条目换行重排，
+ * 还带着位移动画满屏乱飞。现在侧栏是从每一栏借宽度，卡片一起收窄，谁也不换行。
+ * 借得太多、一栏窄过下限的 [MIN_FRACTION] 时才少排一栏，免得卡片挤成一条。
+ */
+@Immutable
+private class StableColumns(private val minSize: Dp, private val referenceWidth: Dp?) : GridCells {
+    override fun Density.calculateCrossAxisCellSizes(availableSize: Int, spacing: Int): List<Int> {
+        val min = minSize.roundToPx()
+        val reference = maxOf(referenceWidth?.roundToPx() ?: 0, availableSize)
+        var count = ((reference + spacing) / (min + spacing)).coerceAtLeast(1)
+        val floor = (min * MIN_FRACTION).toInt()
+        while (count > 1 && (availableSize - spacing * (count - 1)) / count < floor) count--
+        val total = availableSize - spacing * (count - 1)
+        // 除不尽的几个像素分给前几栏，与 GridCells.Adaptive 相同
+        return List(count) { index -> total / count + if (index < total % count) 1 else 0 }
+    }
+
+    override fun equals(other: Any?) = other is StableColumns && other.minSize == minSize && other.referenceWidth == referenceWidth
+
+    override fun hashCode() = 31 * minSize.hashCode() + referenceWidth.hashCode()
+
+    private companion object {
+        const val MIN_FRACTION = 0.7f
+    }
+}
+
+private fun gridHorizontalPadding(viewMode: DriveViewMode): Dp = if (viewMode.isGrid) 16.dp else 0.dp
+
+private fun gridItemSpacing(viewMode: DriveViewMode): Dp = when (viewMode) {
+    DriveViewMode.LIST -> 0.dp
+    DriveViewMode.POSTER -> 8.dp
+}
+
+/**
+ * 首载时的骨架，不含页眉。网格本身也是同一种 LazyVerticalGrid，列数、边距与间距取真实网格
+ * 的同一套参数：宽窗口里列表排成多列，海报墙按卡宽下限换列数，另算一遍迟早与真实网格对不上。
+ * 不可滚动，条目数给够一屏，多出来的懒加载不会组合。
+ */
+@Composable
+internal fun DriveGridSkeleton(viewMode: DriveViewMode, tileSize: TileSize, modifier: Modifier = Modifier) {
+    val itemSpacing = gridItemSpacing(viewMode)
+    SkeletonGroup(modifier = modifier.fillMaxSize()) {
+        LazyVerticalGrid(
+            columns = gridCells(viewMode, tileSize),
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(horizontal = gridHorizontalPadding(viewMode)),
+            horizontalArrangement = Arrangement.spacedBy(itemSpacing),
+            verticalArrangement = Arrangement.spacedBy(itemSpacing),
+            userScrollEnabled = false,
+        ) {
+            items(SKELETON_ITEM_COUNT) { index ->
+                val titleFraction = SkeletonTitleWidths[index % SkeletonTitleWidths.size]
+                when (viewMode) {
+                    DriveViewMode.LIST -> FileRowSkeleton(titleFraction = titleFraction)
+                    DriveViewMode.POSTER -> PosterCardSkeleton(titleFraction)
+                }
+            }
+        }
+    }
+}
+
+private const val SKELETON_ITEM_COUNT = 40
+
+// 标题宽度逐项错开，一排等长的色块读起来像表格
+private val SkeletonTitleWidths = listOf(0.62f, 0.45f, 0.74f, 0.52f, 0.68f, 0.4f)
+
+/** 单元格上的文字：名字（见 [DriveItemName]）与解析出的标签。 */
+@Immutable
+internal data class CellText(val name: DriveItemName, val tags: List<String>, val code: String? = null, val resolution: String? = null)
+
+internal fun cellText(item: DriveListItem.File, folder: DriveFolderView?): CellText {
+    val view = item.view
+    val name = driveItemName(item.file, view, folder)
+    return when {
+        view != null -> CellText(name, view.tags, view.code, view.resolution)
+        folder != null -> CellText(name, folder.tags, folder.code, folder.resolution)
+        else -> CellText(name, emptyList())
+    }
+}
+
+/** 作品头：作品名与作品内共有的标签，只出现一次，各行因此只挂有区分度的标签。 */
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+private fun WorkHeaderRow(header: DriveListItem.WorkHeader, modifier: Modifier = Modifier) {
+    Column(modifier = modifier.fillMaxWidth().padding(top = 12.dp, bottom = 4.dp)) {
+        header.title?.let { title ->
+            Text(
+                text = title,
+                style = MaterialTheme.typography.titleMediumEmphasized,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        if (header.tags.isNotEmpty()) MediaTagRow(tags = header.tags, modifier = Modifier.padding(top = 4.dp))
+    }
+}
+
+/** 分区标题，点按展开或收起。海报墙没有吸顶标题，它随内容滚走；当前所在的分区由顶栏副标题给出。 */
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+private fun SectionHeaderRow(header: DriveListItem.SectionHeader, inset: Dp, onClick: () -> Unit, modifier: Modifier = Modifier) {
+    val reducedMotion = LocalPikoMotion.current.reduced
+    val chevronRotation by animateFloatAsState(
+        targetValue = if (header.expanded) 180f else 0f,
+        animationSpec = MaterialTheme.motionScheme.fastSpatialSpec(),
+        label = "section_chevron",
+    )
+    Surface(
+        onClick = onClick,
+        shape = MaterialTheme.shapes.medium,
+        color = Color.Transparent,
+        modifier = modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier
+                .heightIn(min = 48.dp)
+                .padding(horizontal = inset, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = header.label,
+                    style = if (header.isWork) MaterialTheme.typography.titleMediumEmphasized else MaterialTheme.typography.titleSmallEmphasized,
+                    color = if (header.isWork) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.primary,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (header.tags.isNotEmpty()) MediaTagRow(tags = header.tags, modifier = Modifier.padding(top = 4.dp))
+            }
+            Icon(
+                imageVector = if (reducedMotion) {
+                    if (header.expanded) Icons.Outlined.ExpandLess else Icons.Outlined.ExpandMore
+                } else {
+                    Icons.Outlined.ExpandMore
+                },
+                contentDescription = if (header.expanded) tr("收起", "Collapse", "折りたたむ", "접기", "收合") else tr("展开", "Expand", "展開", "펼치기", "展開"),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = if (reducedMotion) Modifier else Modifier.graphicsLayer { rotationZ = chevronRotation },
+            )
+        }
+    }
+}
+
+@Composable
+private fun DriveCell(
+    file: FileStat,
+    rowKey: String,
+    text: CellText,
+    viewMode: DriveViewMode,
+    isSelectionMode: Boolean,
+    isSelected: Boolean,
+    isHighlighted: Boolean,
+    isBlurred: Boolean,
+    isCut: Boolean,
+    locationLabel: String?,
+    callbacks: DriveItemCallbacks,
+    moreButton: Boolean,
+    isEmptyFolder: Boolean,
+    folderHasVault: Boolean,
+    isDownloaded: Boolean,
+    isDownloading: Boolean = false,
+    requestFocus: Boolean,
+    onFocusRequested: () -> Unit,
+    modifier: Modifier,
+) {
+    val isMac = LocalPikoPlatform.current.shortcutModifier == ShortcutModifier.Command
+    val focusRequester = remember { FocusRequester() }
+    if (requestFocus) {
+        LaunchedEffect(Unit) {
+            runCatching { focusRequester.requestFocus() }
+            onFocusRequested()
+        }
+    }
+    // 正被拖着的条目在图层阶段读 drag.payload 淡下去，起拖/结束不触发全屏单元格重组，且合并进单一 graphicsLayer 避免叠加离屏层
+    val drag = LocalFileDrag.current
+    // 条目里的更多按钮登记在这里，单击选中的那一层不截它的点击
+    val ownClicks = remember { OwnClicks() }
+    CompositionLocalProvider(LocalOwnClicks provides ownClicks) {
+    ContextMenuArea(
+        actions = { callbacks.contextActions(file) },
+        modifier = modifier
+            .graphicsLayer {
+                val beingDragged = drag?.payload?.ids?.contains(file.id) == true
+                alpha = when {
+                    beingDragged && isCut -> DraggedAlpha * 0.5f
+                    beingDragged -> DraggedAlpha
+                    isCut -> 0.5f
+                    else -> 1f
+                }
+            }
+            .focusRequester(focusRequester)
+            .onFocusChanged { callbacks.onFocusChanged(file, it.hasFocus) }
+            .onPlaced { callbacks.onPlaced(file, it) }
+            .selectionClicks(
+                onToggle = { callbacks.onToggleSelect(rowKey) },
+                onExtend = { callbacks.onExtendSelect(rowKey) },
+                // 多选时条目上画着勾选框，单击照旧是勾选或取消
+                onDoubleClick = if (isSelectionMode) null else ({ callbacks.onOpen(file) }),
+                // 鼠标点到哪一项，键盘就从哪一项接着走；框选或拖动时不取焦点，免得起拖那一项留着单选底色
+                onFocus = { runCatching { focusRequester.requestFocus() } },
+                ownClicks = ownClicks,
+                onMiddleClick = { callbacks.onMiddleClick(file) },
+            )
+            // Finder 里回车是改名；资源管理器里回车是打开，交给条目自己的单击
+            .onPreviewKeyEvent { event ->
+                val isReturn = event.key == Key.Enter || event.key == Key.NumPadEnter
+                // 资源管理器的 Alt+Enter 是属性
+                if (isReturn && !isMac && event.isAltPressed) {
+                    if (event.type == KeyEventType.KeyDown) callbacks.onProperties(file)
+                    return@onPreviewKeyEvent true
+                }
+                if (!isReturn || !isMac || isSelectionMode || callbacks.onRename == null) return@onPreviewKeyEvent false
+                // 按下与松开都吃掉：只吃按下的话，条目的单击在松开时照样触发
+                if (event.type == KeyEventType.KeyDown) callbacks.onRename(file)
+                true
+            }
+            .fileDragSource { callbacks.dragPayload(file) }
+            // 文件夹接得住拖来的条目
+            .then(if (file.isFolder) Modifier.fileDropTarget("cell:${file.id}", PikoPathBreadcrumb(file.id, file.name)) else Modifier),
+    ) {
+        val driveRepo = LocalPikoServices.current.driveRepository
+        val folderStats = if (file.isFolder && isDriveFolderId(file.id)) {
+            driveRepo.folderSubtreeStats(file.id)
+        } else null
+        val folderItemCount = folderStats
+            ?.takeIf { it.fileCount > 0L || it.listingComplete }
+            ?.fileCount
+            ?.coerceAtMost(Int.MAX_VALUE.toLong())
+            ?.toInt()
+        val folderDurationMillis = folderStats?.durationMillis?.takeIf { it > 0L }
+        val folderSizeBytes = folderStats?.bytes?.takeIf { it > 0L }
+        when (viewMode) {
+            DriveViewMode.POSTER -> PosterCard(
+                file = file,
+                isSelectionMode = isSelectionMode,
+                isSelected = isSelected,
+                isSpoilerBlurred = isBlurred,
+                isHighlighted = isHighlighted,
+                locationLabel = locationLabel,
+                onClick = { callbacks.onOpen(file) },
+                onStartSelection = callbacks.onStartSelection?.let { select -> ({ select(file) }) },
+                onLongClick = { callbacks.onLongClick(file) },
+                onSelectToggle = { callbacks.onSelect(file, it) },
+                onMoreClick = { callbacks.onMore(file) },
+                moreButton = moreButton,
+                isEmptyFolder = isEmptyFolder,
+                title = text.name.title,
+                original = text.name.rowOriginal(),
+                tags = text.tags,
+                code = text.code,
+                resolution = text.resolution,
+                folderHasVault = folderHasVault,
+                folderItemCount = folderItemCount,
+                folderDurationMillis = folderDurationMillis,
+                folderSizeBytes = folderSizeBytes,
+                isDownloaded = isDownloaded,
+                isDownloading = isDownloading,
+            )
+            DriveViewMode.LIST -> FileListItem(
+                file = file,
+                isSelectionMode = isSelectionMode,
+                isSelected = isSelected,
+                isHighlighted = isHighlighted,
+                isSpoilerBlurred = isBlurred,
+                locationLabel = locationLabel,
+                onClick = { callbacks.onOpen(file) },
+                onStartSelection = callbacks.onStartSelection?.let { select -> ({ select(file) }) },
+                onLongClick = { callbacks.onLongClick(file) },
+                onSelectToggle = { callbacks.onSelect(file, it) },
+                onMoreClick = { callbacks.onMore(file) },
+                moreButton = moreButton,
+                title = text.name.title,
+                original = text.name.rowOriginal(),
+                tags = text.tags,
+                code = text.code,
+                folderHasVault = folderHasVault,
+                isEmptyFolder = isEmptyFolder,
+                folderItemCount = folderItemCount,
+                folderDurationMillis = folderDurationMillis,
+                folderSizeBytes = folderSizeBytes,
+                isDownloaded = isDownloaded,
+                isDownloading = isDownloading,
+            )
+        }
+    }
+    }
+}
+
+/**
+ * 排序字段与方向。ascending 与 descending 分别是该字段两个方向的枚举值，
+ * defaultOrder 是切到这个字段时的起始方向：名称从 A 到 Z，时间与大小从新到旧、从大到小。
+ */
+@Composable
+private fun SortDirectionIcon(order: FileSortOrder, modifier: Modifier = Modifier) {
+    Icon(
+        imageVector = if (order.isAscending) Icons.Outlined.ArrowUpward else Icons.Outlined.ArrowDownward,
+        contentDescription = if (order.isAscending) tr("升序", "Ascending", "昇順", "오름차순", "遞增") else tr("降序", "Descending", "降順", "내림차순", "遞減"),
+        modifier = modifier,
+    )
+}
+
+/**
+ * 列表页眉：搜索时的结果说明、排序、类型筛选、视图切换。
+ *
+ * 排序与视图切换原先挤在顶栏，与新建、搜索一起共四个图标。M3 顶栏规范建议只放一到
+ * 两个动作；这两个是作用于列表本身的控件，放进随列表滚走的页眉，不再常驻占位。
+ * 排序按钮写出当前字段与方向。菜单里再点当前字段即切换升降序，点其他字段则按该字段的
+ * 起始方向排，不必为六种组合各列一项。
+ *
+ * 类型筛选与排序同一种文字按钮，只在列表里有两类以上文件、或已在筛选时出现：只有一类时
+ * 筛了等于没筛。菜单里每类带上数量，选之前就知道会剩多少。
+ */
+@Composable
+internal fun DriveListHeader(
+    summary: String?,
+    sortOrder: FileSortOrder,
+    onSortChange: (FileSortOrder) -> Unit,
+    typeFilter: FileCategory?,
+    availableTypes: List<Pair<FileCategory, Int>>,
+    onTypeFilterChange: (FileCategory?) -> Unit,
+    viewMode: DriveViewMode,
+    onViewModeChange: (DriveViewMode) -> Unit,
+    tileSize: TileSize,
+    onTileSizeChange: (TileSize) -> Unit,
+    perFolderSort: Boolean = false,
+    onPerFolderSortChange: ((Boolean) -> Unit)? = null,
+    foldersFirst: Boolean = true,
+    onFoldersFirstChange: ((Boolean) -> Unit)? = null,
+    /** 为 false 时只留搜索结果的说明：宽窗口里这些控件在命令栏上。 */
+    showControls: Boolean = true,
+) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        if (summary != null) {
+            // 与排序按钮的图标同落在 16dp 页边距上：外层只给了 4dp，这里补 TextButton 的 12dp
+            Text(
+                text = summary,
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(start = 12.dp, top = 8.dp),
+            )
+        }
+        if (!showControls) {
+            if (summary != null) Spacer(Modifier.height(8.dp))
+            return@Column
+        }
+        // 排序靠左、视图切换靠右；类型筛选在列表有两类以上文件或正在筛选时展开为单行 M3 FilterChip 条，
+        // 一点即切且不在同行再放下拉按钮（严格 DRY）。桌面宽窗口由 ExplorerCommandBar 中的 TypeFilterButton 承载以保全纵向密度。
+        val showFilter = typeFilter != null || availableTypes.size > 1
+        AdaptiveBar(
+            modifier = Modifier.fillMaxWidth().height(48.dp),
+            leading = listOf(
+                BarItem("sort", 30, sortOverflowActions(sortOrder, onSortChange, perFolderSort, onPerFolderSortChange, foldersFirst, onFoldersFirstChange)) {
+                    SortButton(sortOrder, onSortChange, perFolderSort, onPerFolderSortChange, foldersFirst, onFoldersFirstChange)
+                },
+            ),
+            trailing = listOf(
+                BarItem("view", 10, viewModeOverflowActions(viewMode, onViewModeChange) + tileSizeActions(viewMode, tileSize, onTileSizeChange)) {
+                    ViewSwitcher(viewMode, onViewModeChange, tileSize, onTileSizeChange, feedShown = false, onFeedShownChange = null)
+                },
+            ),
+        )
+        if (showFilter) {
+            TypeFilterChipRow(
+                typeFilter = typeFilter,
+                availableTypes = availableTypes,
+                onTypeFilterChange = onTypeFilterChange,
+                modifier = Modifier.fillMaxWidth().padding(start = 12.dp, bottom = 6.dp),
+            )
+        }
+    }
+}
+
+/** 紧凑窗口列表页眉的横向筛选芯片条（M3E Chips spec: Filter chip set），替代二次展开的下拉菜单。 */
+@Composable
+private fun TypeFilterChipRow(
+    typeFilter: FileCategory?,
+    availableTypes: List<Pair<FileCategory, Int>>,
+    onTypeFilterChange: (FileCategory?) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val scrollState = rememberScrollState()
+    Row(
+        modifier = modifier
+            .verticalWheelScrollsRow(scrollState)
+            .horizontalScroll(scrollState),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        FilterChip(
+            selected = typeFilter == null,
+            onClick = { onTypeFilterChange(null) },
+            label = { Text(tr("全部", "All", "すべて", "전체", "全部"), maxLines = 1) },
+            leadingIcon = if (typeFilter == null) {
+                { Icon(Icons.Outlined.Check, contentDescription = null, modifier = Modifier.size(FilterChipDefaults.IconSize)) }
+            } else null,
+        )
+        availableTypes.forEach { (category, count) ->
+            val selected = category == typeFilter
+            FilterChip(
+                selected = selected,
+                onClick = { onTypeFilterChange(if (selected) null else category) },
+                label = {
+                    Text(
+                        text = "${category.label} $count",
+                        style = MaterialTheme.typography.labelLarge.tabular,
+                        maxLines = 1,
+                    )
+                },
+                leadingIcon = {
+                    Icon(
+                        imageVector = if (selected) Icons.Outlined.Check else category.icon(),
+                        contentDescription = null,
+                        modifier = Modifier.size(FilterChipDefaults.IconSize),
+                    )
+                },
+            )
+        }
+    }
+}
+
+/** 排序收进「更多」时摊成几项，当前的一项打勾并写出方向，再点它是翻转，与排序按钮的菜单相同。 */
+internal fun sortOverflowActions(
+    sortOrder: FileSortOrder,
+    onSortChange: (FileSortOrder) -> Unit,
+    perFolderSort: Boolean = false,
+    onPerFolderSortChange: ((Boolean) -> Unit)? = null,
+    foldersFirst: Boolean = true,
+    onFoldersFirstChange: ((Boolean) -> Unit)? = null,
+): List<SheetAction> = buildList {
+    PikoSortField.entries.forEach { field ->
+        val current = field.owns(sortOrder)
+        val direction = if (sortOrder.isAscending) tr("升序", "Ascending", "昇順", "오름차순", "遞增") else tr("降序", "Descending", "降順", "내림차순", "遞減")
+        add(
+            SheetAction(
+                Icons.AutoMirrored.Outlined.Sort,
+                if (current) tr("按${field.label}（$direction）", "Sort by ${field.label} ($direction)", "${field.label}順（$direction）", "${field.label} 정렬 ($direction)", "依${field.label}排序（$direction）") else tr("按${field.label}", "Sort by ${field.label}", "${field.label}順", "${field.label} 정렬", "依${field.label}排序"),
+                { onSortChange(field.selectFrom(sortOrder)) },
+                group = ActionGroup.Sort,
+                checked = current,
+            ),
+        )
+    }
+    if (onFoldersFirstChange != null) {
+        add(SheetAction(
+            Icons.AutoMirrored.Outlined.Sort,
+            tr("文件夹置顶", "Folders on top", "フォルダーを上部に固定", "폴더 상단 고정", "資料夾置頂"),
+            { onFoldersFirstChange(!foldersFirst) },
+            group = ActionGroup.Sort,
+            checked = foldersFirst,
+        ))
+    }
+    if (onPerFolderSortChange != null) {
+        add(
+            SheetAction(
+                Icons.AutoMirrored.Outlined.Sort,
+                tr("各文件夹独立排序", "Sort each folder separately", "フォルダーごとに並べ替え", "폴더별 정렬", "各資料夾獨立排序"),
+                { onPerFolderSortChange(!perFolderSort) },
+                group = ActionGroup.Sort,
+                checked = perFolderSort,
+            ),
+        )
+    }
+}
+
+internal fun typeFilterOverflowActions(
+    typeFilter: FileCategory?,
+    availableTypes: List<Pair<FileCategory, Int>>,
+    onTypeFilterChange: (FileCategory?) -> Unit,
+): List<SheetAction> =
+    listOf(SheetAction(Icons.Outlined.FilterList, tr("全部类型", "All types", "すべての種類", "모든 유형", "所有類型"), { onTypeFilterChange(null) }, group = ActionGroup.Filter, checked = typeFilter == null)) +
+        availableTypes.map { (category, count) ->
+            SheetAction(category.icon(), "${category.label}（$count）", { onTypeFilterChange(category) }, group = ActionGroup.Filter, checked = category == typeFilter)
+        }
+
+internal fun viewModeOverflowActions(viewMode: DriveViewMode, onViewModeChange: (DriveViewMode) -> Unit): List<SheetAction> =
+    DriveViewMode.entries.map { mode ->
+        SheetAction(mode.icon(selected = mode == viewMode), mode.label, { onViewModeChange(mode) }, group = ActionGroup.View, checked = mode == viewMode)
+    }
+
+/**
+ * 排序按钮，写出当前字段与方向。菜单里再点当前字段即切换升降序，点其他字段则按该字段的起始方向排，
+ * 不必为六种组合各列一项。列表页眉与宽窗口的命令栏共用。
+ */
+@Composable
+internal fun SortButton(
+    sortOrder: FileSortOrder,
+    onSortChange: (FileSortOrder) -> Unit,
+    perFolderSort: Boolean = false,
+    onPerFolderSortChange: ((Boolean) -> Unit)? = null,
+    foldersFirst: Boolean = true,
+    onFoldersFirstChange: ((Boolean) -> Unit)? = null,
+) {
+    var showMenu by remember { mutableStateOf(false) }
+    Box {
+        TextButton(onClick = { showMenu = true }) {
+            Icon(Icons.AutoMirrored.Outlined.Sort, contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(modifier = Modifier.width(6.dp))
+            Text(tr("按${sortOrder.field.label}", "Sort by ${sortOrder.field.label}", "${sortOrder.field.label}順", "${sortOrder.field.label} 정렬", "依${sortOrder.field.label}排序"))
+            Spacer(modifier = Modifier.width(2.dp))
+            SortDirectionIcon(sortOrder, modifier = Modifier.size(16.dp))
+        }
+        PikoDropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
+            val fields = PikoSortField.entries
+            fields.forEachIndexed { index, field ->
+                val isCurrent = field.owns(sortOrder)
+                DropdownMenuItem(
+                    onClick = {
+                        showMenu = false
+                        onSortChange(field.selectFrom(sortOrder))
+                    },
+                    text = { Text(field.label) },
+                    shape = menuItemShape(index, fields.size),
+                    trailingContent = { if (isCurrent) SortDirectionIcon(sortOrder) },
+                )
+            }
+            val optionCount = (if (onFoldersFirstChange != null) 1 else 0) + (if (onPerFolderSortChange != null) 1 else 0)
+            if (optionCount > 0) {
+                HorizontalDivider(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+                    color = MaterialTheme.colorScheme.outlineVariant,
+                )
+            }
+            if (onFoldersFirstChange != null) {
+                DropdownMenuItem(
+                    onClick = {
+                        showMenu = false
+                        onFoldersFirstChange(!foldersFirst)
+                    },
+                    text = { Text(tr("文件夹置顶", "Folders on top", "フォルダーを上部に固定", "폴더 상단 고정", "資料夾置頂")) },
+                    shape = menuItemShape(0, optionCount),
+                    trailingContent = {
+                        if (foldersFirst) Icon(Icons.Outlined.Check, contentDescription = null, modifier = Modifier.size(18.dp))
+                    },
+                )
+            }
+            if (onPerFolderSortChange != null) {
+                DropdownMenuItem(
+                    onClick = {
+                        showMenu = false
+                        onPerFolderSortChange(!perFolderSort)
+                    },
+                    text = { Text(stringResource(Res.string.text_sort_each_folder_separately)) },
+                    shape = menuItemShape(if (onFoldersFirstChange != null) 1 else 0, optionCount),
+                    trailingContent = {
+                        if (perFolderSort) Icon(Icons.Outlined.Check, contentDescription = null, modifier = Modifier.size(18.dp))
+                    },
+                )
+            }
+        }
+    }
+}
+
+/**
+ * 类型筛选，只在列表里有两类以上文件、或已在筛选时出现：只有一类时筛了等于没筛。
+ * 菜单里每类带上数量，选之前就知道会剩多少。列表页眉与宽窗口的命令栏共用。
+ */
+@Composable
+internal fun TypeFilterButton(
+    typeFilter: FileCategory?,
+    availableTypes: List<Pair<FileCategory, Int>>,
+    onTypeFilterChange: (FileCategory?) -> Unit,
+) {
+    if (typeFilter == null && availableTypes.size <= 1) return
+    var showMenu by remember { mutableStateOf(false) }
+    val colors = MaterialTheme.colorScheme
+    val active = typeFilter != null
+    Box {
+        TextButton(
+            onClick = { showMenu = true },
+            shape = CircleShape,
+            colors = if (active) {
+                androidx.compose.material3.ButtonDefaults.textButtonColors(
+                    containerColor = colors.secondaryContainer,
+                    contentColor = colors.onSecondaryContainer,
+                )
+            } else {
+                androidx.compose.material3.ButtonDefaults.textButtonColors()
+            },
+        ) {
+            Icon(
+                imageVector = typeFilter?.icon() ?: Icons.Outlined.FilterList,
+                contentDescription = null,
+                modifier = Modifier.size(18.dp),
+            )
+            Spacer(modifier = Modifier.width(6.dp))
+            Text(typeFilter?.label ?: tr("全部类型", "All types", "すべての種類", "모든 유형", "所有類型"))
+        }
+        PikoDropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
+            val options = listOf<Pair<FileCategory?, Int?>>(null to null) + availableTypes
+            options.forEachIndexed { index, (category, count) ->
+                DropdownMenuItem(
+                    onClick = {
+                        showMenu = false
+                        onTypeFilterChange(category)
+                    },
+                    text = {
+                        Text(
+                            text = category?.label ?: tr("全部类型", "All types", "すべての種類", "모든 유형", "所有類型"),
+                            color = if (category == typeFilter) MaterialTheme.colorScheme.primary else Color.Unspecified,
+                        )
+                    },
+                    leadingIcon = category?.let { { Icon(it.icon(), contentDescription = null, modifier = Modifier.size(20.dp)) } },
+                    trailingContent = count?.let { { Text("$it", style = MaterialTheme.typography.labelMedium.tabular) } },
+                    shape = menuItemShape(index, options.size),
+                )
+            }
+        }
+    }
+}
+
+/** 视图的图标：平时描边，当前的那个视图用实心，与全应用「选中即实心」一致。 */
+internal fun DriveViewMode.icon(selected: Boolean = false) = when (this) {
+    DriveViewMode.LIST -> if (selected) Icons.AutoMirrored.Filled.ViewList else Icons.AutoMirrored.Outlined.ViewList
+    DriveViewMode.POSTER -> if (selected) Icons.Filled.GridView else Icons.Outlined.GridView
+}
+
+internal val DriveViewMode.label
+    get() = when (this) {
+        DriveViewMode.LIST -> tr("列表", "List", "リスト", "목록", "清單")
+        DriveViewMode.POSTER -> tr("网格", "Grid", "グリッド", "격자", "網格")
+    }
+
+/**
+ * 视图切换，M3 Expressive 连体按钮组：列表、海报墙、图库三选一。窄屏在列表上方，宽窗口在命令栏右端、信息流旁边：
+ * 两者都是换一种方式看这个文件夹。只有图标，名字靠悬停提示。
+ */
+@Composable
+internal fun ViewModeToggle(
+    viewMode: DriveViewMode,
+    onViewModeChange: (DriveViewMode) -> Unit,
+) {
+    val modes = DriveViewMode.entries
+    Row(horizontalArrangement = Arrangement.spacedBy(ButtonGroupDefaults.ConnectedSpaceBetween)) {
+        modes.forEachIndexed { index, mode ->
+            TooltipBox(
+                positionProvider = TooltipDefaults.rememberTooltipPositionProvider(TooltipAnchorPosition.Below),
+                tooltip = { PlainTooltip { Text(mode.label) } },
+                state = rememberTooltipState(),
+            ) {
+                ToggleButton(
+                    checked = mode == viewMode,
+                    onCheckedChange = { if (mode != viewMode) onViewModeChange(mode) },
+                    shapes = connectedToggleShapes(index, modes.size),
+                    contentPadding = ViewToggleContentPadding,
+                ) {
+                    Icon(mode.icon(selected = mode == viewMode), contentDescription = tr("${mode.label}视图", "${mode.label} view", "${mode.label}表示", "${mode.label} 보기", "${mode.label}檢視"), modifier = Modifier.size(20.dp))
+                }
+            }
+        }
+    }
+}
+
+private val ViewToggleContentPadding = PaddingValues(horizontal = 12.dp)
+
+/** 启发式折叠提示。作为列表的一项随内容滚走，不再常驻在列表上方。 */
+@Composable
+internal fun FoldBanner(
+    isFolded: Boolean,
+    hiddenCount: Int,
+    onToggle: () -> Unit,
+) {
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 4.dp),
+        shape = MaterialTheme.shapes.medium,
+        color = if (isFolded) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.surfaceContainerHigh,
+    ) {
+        Row(
+            modifier = Modifier.padding(start = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                imageVector = Icons.Outlined.AutoAwesome,
+                contentDescription = null,
+                tint = if (isFolded) MaterialTheme.colorScheme.onSecondaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(18.dp),
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(
+                text = if (isFolded) tr("已折叠 $hiddenCount 个次要项", "$hiddenCount extras collapsed", "$hiddenCount 個の付属項目を折りたたみ中", "부가 항목 ${hiddenCount}개 접힘", "已摺疊 $hiddenCount 個次要項目") else tr("已显示全部，含 $hiddenCount 个次要项", "Showing all, including $hiddenCount extras", "付属項目 $hiddenCount 個を含めすべて表示", "부가 항목 ${hiddenCount}개를 포함하여 모두 표시", "已顯示全部，包含 $hiddenCount 個次要項目"),
+                style = MaterialTheme.typography.bodyMedium,
+                color = if (isFolded) MaterialTheme.colorScheme.onSecondaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.weight(1f),
+            )
+            TextButton(onClick = onToggle) {
+                Text(if (isFolded) tr("显示全部", "Show all", "すべて表示", "모두 표시", "顯示全部") else tr("恢复折叠", "Reset folding", "折りたたみをリセット", "접기 상태 초기화", "還原摺疊"))
+            }
+        }
+    }
+}
+
+/** 在父级给的宽度两侧各多占 [bleed]，用来抵消容器的水平内边距。 */
+private fun Modifier.bleedHorizontal(bleed: Dp): Modifier = layout { measurable, constraints ->
+    val extra = (bleed * 2).roundToPx()
+    val placeable = measurable.measure(
+        constraints.copy(
+            minWidth = constraints.minWidth + extra,
+            maxWidth = constraints.maxWidth + extra,
+        ),
+    )
+    layout(constraints.maxWidth, placeable.height) {
+        placeable.place(-bleed.roundToPx(), 0)
+    }
+}

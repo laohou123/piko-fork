@@ -83,6 +83,7 @@ interface PlaybackBackend {
      */
     fun addSubtitle(subtitle: ExternalSubtitle) = Unit
 
+
     /**
      * 挂一条外挂字幕但不改当前选中的轨道：文件里内封字幕已经选中的，补挂时不能把它顶掉。
      *
@@ -98,6 +99,10 @@ interface PlaybackBackend {
      * 用于「字幕文件被删掉」之后：不卸的话画面还在用那份已经取不到的流。
      */
     fun removeSubtitle(trackId: String) = Unit
+
+    /** 实时更新字幕外观（底色、字体、字号、纵向位置与 ASS 覆盖），播放期间即时生效。 */
+    fun setSubtitleStyle(style: SubtitleStylePrefs) = Unit
+
 
     /** 为 false 时控件不给旋转入口。 */
     val supportsRotation: Boolean get() = false
@@ -159,6 +164,9 @@ data class MediaTrack(
     val title: String?,
     val language: String?,
     val isExternal: Boolean = false,
+    val externalFilename: String? = null,
+    val codec: String? = null,
+    val isImage: Boolean = false,
 )
 
 /** 随视频一起加载的外挂字幕。[url] 是后端能直接读的地址，[title] 用来在列表里区分。 */

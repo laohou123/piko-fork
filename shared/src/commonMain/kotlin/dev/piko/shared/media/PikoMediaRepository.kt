@@ -1,353 +1,157 @@
+@file:JvmMultifileClass
+@file:JvmName("PikoMediaRepositoryKt")
+
 package dev.piko.shared.media
 
-import dev.piko.shared.i18n.tr
+import androidx.compose.runtime.Stable
 import dev.piko.data.auth.PikoUserPreferences
-import dev.piko.shared.data.BatchDriveDetailObserver
-import dev.piko.shared.data.PikoClientProvider
-import dev.piko.shared.log.PikoLog
+import dev.piko.download.DownloadTask
+import dev.piko.shared.data.ContentMetadata
+import dev.piko.shared.data.DriveMetadataSink
 import dev.piko.shared.data.LeasedFile
-import dev.piko.shared.data.VaultEntry
+import dev.piko.shared.data.LocalLocation
+import dev.piko.shared.data.LocalMounts
+import dev.piko.shared.data.PikoClientProvider
+import dev.piko.shared.data.runSuspendCatching
+import dev.piko.shared.log.PikoLog
 import dev.piko.shared.log.logFailure
 import dev.piko.shared.log.logFile
-import dev.piko.shared.log.logRangeAttempt
-import io.github.nihildigit.pikpak.leaseDetail
-import dev.piko.shared.media.proxy.PikPakByteSource
+import dev.piko.shared.media.cache.PikoFileCachePool
+import dev.piko.shared.media.player.PlayHistoryReporter
 import dev.piko.shared.media.proxy.PikoMediaProxy
 import dev.piko.shared.media.proxy.ProxyByteSource
 import dev.piko.shared.media.proxy.ProxyStream
-import dev.piko.shared.media.proxy.SlicedByteSource
-import io.github.nihildigit.pikpak.BlockStore
-import io.github.nihildigit.pikpak.BufferBudget
+import dev.piko.shared.media.reader.DocumentByteResult
+import dev.piko.shared.media.storyboard.StoryboardSource
 import io.github.nihildigit.pikpak.ConsumerIntent
-import dev.piko.shared.media.cache.PikoFileCachePool
-import dev.piko.download.DownloadTask
-import io.github.nihildigit.pikpak.ReadEndReason
-import io.github.nihildigit.pikpak.ServiceIntent
-import io.github.nihildigit.pikpak.TransferDemand
-import io.github.nihildigit.pikpak.PikPakStreamReader
-import io.github.nihildigit.pikpak.PlaybackBufferSnapshot
-import kotlinx.coroutines.currentCoroutineContext
-import io.github.nihildigit.pikpak.ApiRequestPriority
-import io.github.nihildigit.pikpak.FileDetail
-import io.github.nihildigit.pikpak.MediaVariant
 import io.github.nihildigit.pikpak.PikPakClient
-import io.github.nihildigit.pikpak.PikPakFileHandle
-import io.github.nihildigit.pikpak.ResolvedVariant
-import io.github.nihildigit.pikpak.StreamRole
-import io.github.nihildigit.pikpak.VariantPreference
 import io.github.nihildigit.pikpak.batchDelete
-import io.github.nihildigit.pikpak.batchGetFileDetails
 import io.github.nihildigit.pikpak.batchTrash
-import io.github.nihildigit.pikpak.fileHandle
-import io.github.nihildigit.pikpak.getFile
+import io.github.nihildigit.pikpak.StreamRole
+import io.github.nihildigit.pikpak.TransferDemand
 import io.github.nihildigit.pikpak.listPlayHistory
-import io.github.nihildigit.pikpak.reportPlay
-import io.github.nihildigit.pikpak.resolveVariant
-import io.github.nihildigit.pikpak.streamRangeFromUrl
-import io.github.nihildigit.pikpak.withApiPriority
-import io.ktor.utils.io.readAvailable
-import kotlinx.coroutines.CancellationException
+import kotlin.jvm.JvmMultifileClass
+import kotlin.jvm.JvmName
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.emitAll
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.flow.flow
-import kotlinx.coroutines.flow.flowOn
-import kotlinx.coroutines.flow.transformWhile
-import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
-import kotlin.concurrent.Volatile
-import kotlin.time.Duration
-import kotlin.time.Duration.Companion.milliseconds
-import kotlin.time.Duration.Companion.minutes
-import kotlin.time.Duration.Companion.seconds
-import kotlin.time.TimeMark
-import kotlin.time.TimeSource
+import kotlinx.coroutines.withTimeoutOrNull
 
-enum class PlayableMediaKind { Video, Image, UnsupportedImage }
+@Stable
+interface MediaPlaybackService {
+    val loopbackProxy: PikoMediaProxy
+    val playHistoryReporter: PlayHistoryReporter
 
-data class PlayableMediaInfo(
-    val fileId: String,
-    val name: String,
-    val gcid: String,
-    /** 签名直链，会过期。只适合立刻使用，播放请走 [PreparedPlayback.proxyUrl]。 */
-    val currentUrl: String,
-    val durationSeconds: Long,
-    val currentResolution: String,
-    val availableVariants: List<MediaVariant>,
-    val mediaId: String? = null,
-    val sizeBytes: Long = 0L,
-    val kind: PlayableMediaKind = mediaKindOf(name),
-    /** 画面尺寸，服务端没抽出元数据时为 0。 */
-    val width: Int = 0,
-    val height: Int = 0,
-    val isOrigin: Boolean = true,
-) {
-    /** 横向画面。尺寸未知时为 null，界面据此决定要不要提示全屏。 */
-    val isLandscapeVideo: Boolean?
-        get() = if (width <= 0 || height <= 0) null else width > height
+    fun currentAccountClient(): PikPakClient?
+    suspend fun localPath(fileId: String, subtitle: Boolean = false): String?
+    fun knownContentMetadata(fileId: String): ContentMetadata?
+    fun knownDurationMs(fileId: String, gcid: String = "", sizeBytes: Long = 0L): Long?
+
+    suspend fun prepareMedia(fileId: String, preferredResolution: String? = null): Result<PlayableMediaInfo>
+    suspend fun fetchDownloadUrl(fileId: String): Result<String>
+    suspend fun readDocumentBytes(fileId: String, maxBytes: Int, localPath: String? = null): Result<DocumentByteResult>
+    fun openTransferDemand(initialIntent: ConsumerIntent = ConsumerIntent()): TransferDemand
+    suspend fun preparePlayback(
+        fileId: String,
+        preferredResolution: String? = null,
+        defaultMaxHeight: Int = 0,
+        startPositionMillis: Long = 0L,
+    ): Result<PreparedPlayback>
+    suspend fun cachedRenditionCoverage(
+        info: PlayableMediaInfo,
+        positionMillis: Long,
+        durationMillis: Long,
+    ): Pair<Map<String, Float>, Set<String>>
+
+    fun enqueuePlayHistory(
+        fileId: String,
+        positionMillis: Long,
+        durationMillis: Long,
+        urgent: Boolean = false,
+        title: String = "",
+        client: PikPakClient? = null,
+    ): Boolean
+    suspend fun reportPlay(
+        fileId: String,
+        positionMillis: Long,
+        durationMillis: Long,
+        urgent: Boolean = true,
+        title: String = "",
+        client: PikPakClient? = null,
+    )
+    suspend fun flushPlayHistory(timeoutMillis: Long = PlayHistoryReporter.DEFAULT_FLUSH_TIMEOUT_MILLIS)
+    suspend fun cloudPlaybackPosition(fileId: String): Long?
+    suspend fun savePlaybackPosition(fileId: String, positionMillis: Long)
+    fun savePlaybackPositionAsync(fileId: String, positionMillis: Long)
+    suspend fun getPlaybackPosition(fileId: String): Long
+    fun shouldResumePlayback(): Boolean = true
 }
 
-/**
- * 可读的转码流里画面最大的那个。空表示这个文件没有能用的转码——
- * medias 里既有还在转的（video 为空），也有转完却没给链接的。
- */
-fun PlayableMediaInfo.bestTranscodeName(): String? = availableVariants.transcodeNameAtMost(Int.MAX_VALUE)
-
-/** 眼下放的这一档的名字，原画为 null。与 [PlayableMediaInfo.availableVariants] 里的名字对得上，界面据此标出当前档。 */
-val PlayableMediaInfo.transcodeName: String?
-    get() = if (isOrigin) null else availableVariants.firstOrNull { it.mediaId == mediaId }?.qualityName
-
-/**
- * 按画面高度挑一档可读的转码：优先不超过 [maxHeight] 的最大一档。
- *
- * 一档都不超过时（例如用户把上限设成 480，这个片源最低只有 720），取高一档里最低的那个：
- * 720 依然比原画省流量，直接退回原画等于把上限完全作废，用户看到的反而更清楚也更费流量。
- * 连转码都没有才返回 null，由调用方播原画。
- */
-fun List<MediaVariant>.transcodeNameAtMost(maxHeight: Int): String? {
-    val usable = filter { !it.isOrigin && it.video != null && it.link.url.isNotBlank() }
-    fun height(variant: MediaVariant) = variant.video?.height ?: 0
-    val within = usable.filter { height(it) <= maxHeight }.maxByOrNull(::height)
-    val nearestAbove = usable.filter { height(it) > maxHeight }.minByOrNull(::height)
-    return (within ?: nearestAbove)?.qualityName
+@Stable
+interface MediaVariantProber {
+    suspend fun openRandomAccess(fileId: String, retainedBy: String? = null, mediaId: String? = null): Result<RandomAccessMediaSource>
+    fun knownUnreadableTranscodeIds(fileId: String, gcid: String, sizeBytes: Long): Set<String>
+    fun knownTranscodeStreamSizeFor(fileId: String, gcid: String, sizeBytes: Long, mediaId: String): Long?
+    fun downloadQualities(fileId: String): Flow<List<DownloadQuality>>
+    fun prefetchDownloadQualities(fileId: String)
+    suspend fun downloadVariant(fileId: String, name: String?, maxHeight: Int): Result<DownloadQuality?>
 }
 
-private val MediaVariant.qualityName: String?
-    get() = mediaName.ifBlank { resolutionName }.takeIf { it.isNotBlank() }
-
-/** 这一档在当前片源里是否真的能读：名字对上、有画面参数、链接不为空。 */
-private fun List<MediaVariant>.hasQuality(name: String): Boolean =
-    any { !it.isOrigin && it.video != null && it.link.url.isNotBlank() && it.qualityName == name }
-
-private val InactivePlaybackReactivation: StateFlow<Boolean> = MutableStateFlow(false).asStateFlow()
-
-/**
- * 一次播放准备的结果。关闭它即释放代理会话、需求凭据与 handle。
- */
-class PreparedPlayback internal constructor(
-    val info: PlayableMediaInfo,
-    private val stream: ProxyStream?,
-    /** 当前变体（原画或转码流）按其实际流长度或编码码率估算的平均字节消耗率（字节/秒）。 */
-    val estimatedBytesPerSecond: Long? = null,
-    val defaultBufferBudget: BufferBudget = playbackBufferBudget(),
-    internal val demand: TransferDemand = TransferDemand(),
-) : dev.piko.shared.media.player.PlaybackTransport {
-    @Volatile internal var prewarmJob: Job? = null
-    @Volatile private var boundPlaybackEpoch: Long = -1L
-    @Volatile private var prewarmCancelled: Boolean = false
-
-    /** 本机代理的地址。handle 建不起来（例如没有 gcid）时为 null，只能读直链。 */
-    val proxyUrl: String? get() = stream?.url
-
-    /** 当前流底层缓存已从网络收到的累计字节数（单调递增，用于显示加载实时网速）。 */
-    val receivedBytes: Long get() = stream?.receivedBytes ?: 0L
-
-    /** 底层云端文件是否正处于冷存唤醒等待中。 */
-    val isReactivating: StateFlow<Boolean> get() = stream?.isReactivating ?: InactivePlaybackReactivation
-
-    internal fun attachPrewarmJob(job: Job) {
-        if (prewarmCancelled || demand.isClosed) {
-            job.cancel()
-            return
-        }
-        prewarmJob = job
-        if (prewarmCancelled || demand.isClosed) {
-            cancelPrewarm()
-        }
-    }
-
-    fun cancelPrewarm() {
-        prewarmCancelled = true
-        prewarmJob?.cancel()
-        prewarmJob = null
-    }
-
-    private fun onIntentUpdated(intent: ConsumerIntent) {
-        if (intent.service == ServiceIntent.PAUSED || intent.bufferBudget.maxReadAheadBytes <= 0L) {
-            cancelPrewarm()
-            return
-        }
-        if (intent.epoch > 0L) {
-            val prevBound = boundPlaybackEpoch
-            if (prevBound < 0L) {
-                boundPlaybackEpoch = intent.epoch
-            } else if (intent.epoch > prevBound) {
-                boundPlaybackEpoch = intent.epoch
-                cancelPrewarm()
-            }
-        }
-    }
-
-    fun submitIntent(intent: ConsumerIntent): Boolean {
-        val updated = demand.submitIntent(intent)
-        onIntentUpdated(demand.intent)
-        return updated
-    }
-
-    fun updateIntent(transform: (ConsumerIntent) -> ConsumerIntent): Boolean {
-        val updated = demand.updateIntent(transform)
-        onIntentUpdated(demand.intent)
-        return updated
-    }
-
-    fun reportPlaybackBuffer(snapshot: PlaybackBufferSnapshot): Boolean =
-        demand.reportPlaybackBuffer(
-            snapshot.copy(mediaBytesPerSecond = snapshot.mediaBytesPerSecond ?: estimatedBytesPerSecond),
-        )
-
-    fun withdrawSpeculation() {
-        cancelPrewarm()
-        demand.withdrawSpeculation()
-    }
-
-    override fun withdrawTransport() {
-        cancelPrewarm()
-        stream?.withdrawTransport()
-        demand.close()
-    }
-
-    override fun close() {
-        withdrawTransport()
-        stream?.close()
-    }
+@Stable
+interface SubtitleSourceService {
+    suspend fun prepareSubtitle(fileId: String): ProxyStream?
+    suspend fun prepareExternalSubtitle(fileId: String, knownLanguage: String? = null): PreparedSubtitle?
+    suspend fun prepareOriginalEmbeddedSubtitles(fileId: String): PreparedOriginalSubtitles
 }
 
-/** [PikoMediaRepository.clipProbe] 的结果。时长取不到时为 null。 */
-class ClipProbe(val hasTranscode: Boolean, val durationMs: Long?)
-
-/**
- * 下载时可选的一档。原画的 [name] 与 [mediaId] 为 null。[sizeBytes] 是要下的字节数，转码档还没探到时为 null；
- * 转码档存下来是转封装后的 MP4，比这个数略小。[height] 是画面高度，不知道时为 0。
- */
-data class DownloadQuality(
-    val name: String?,
-    val mediaId: String?,
-    val height: Int,
-    val sizeBytes: Long?,
-    val durationMs: Long,
-    /** 转码档探测时读不出字节（服务端坏了），不能选。 */
-    val unreadable: Boolean = false,
-) {
-    val isOriginal: Boolean get() = mediaId == null
+@Stable
+interface ClipMediaService {
+    suspend fun prepareClip(
+        fileId: String,
+        startMs: Long,
+        videoDurationMs: Long,
+        role: StreamRole = StreamRole.BACKGROUND,
+        demand: TransferDemand? = null,
+        onByteSource: ((ProxyByteSource) -> Unit)? = null,
+    ): Result<PreparedClip>
+    suspend fun clipProbe(fileId: String, urgent: Boolean = false): ClipProbe
+    suspend fun batchClipProbe(fileIds: List<String>, urgent: Boolean = false): Map<String, ClipProbe>
+    fun openStoryboardSession(source: StoryboardSource): StoryboardTransportSession
+    suspend fun resolveStoryboardStreamSize(source: StoryboardSource): Long?
+    suspend fun fetchStoryboardRange(source: StoryboardSource, streamSize: Long, offset: Long, length: Int): ByteArray?
+    suspend fun fetchPreviewChunk(
+        fileId: String,
+        positionMillis: Long,
+        durationMillis: Long,
+        chunkBytes: Int = DEFAULT_PREVIEW_CHUNK_BYTES,
+    ): ByteArray?
 }
 
-/**
- * 这一档转码在服务端读不出字节，见 [PikoMediaRepository.downloadQualities]。消息直接给用户看，点明是 PikPak：
- * 只写「无法读取」时用户会当成网络或客户端自身的问题，反复重试。
- */
-class UnreadableTranscodeException(cause: Throwable? = null) : IllegalStateException(
-    tr(
-        "PikPak 云端转码流不可用，请选择其他画质",
-        "PikPak cloud transcode is unavailable. Choose another quality",
-        "PikPak クラウドの変換ストリームを利用できません。別の画質を選択してください",
-        "PikPak 클라우드 변환 스트림을 사용할 수 없습니다. 다른 화질을 선택해 주세요",
-        "PikPak 雲端轉碼串流無法使用，請選擇其他畫質",
-    ),
-    cause,
-)
+@Stable
+interface MediaService : MediaPlaybackService, MediaVariantProber, SubtitleSourceService, ClipMediaService
 
-/** 选定的转码档在详情里已经没有了，给用户看的失败原因。 */
-val TRANSCODE_GONE_MESSAGE: String get() = tr("所选画质已不可用", "Selected quality is no longer available", "選択した画質は利用できなくなりました", "선택한 화질을 더 이상 사용할 수 없습니다", "所選畫質已無法使用")
-
+@Stable
 class PikoMediaRepository(
     private val clientManager: PikoClientProvider,
     private val preferences: PikoUserPreferences? = null,
     /** 随机片段切片的磁盘缓存，见 [ClipCache]。没有就每次都从网上取。 */
-    private val clipCache: ClipCache? = null,
-) {
-    private val client get() = clientManager.currentClient.value ?: error("Not logged in")
+    clipCache: ClipCache? = null,
+) : MediaService {
+    private val client: PikPakClient get() = clientManager.currentClient.value ?: error("Not logged in")
 
-    /**
-     * 打开归档条目时借用的文件对象放在哪个目录，返回它的 ID。PikoServices 组装好 Piko-Temp 之后设上：
-     * 媒体仓库在各端入口建出来时，Piko-Temp 还不存在。
-     */
+    override fun currentAccountClient(): PikPakClient? = clientManager.currentClient.value
+
+    /** 打开归档条目时借用的文件对象放在哪个目录，返回它的 ID。 */
     var leaseFolder: (suspend (PikPakClient) -> String)? = null
-    var localMounts: dev.piko.shared.data.LocalMounts? = null
-    var metadataSink: dev.piko.shared.data.DriveMetadataSink? = null
-    suspend fun localPath(fileId: String, subtitle: Boolean = false): String? = localMounts?.resolve(fileId, subtitle)
-
-    /** 下载调度器提供；原画播放与完整下载共用缓存，转码片段仍用 ClipCache。 */
-    var fileCachePool: PikoFileCachePool? = null
-    var partialDownload: ((fileId: String) -> DownloadTask?)? = null
-
-    // 按磁盘记录重建的切片在这里提前取直链，见 cachedClip
-    private val backgroundScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-
-    // 随机片段挑段时查转码拿到的详情，紧接着建 handle 直接用：handle 连第一条直链都从详情里取，
-    // 一段省下全部的详情查询。直链的有效期远长于这几分钟
-    private val freshDetails = HashMap<String, Pair<FileDetail, TimeMark>>()
-    private val freshDetailsLock = Mutex()
-    private var freshDetailsOwner: PikPakClient? = null
-
-    internal fun knownContentMetadata(fileId: String): dev.piko.shared.data.ContentMetadata? {
-        val owner = clientManager.currentClient.value ?: return null
-        return metadataSink?.lookupContentByFileId(owner, fileId)
-    }
-
-    fun knownDurationMs(fileId: String, gcid: String = "", sizeBytes: Long = 0L): Long? {
-        val owner = clientManager.currentClient.value ?: return null
-        val sink = metadataSink ?: return null
-        val content = sink.lookupContentByFileId(owner, fileId)
-            ?: (if (gcid.isNotBlank() && sizeBytes >= 0L) sink.lookupContent(owner, gcid, sizeBytes) else null)
-        return content?.durationMillis?.takeIf { it > 0L }
-    }
-
-    init {
-        backgroundScope.launch {
-            clientManager.currentClient.collect { owner ->
-                freshDetailsLock.withLock {
-                    if (freshDetailsOwner !== owner) {
-                        freshDetails.clear()
-                        freshDetailsOwner = owner
-                    }
-                }
-            }
-        }
-    }
-
-    // 进程内一个就够：端口按需绑定，没有会话时只占一个监听 socket
-    private val proxy get() = sharedProxy
-
-    suspend fun prepareMedia(fileId: String, preferredResolution: String? = null): Result<PlayableMediaInfo> =
-        withContext(Dispatchers.Default) {
-            runSuspendCatching {
-                val detail = takeFreshDetail(client, fileId)
-                    ?: withApiPriority(ApiRequestPriority.INTERACTIVE) { detailOf(client, fileId) }
-                        .also { rememberFreshDetail(client, fileId, it) }
-                val resolved = detail.resolveVariant(preferenceFor(preferredResolution))
-                playableMediaInfo(detail, resolved, fileId)
-            }
-        }
-
-    /**
-     * 获取文件的下载直链（含归档条目或压缩包内条目的按需借出直链）。
-     */
-    suspend fun fetchDownloadUrl(fileId: String): Result<String> =
-        withContext(Dispatchers.Default) {
-            runSuspendCatching {
-                val detail = takeFreshDetail(client, fileId)
-                    ?: withApiPriority(ApiRequestPriority.INTERACTIVE) { detailOf(client, fileId) }
-                        .also { rememberFreshDetail(client, fileId, it) }
-                detail.downloadUrl?.takeIf { it.isNotBlank() } ?: error(tr("未获取到下载链接", "Download link unavailable", "ダウンロードリンクを取得できません", "다운로드 링크를 가져올 수 없습니다", "無法取得下載連結"))
-            }
-        }
-
-    /** 为即将发起的播放或片段请求开启账号级传输需求凭据。 */
-    fun openTransferDemand(initialIntent: ConsumerIntent = ConsumerIntent()): TransferDemand =
-        client.openTransferDemand(initialIntent)
+    var localMounts: LocalMounts? = null
+    var metadataSink: DriveMetadataSink? = null
 
     /**
      * 删除文件交给网盘仓库去办（[PikoDriveRepository.delete]），由它顺带更新本地索引与目录缓存。
@@ -382,686 +186,256 @@ class PikoMediaRepository(
             cloudFileTrasher?.invoke(ids) ?: runSuspendCatching { client.batchTrash(ids) }
         }
 
-    /**
-     * 取元数据并为视频开一个代理会话。
-     *
-     * 只调一次 getFile：元数据、直链与 handle 都出自同一份详情，失败回退用的直链与代理读的字节同源。
-     * [preferredResolution] 是用户在播放器里点选的档位；为 null 时按 [defaultMaxHeight] 挑，见 [transcodeNameAtMost]，
-     * 0 表示原画。
-     */
-    suspend fun preparePlayback(
-        fileId: String,
-        preferredResolution: String? = null,
-        defaultMaxHeight: Int = 0,
-        startPositionMillis: Long = 0L,
-    ): Result<PreparedPlayback> {
-        val accountClient = client
-        val initialBudget = playbackBufferBudget()
-        val owner = accountClient.openTransferDemand(
-            ConsumerIntent(
-                epoch = 0L,
-                service = ServiceIntent.WAITING,
-                bufferBudget = initialBudget,
-            ),
-        )
-        var created: PreparedPlayback? = null
-        try {
-            return withContext(owner) {
-                preparePlaybackOwned(accountClient, owner, fileId, preferredResolution, defaultMaxHeight, startPositionMillis)
-                    .onSuccess { created = it }
-            }.onFailure { owner.close() }
-        } catch (e: Throwable) {
-            created?.close()
-            owner.close()
-            throw e
-        }
-    }
+    override suspend fun localPath(fileId: String, subtitle: Boolean): String? = localMounts?.resolve(fileId, subtitle)
 
-    private suspend fun preparePlaybackOwned(
-        client: PikPakClient,
-        owner: TransferDemand,
-        fileId: String,
-        preferredResolution: String? = null,
-        defaultMaxHeight: Int = 0,
-        startPositionMillis: Long = 0L,
-    ): Result<PreparedPlayback> =
-        withContext(Dispatchers.Default) {
-            runSuspendCatching {
-                // 本机下了一部分的原画不费流量，照样先用，画质上限是为了省流量
-                if (preferredResolution.isNullOrBlank() || preferredResolution == ORIGINAL_QUALITY) {
-                    partialSource(client, fileId)?.let { (task, source) ->
-                        val fileLabel = logFile(fileId, task.fileName)
-                        PikoLog.d(TAG, "Reusing partial download cache for playback: $fileLabel, held=${task.downloadedBytes}/${task.totalBytes} B")
-                        val info = PlayableMediaInfo(fileId, task.displayName.substringAfterLast('/'), task.gcid,
-                            currentUrl = "", durationSeconds = 0, availableVariants = emptyList(),
-                            currentResolution = ORIGINAL_QUALITY, sizeBytes = task.totalBytes)
-                        val stream = registerProxy(source, task.fileName.substringAfterLast('/'), fileLabel, owner)
-                            ?: error(tr("无法创建本地播放会话", "Unable to create local playback session", "ローカル再生セッションを作成できません", "로컬 재생 세션을 만들 수 없습니다", "無法建立本機播放工作階段"))
-                        val partialBudget = playbackBufferBudget()
-                        owner.updateIntent { it.copy(bufferBudget = partialBudget) }
-                        return@runSuspendCatching PreparedPlayback(info, stream, defaultBufferBudget = partialBudget, demand = owner)
-                    }
-                }
-                val detail = takeFreshDetail(client, fileId)
-                    ?: withApiPriority(ApiRequestPriority.INTERACTIVE) { detailOf(client, fileId) }
-                        .also { rememberFreshDetail(client, fileId, it) }
-                // 点选的那一档在这一集未必存在（同名档位只在部分片源里有），
-                // 缺席时按它的画面高度重新挑，而不是让 SDK 直接退回原画
-                val resolution = when {
-                    preferredResolution == ORIGINAL_QUALITY -> ORIGINAL_QUALITY
-                    !preferredResolution.isNullOrBlank() && detail.medias.hasQuality(preferredResolution) -> preferredResolution
-                    else -> defaultMaxHeight.takeIf { it > 0 }?.let { detail.medias.transcodeNameAtMost(it) }
-                }
-                val resolved = detail.resolveVariant(preferenceFor(resolution))
-                val info = playableMediaInfo(detail, resolved, fileId)
-                val leased = LeasedFile.isLeased(fileId)
-                val stream = if (info.kind == PlayableMediaKind.Video) openProxyStream(client, detail, resolved, leased = leased) else null
-                val actualStreamBytes = stream?.size ?: resolved.sizeBytes ?: detail.sizeBytes.takeIf { resolved.isOrigin } ?: 0L
-                val resolvedInfo = if (actualStreamBytes > 0L && info.sizeBytes != actualStreamBytes) {
-                    info.copy(sizeBytes = actualStreamBytes)
-                } else {
-                    info
-                }
-                val durationSeconds = resolved.video?.duration?.takeIf { it > 0L } ?: (durationMsOf(detail) / 1000L)
-                val estimatedRate = estimatedMediaBytesPerSecond(
-                    streamSize = actualStreamBytes,
-                    durationSeconds = durationSeconds,
-                    bitRateBitsPerSecond = resolved.video?.bitRate,
-                )
-                val defaultBudget = playbackBufferBudget(estimatedRate)
-                owner.updateIntent { it.copy(bufferBudget = defaultBudget) }
-                val prepared = PreparedPlayback(resolvedInfo, stream, estimatedRate, defaultBudget, owner)
-                // 完整播放器必读偏移 0 识别容器与编解码头；MPEG-TS 转码流从中途续播或切换画质时，
-                // FFmpeg 打开无索引 TS 还需读末尾 PCR 计算总时长并向比例偏移跳读定位，并发预热首尾与估计落点可省去串行往返。
-                if (stream != null && stream.size > 0L) {
-                    val prewarmRanges = playbackPrewarmRanges(
-                        streamSize = stream.size,
-                        isOrigin = resolved.isOrigin,
-                        startPositionMillis = startPositionMillis,
-                        durationMillis = durationSeconds * 1000L,
-                    )
-                    val prewarm = backgroundScope.launch {
-                        runCatching { stream.prefetch(prewarmRanges, StreamRole.FOREGROUND, PikPakStreamReader.BLOCKING_PRIORITY) }
-                            .onFailure {
-                                if (it !is CancellationException) {
-                                    PikoLog.d(TAG, "Playback prewarm skipped: ${logFile(fileId, detail.name)}, cause=${it::class.simpleName}: ${it.message}")
-                                }
-                            }
-                    }
-                    prepared.attachPrewarmJob(prewarm)
-                }
-                prepared
-            }
-        }
+    /** 下载调度器提供；原画播放与完整下载共用缓存，转码片段仍用 ClipCache。 */
+    var fileCachePool: PikoFileCachePool? = null
+    var partialDownload: ((fileId: String) -> DownloadTask?)? = null
 
-    /**
-     * 为随机片段开一个代理会话：全片 [startMs] 起的一段，[videoDurationMs] 是全片时长。
-     *
-     * 有 [CLIP_RESOLUTION] 转码时只截转码流起点附近的一截交给播放器，见 [SlicedByteSource]。
-     * PikPak 的转码流是 MPEG-TS，没有索引，从片中起播 mpv 只能按时间戳二分查找，一次起播十来处跳读，
-     * 实测 4 到 18 秒；而 TS 本来就能从任意包边界接着播，截出来当一个短文件从头顺序读，不跳读，
-     * 起播只要起点那几百 KB。转码的码率大致恒定，按时长比例折算的起点也比原画准。
-     *
-     * 没有这一档转码、或者转码不是 TS 时，退回原画整条，由播放器从起点 seek 过去。
-     */
-    suspend fun prepareClip(
-        fileId: String,
-        startMs: Long,
-        videoDurationMs: Long,
-        role: StreamRole = StreamRole.BACKGROUND,
-        demand: TransferDemand? = null,
-        onByteSource: ((ProxyByteSource) -> Unit)? = null,
-    ): Result<PreparedClip> {
-        val accountClient = client
-        val ownsDemand = demand == null
-        val owner = demand ?: accountClient.openTransferDemand(
-            ConsumerIntent(
-                service = if (role == StreamRole.FOREGROUND) ServiceIntent.WAITING else ServiceIntent.PREFETCH,
-                bufferBudget = if (role == StreamRole.FOREGROUND) {
-                    BufferBudget(maxReadAheadBytes = CLIP_SCAN_READ_AHEAD_BYTES)
-                } else {
-                    BufferBudget.NONE
-                },
-            ),
-        )
-        var created: PreparedClip? = null
-        try {
-            return withContext(owner) {
-                prepareClipOwned(accountClient, fileId, startMs, videoDurationMs, onByteSource)
-                    .onSuccess {
-                        created = it
-                        it.bindDemand(owner)
-                    }
-            }.onFailure { if (ownsDemand) owner.close() }
-        } catch (e: Throwable) {
-            created?.close()
-            if (ownsDemand) owner.close()
-            throw e
-        }
-    }
+    private val backgroundScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
-    private suspend fun prepareClipOwned(
-        client: PikPakClient,
-        fileId: String,
-        startMs: Long,
-        videoDurationMs: Long,
-        onByteSource: ((ProxyByteSource) -> Unit)? = null,
-    ): Result<PreparedClip> =
-        withContext(Dispatchers.Default) {
-            runSuspendCatching {
-                if (dev.piko.shared.data.LocalLocation.isLocal(fileId)) {
-                    val path = localPath(fileId)
-                        ?: error(tr("本机文件夹不可访问", "Local folder is inaccessible", "ローカルフォルダにアクセスできません", "로컬 폴더에 접근할 수 없습니다", "本機資料夾無法存取"))
-                    return@runSuspendCatching PreparedClip(null, path, false, startMs, 0.0,
-                        maxWindowMs = dev.piko.shared.state.localClipMaxWindowMs(startMs, videoDurationMs), localPath = path)
-                }
-                val key = clipKey(client.account, fileId, startMs)
-                val leased = LeasedFile.isLeased(fileId)
-                clipCache?.record(key)?.let { record ->
-                    cachedClip(client, record, videoDurationMs, leased, onByteSource)?.let { return@runSuspendCatching it }
-                }
-                val detail = takeFreshDetail(client, fileId)
-                    ?: detailOf(client, fileId).also { rememberFreshDetail(client, fileId, it) }
-                val transcode = detail.resolveVariant(VariantPreference.Resolution(CLIP_RESOLUTION))
-                if (!transcode.isOrigin && videoDurationMs > 0) {
-                    openClipSlice(client, detail, transcode, key, startMs, videoDurationMs, leased, onByteSource)
-                        ?.let { return@runSuspendCatching it }
-                }
-                val original = detail.resolveVariant(VariantPreference.Original)
-                val info = playableMediaInfo(detail, original, fileId)
-                val stream = openProxyStream(client, detail, original, leased = leased, fastReactivation = true, onByteSource = onByteSource)
-                val bytesPerMs = if (videoDurationMs > 0) detail.sizeBytes.toDouble() / videoDurationMs else 0.0
-                PreparedClip(stream, fallbackUrl = info.currentUrl, sliced = false, clipStartMs = startMs, bytesPerMs = bytesPerMs)
-            }
-        }
+    override val loopbackProxy: PikoMediaProxy get() = sharedProxy
 
-    /**
-     * 这一段来过：按记录建 handle，不查详情就交出代理地址，开头与末尾从磁盘读。
-     * 读到中间才要直链，所以在后台先取一条，播放器读完盘上那几秒之前多半已经取好。
-     */
-    private suspend fun cachedClip(
-        client: PikPakClient,
-        record: ClipRecord,
-        videoDurationMs: Long,
-        leased: Boolean,
-        onByteSource: ((ProxyByteSource) -> Unit)? = null,
-    ): PreparedClip? {
-        val bytesPerMs = if (videoDurationMs > 0) record.streamBytes.toDouble() / videoDurationMs else 0.0
-        val handle = PikPakFileHandle(
-            client = client,
-            gcid = record.gcid,
-            size = record.originalBytes,
-            name = record.name,
-            initialFileId = record.fileId,
-            mediaId = record.mediaId,
-            parentId = record.parentId,
-            leased = leased,
-            onRangeAttempt = ::logRangeAttempt,
-            streamSize = record.streamBytes,
-            reactivationPollInterval = CLIP_REACTIVATION_POLL_INTERVAL,
-            reactivationTimeout = CLIP_REACTIVATION_TIMEOUT,
-        )
-        val boundedLength = record.sliceLength.coerceIn(TS_PACKET_BYTES, (record.streamBytes - record.sliceOffset).coerceAtLeast(TS_PACKET_BYTES))
-        val cache = try {
-            handle.openCache(
-                blockStore = sliceStore(record.sliceOffset, boundedLength, bytesPerMs),
-                coroutineContext = proxy.readerContext,
-            )
-        } catch (e: Throwable) {
-            handle.close()
-            throw e
-        }
-        backgroundScope.launch {
-            runCatching { handle.prewarm() }.onFailure {
-                if (it !is CancellationException) {
-                    PikoLog.d(TAG, "Cached clip URL prewarm failed: ${logFile(record.fileId, record.name)}, cause=${it::class.simpleName}: ${it.message}")
-                }
-            }
-        }
-        val source = SlicedByteSource(
-            inner = PikPakByteSource(handle, cache),
-            offset = record.sliceOffset,
-            size = boundedLength,
-            nullVideoBeforeOffset = (record.keyframeOffset - record.sliceOffset).coerceAtLeast(0L),
-            nullVideoPid = record.videoPid,
-        )
-        onByteSource?.invoke(source)
-        val stream = registerProxy(source, fileName = "clip.ts", fileLabel = logFile(record.fileId, record.name)) ?: return null
-        return PreparedClip(
-            stream,
-            fallbackUrl = null,
-            sliced = true,
-            clipStartMs = record.sliceStartMs,
-            bytesPerMs = bytesPerMs,
-            maxWindowMs = record.sliceDurationMs.takeIf { it > 0L }?.let { minOf(CLIP_SLICE_MS, it) } ?: CLIP_SLICE_MS,
-            fromDisk = true,
-        )
-    }
-
-    private fun sliceStore(sliceOffset: Long, sliceLength: Long, bytesPerMs: Double) =
-        clipCache?.let { RangeLimitedStore(it.blocks) }?.also { it.keepSlice(sliceOffset, sliceLength, bytesPerMs) }
-
-    /** 只存切片开头与末尾的块，见 [RangeLimitedStore]。块的偏移是整条转码流的，这里换算过去。 */
-    private fun RangeLimitedStore.keepSlice(sliceOffset: Long, sliceLength: Long, bytesPerMs: Double) {
-        kept = PreparedClip.sliceRanges(sliceLength, bytesPerMs).map { it.first + sliceOffset..it.last + sliceOffset }
-    }
-
-    // 同一个视频、同一个起点才是同一截；换了清晰度截出来的字节就不同。
-    // 归档条目的 ID 带着文件名，拼进磁盘上的文件名会超长，只用条目自己的 ID
-    private fun clipKey(account: String, fileId: String, startMs: Long): String {
-        val id = VaultEntry.entryIdOf(fileId)?.let { "vault-$it" } ?: fileId
-        return "${account}_${id}_${startMs}_${CLIP_RESOLUTION}_v5"
-    }
-
-    /**
-     * 这个文件有没有随机片段要的那档转码，以及详情里的时长。列目录不带转码信息，只能逐个查详情；
-     * 查不到按没有算，信息流把它排到有转码的后面，轮到时放原画。
-     *
-     * 时长是给归档条目的：它们存自磁力解析，没有时长，而信息流的随机起点要按时长算。借一次对象的详情里
-     * 两样都有；这份详情随即留给 [prepareClip]，挑中后不必再借。
-     */
-    suspend fun clipProbe(fileId: String, urgent: Boolean = false): ClipProbe =
-        clipProbeInternal(fileId, urgent = urgent, logOnFailure = true).first
-
-    private suspend fun clipProbeInternal(
-        fileId: String,
-        urgent: Boolean,
-        logOnFailure: Boolean,
-    ): Pair<ClipProbe, Boolean> =
-        withContext(Dispatchers.Default) {
-            runSuspendCatching {
-                if (dev.piko.shared.data.LocalLocation.isLocal(fileId)) {
-                    val file = localMounts?.probe(fileId)
-                    return@runSuspendCatching ClipProbe(false, file?.params?.get("duration")?.toDoubleOrNull()?.let { (it * 1000).toLong() })
-                }
-                val owner = client
-                val content = metadataSink?.lookupContentByFileId(owner, fileId)
-                val transcodes = content?.transcodes
-                val durationMs = content?.durationMillis
-                if (transcodes != null && (transcodes.isNotEmpty() || content.qualityRank > 0) && (durationMs ?: 0L) > 0L) {
-                    return@runSuspendCatching ClipProbe(
-                        hasTranscode = transcodes.any { it.name == CLIP_RESOLUTION && !it.unreadable },
-                        durationMs = durationMs,
-                    )
-                }
-                val priority = if (urgent) ApiRequestPriority.INTERACTIVE else ApiRequestPriority.BACKGROUND
-                val detail = withApiPriority(priority) { detailOf(owner, fileId) }
-                rememberFreshDetail(owner, fileId, detail)
-                clipProbeOf(detail)
-            }.fold(
-                onSuccess = { it to true },
-                onFailure = {
-                    if (logOnFailure) {
-                        PikoLog.d(TAG, "Clip detail probe failed, treating as no transcode: ${logFile(fileId, "")}, cause=${it::class.simpleName}: ${it.message}")
-                    }
-                    ClipProbe(hasTranscode = false, durationMs = null) to false
-                },
-            )
-        }
-
-    /**
-     * 批量探测多个候选视频是否包含 [CLIP_RESOLUTION] 转码流及时长：
-     * 普通网盘文件优先复用近期缓存详情，其余合并为单次 [batchGetFileDetails] 批量查询并写回 [metadataSink] 与 [freshDetails]；
-     * 归档条目优先从 [metadataSink] 的持久化内容元数据零网络直出，缺失时再回退单条探测。
-     */
-    suspend fun batchClipProbe(fileIds: List<String>, urgent: Boolean = false): Map<String, ClipProbe> =
-        withContext(Dispatchers.Default) {
-            if (fileIds.isEmpty()) return@withContext emptyMap()
-            val distinctIds = fileIds.distinct()
-            val result = LinkedHashMap<String, ClipProbe>(distinctIds.size)
-            val owner = clientManager.currentClient.value
-            val missingDriveIds = ArrayList<String>()
-            val fallbackIds = ArrayList<String>()
-            for (id in distinctIds) {
-                if (dev.piko.shared.data.LocalLocation.isLocal(id)) {
-                    val file = runSuspendCatching { localMounts?.probe(id) }.getOrNull()
-                    result[id] = ClipProbe(false, file?.params?.get("duration")?.toDoubleOrNull()?.let { (it * 1000).toLong() })
-                    continue
-                }
-                if (owner == null) {
-                    result[id] = ClipProbe(hasTranscode = false, durationMs = null)
-                    continue
-                }
-                val fresh = takeFreshDetail(owner, id)
-                if (fresh != null) {
-                    result[id] = clipProbeOf(fresh)
-                    continue
-                }
-                val cachedContent = metadataSink?.lookupContentByFileId(owner, id)
-                val cachedTranscodes = cachedContent?.transcodes
-                val cachedDurationMs = cachedContent?.durationMillis
-                if (cachedTranscodes != null && (cachedTranscodes.isNotEmpty() || cachedContent.qualityRank > 0) && (cachedDurationMs ?: 0L) > 0L) {
-                    result[id] = ClipProbe(
-                        hasTranscode = cachedTranscodes.any { it.name == CLIP_RESOLUTION && !it.unreadable },
-                        durationMs = cachedDurationMs,
-                    )
-                    continue
-                }
-                if (LeasedFile.isLeased(id)) {
-                    fallbackIds += id
-                } else {
-                    missingDriveIds += id
-                }
-            }
-            val priority = if (urgent) ApiRequestPriority.INTERACTIVE else ApiRequestPriority.BACKGROUND
-            var batchFailed = false
-            if (owner != null && missingDriveIds.isNotEmpty()) {
-                val observer = metadataSink?.capture(owner)
-                val fetched = runSuspendCatching {
-                    withApiPriority(priority) {
-                        owner.batchGetFileDetails(missingDriveIds, usage = "PLAY")
-                    }
-                }.onFailure {
-                    batchFailed = true
-                    PikoLog.w(
-                        TAG,
-                        "Batch clip detail probe failed (count=${missingDriveIds.size}), falling back to single-item probes: ${it::class.simpleName}: ${it.message}",
-                    )
-                }.getOrDefault(emptyList())
-                val validFetched = fetched.filter { it.id.isNotBlank() }
-                if (validFetched.isNotEmpty()) {
-                    if (observer is BatchDriveDetailObserver) {
-                        observer.observeBatch(validFetched)
-                    } else if (observer != null) {
-                        for (detail in validFetched) observer.observe(detail.id, detail)
-                    }
-                    rememberFreshDetails(owner, validFetched)
-                    for (detail in validFetched) {
-                        result[detail.id] = clipProbeOf(detail)
-                    }
-                }
-                for (id in missingDriveIds) {
-                    if (id !in result) {
-                        val content = metadataSink?.lookupContentByFileId(owner, id)
-                        val transcodes = content?.transcodes
-                        val durationMs = content?.durationMillis
-                        if (transcodes != null && (transcodes.isNotEmpty() || content.qualityRank > 0) && (durationMs ?: 0L) > 0L) {
-                            result[id] = ClipProbe(
-                                hasTranscode = transcodes.any { it.name == CLIP_RESOLUTION && !it.unreadable },
-                                durationMs = durationMs,
-                            )
-                        } else {
-                            fallbackIds += id
-                        }
-                    }
-                }
-            }
-            if (fallbackIds.isNotEmpty()) {
-                val batchFailedSet = if (batchFailed) missingDriveIds.toSet() else emptySet()
-                val probed = coroutineScope {
-                    fallbackIds.map { id ->
-                        async { id to clipProbeInternal(id, urgent = urgent, logOnFailure = id !in batchFailedSet) }
-                    }.awaitAll()
-                }
-                var suppressedFailures = 0
-                for ((id, outcome) in probed) {
-                    result[id] = outcome.first
-                    if (!outcome.second && id in batchFailedSet) suppressedFailures++
-                }
-                if (suppressedFailures > 0) {
-                    PikoLog.d(TAG, "Fallback single-item clip probes also failed after batch error: failed=$suppressedFailures/${batchFailedSet.size}")
-                }
-            }
-            result
-        }
-
-    private fun clipProbeOf(detail: FileDetail): ClipProbe = ClipProbe(
-        hasTranscode = detail.medias.any { !it.isOrigin && it.mediaName == CLIP_RESOLUTION && it.url != null },
-        durationMs = durationMsOf(detail).takeIf { it > 0L },
+    /** 跨播放器窗口生命周期的云端播放历史上报队列，负责同文件冷却合并、账号捕获与失败退避重试。 */
+    override val playHistoryReporter: PlayHistoryReporter = PlayHistoryReporter(
+        scope = backgroundScope,
+        isPlayHistorySynced = ::isPlayHistorySynced,
     )
 
-    /**
-     * 文件详情。归档条目在网盘里没有常驻的文件，按 gcid 借一个对象查完就删（SDK 的 leaseDetail）：
-     * 详情里的直链照样能用，6 GB 的免费空间因此整块留给正在看的那一个文件。
-     * 读这份详情建 handle 时要带 leased，直链过期后重建出的对象才会同样删掉。
-     */
-    private suspend fun detailOf(client: PikPakClient, fileId: String): FileDetail {
-        require(!dev.piko.shared.data.LocalLocation.isLocal(fileId)) { "Cloud file detail requested for local fileId" }
-        val observer = metadataSink?.capture(client)
-        val leased = LeasedFile.resolvedFileOf(fileId)
-        val detail = if (leased == null) {
-            client.getFile(fileId)
-        } else {
-            val folder = leaseFolder ?: error(tr("无法打开归档条目", "Unable to open archived item", "アーカイブ項目を開けません", "보관 항목을 열 수 없습니다", "無法開啟歸檔項目"))
-            client.leaseDetail(leased, parentId = folder(client))
-        }
-        observer?.observe(fileId, detail)
-        return detail
+    private sealed interface LocalPositionOp {
+        data class Save(val key: String, val positionMillis: Long) : LocalPositionOp
+        data class Flush(val done: CompletableDeferred<Unit>) : LocalPositionOp
     }
 
-    private suspend fun rememberFreshDetail(owner: PikPakClient, fileId: String, detail: FileDetail) = freshDetailsLock.withLock {
-        if (clientManager.currentClient.value === owner) {
-            if (freshDetailsOwner !== owner) freshDetails.clear()
-            freshDetailsOwner = owner
-            freshDetails.entries.removeAll { it.value.second.elapsedNow() > FRESH_DETAIL_FOR }
-            freshDetails[fileId] = detail to TimeSource.Monotonic.markNow()
-        }
-    }
+    private val localPositionOps = Channel<LocalPositionOp>(Channel.UNLIMITED)
 
-    private suspend fun rememberFreshDetails(owner: PikPakClient, details: List<FileDetail>) = freshDetailsLock.withLock {
-        if (clientManager.currentClient.value === owner) {
-            if (freshDetailsOwner !== owner) freshDetails.clear()
-            freshDetailsOwner = owner
-            freshDetails.entries.removeAll { it.value.second.elapsedNow() > FRESH_DETAIL_FOR }
-            val mark = TimeSource.Monotonic.markNow()
-            for (detail in details) {
-                freshDetails[detail.id] = detail to mark
+    private val detailResolver = MediaDetailResolver(
+        clientManager = clientManager,
+        leaseFolderProvider = { leaseFolder },
+        metadataSinkProvider = { metadataSink },
+    )
+
+    private val qualityProber = TranscodeQualityProber(
+        requireClient = { client },
+        currentClientOrNull = { clientManager.currentClient.value },
+        metadataSinkProvider = { metadataSink },
+        fileCachePoolProvider = { fileCachePool },
+        proxy = sharedProxy,
+        backgroundScope = backgroundScope,
+        detailResolver = detailResolver,
+    )
+
+    private val sessionPreparer = PlaybackSessionPreparer(
+        requireClient = { client },
+        currentClientOrNull = { clientManager.currentClient.value },
+        localMountsProvider = { localMounts },
+        metadataSinkProvider = { metadataSink },
+        fileCachePoolProvider = { fileCachePool },
+        partialDownloadProvider = { partialDownload },
+        proxy = sharedProxy,
+        backgroundScope = backgroundScope,
+        detailResolver = detailResolver,
+        qualityProber = qualityProber,
+        playbackCacheEnabled = { preferences?.currentSnapshot?.playbackCacheEnabled ?: true },
+    )
+
+    private val subtitleService = MediaSubtitleService(
+        requireClient = { client },
+        currentClientOrNull = { clientManager.currentClient.value },
+        fileCachePoolProvider = { fileCachePool },
+        detailResolver = detailResolver,
+        sessionPreparer = sessionPreparer,
+    )
+
+    private val clipAndStoryboard = ClipAndStoryboardMediaSource(
+        requireClient = { client },
+        currentClientOrNull = { clientManager.currentClient.value },
+        localMountsProvider = { localMounts },
+        metadataSinkProvider = { metadataSink },
+        fileCachePoolProvider = { fileCachePool },
+        leaseFolderProvider = { leaseFolder },
+        clipCache = clipCache,
+        proxy = sharedProxy,
+        backgroundScope = backgroundScope,
+        detailResolver = detailResolver,
+        qualityProber = qualityProber,
+        sessionPreparer = sessionPreparer,
+    )
+
+    init {
+        backgroundScope.launch {
+            for (op in localPositionOps) {
+                when (op) {
+                    is LocalPositionOp.Save -> {
+                        runSuspendCatching {
+                            preferences?.savePlaybackPosition(op.key, op.positionMillis)
+                        }.logFailure(MEDIA_LOG_TAG, "Failed to save local playback position: ${logFile(op.key, "")}")
+                    }
+                    is LocalPositionOp.Flush -> op.done.complete(Unit)
+                }
+            }
+        }
+        backgroundScope.launch {
+            clientManager.currentClient.collect { owner ->
+                detailResolver.clearIfOwnerChanged(owner)
+                subtitleService.clearIfOwnerChanged(owner)
             }
         }
     }
 
-    /** 近期刚查过的详情（如 [clipProbe] 或 [prepareClip]），还新鲜就直接复用，省一次 getFile 查询。 */
-    private suspend fun takeFreshDetail(owner: PikPakClient, fileId: String): FileDetail? = freshDetailsLock.withLock {
-        if (freshDetailsOwner !== owner) return@withLock null
-        val entry = freshDetails[fileId] ?: return@withLock null
-        if (entry.second.elapsedNow() <= FRESH_DETAIL_FOR) {
-            entry.first
-        } else {
-            freshDetails.remove(fileId)
-            null
-        }
-    }
+    override fun knownContentMetadata(fileId: String): ContentMetadata? =
+        detailResolver.knownContentMetadata(fileId)
 
-    private suspend fun openClipSlice(
-        client: PikPakClient,
-        detail: FileDetail,
-        transcode: ResolvedVariant,
-        key: String,
+    override fun knownDurationMs(fileId: String, gcid: String, sizeBytes: Long): Long? =
+        detailResolver.knownDurationMs(fileId, gcid, sizeBytes)
+
+    override suspend fun prepareMedia(fileId: String, preferredResolution: String?): Result<PlayableMediaInfo> =
+        sessionPreparer.prepareMedia(fileId, preferredResolution)
+
+    override suspend fun fetchDownloadUrl(fileId: String): Result<String> =
+        sessionPreparer.fetchDownloadUrl(fileId)
+
+    override suspend fun readDocumentBytes(fileId: String, maxBytes: Int, localPath: String?): Result<DocumentByteResult> =
+        sessionPreparer.readDocumentBytes(fileId, maxBytes, localPath)
+
+    override fun openTransferDemand(initialIntent: ConsumerIntent): TransferDemand =
+        client.openTransferDemand(initialIntent)
+
+    override suspend fun preparePlayback(
+        fileId: String,
+        preferredResolution: String?,
+        defaultMaxHeight: Int,
+        startPositionMillis: Long,
+    ): Result<PreparedPlayback> =
+        sessionPreparer.preparePlayback(fileId, preferredResolution, defaultMaxHeight, startPositionMillis)
+
+    internal fun playbackPrewarmRanges(
+        streamSize: Long,
+        isOrigin: Boolean,
+        startPositionMillis: Long,
+        durationMillis: Long,
+    ): List<LongRange> =
+        sessionPreparer.playbackPrewarmRanges(streamSize, isOrigin, startPositionMillis, durationMillis)
+
+    override suspend fun openRandomAccess(fileId: String, retainedBy: String?, mediaId: String?): Result<RandomAccessMediaSource> =
+        sessionPreparer.openRandomAccess(fileId, retainedBy, mediaId)
+
+    override suspend fun cachedRenditionCoverage(
+        info: PlayableMediaInfo,
+        positionMillis: Long,
+        durationMillis: Long,
+    ): Pair<Map<String, Float>, Set<String>> =
+        sessionPreparer.cachedRenditionCoverage(info, positionMillis, durationMillis)
+
+    override fun knownUnreadableTranscodeIds(fileId: String, gcid: String, sizeBytes: Long): Set<String> =
+        qualityProber.knownUnreadableTranscodeIds(fileId, gcid, sizeBytes)
+
+    override fun knownTranscodeStreamSizeFor(fileId: String, gcid: String, sizeBytes: Long, mediaId: String): Long? =
+        qualityProber.knownTranscodeStreamSizeFor(fileId, gcid, sizeBytes, mediaId)
+
+    override fun downloadQualities(fileId: String): Flow<List<DownloadQuality>> =
+        qualityProber.downloadQualities(fileId)
+
+    override fun prefetchDownloadQualities(fileId: String) =
+        qualityProber.prefetchDownloadQualities(fileId)
+
+    override suspend fun downloadVariant(fileId: String, name: String?, maxHeight: Int): Result<DownloadQuality?> =
+        qualityProber.downloadVariant(fileId, name, maxHeight)
+
+    override suspend fun prepareSubtitle(fileId: String): ProxyStream? =
+        subtitleService.prepareSubtitle(fileId)
+
+    override suspend fun prepareExternalSubtitle(fileId: String, knownLanguage: String?): PreparedSubtitle? =
+        subtitleService.prepareExternalSubtitle(fileId, knownLanguage)
+
+    override suspend fun prepareOriginalEmbeddedSubtitles(fileId: String): PreparedOriginalSubtitles =
+        subtitleService.prepareOriginalEmbeddedSubtitles(fileId)
+
+    override suspend fun prepareClip(
+        fileId: String,
         startMs: Long,
         videoDurationMs: Long,
-        leased: Boolean,
-        onByteSource: ((ProxyByteSource) -> Unit)? = null,
-    ): PreparedClip? {
-        val mediaId = transcode.mediaId ?: return null
-        val store = clipCache?.let { RangeLimitedStore(it.blocks) }
-        val source = openByteSource(client, detail, transcode, blockStore = store, leased = leased, fastReactivation = true) ?: return null
-        onByteSource?.invoke(source)
-        val bytesPerMs: Double
-        val verified: TsTimestamps.VerifiedSlice
-        val offset: Long
-        val sliceLength: Long
-        val slice = try {
-            // 长度是 188 的整数倍是 TS 的样子；不是 TS 截出来就放不了，退回原画
-            if (source.size % TS_PACKET_BYTES != 0L) {
-                PikoLog.d(TAG, "Transcode stream size (${source.size} B) is not TS-aligned, falling back to original for clip: ${logFile(detail.id, detail.name)}")
-                source.close()
-                return null
-            }
-            bytesPerMs = source.size.toDouble() / videoDurationMs
-            val estimated = ((bytesPerMs * startMs).toLong() / TS_PACKET_BYTES * TS_PACKET_BYTES).coerceIn(0, source.size - TS_PACKET_BYTES)
-            // 切片取有界紧致窗口（CLIP_SLICE_MS = 180s，足以支撑多轮 30s 自动续播）：
-            // MPEG-TS 没有头部索引表，暴露几百 MB 整条残余流会让 FFmpeg 在未缓存区间做十余次串行公网二分查找，
-            // 一旦后半段或片尾存在 PTS 跳变即导致 av_seek_frame 失败；有界窗口首尾 PTS 均已预取入库且紧致连续，FFmpeg 插值一步直达。
-            val wanted = (bytesPerMs * (CLIP_SLICE_MS + PreparedClip.KEYFRAME_INTERVAL_MS) * SLICE_BITRATE_MARGIN).toLong()
-            val length = (wanted / TS_PACKET_BYTES + 1) * TS_PACKET_BYTES
-            fun windowLengthAt(pos: Long) = length.coerceAtMost(source.size - pos)
-            store?.keepSlice(estimated, windowLengthAt(estimated), bytesPerMs)
-            // 切片必须从同时携带完整 PAT + PMT + 带内参数集（VPS/SPS/PPS）与匹配关键帧的安全接入点起；
-            // 严禁在未找到安全接入点时按估算偏移裸切（半路裸切会丢失参数集，导致 Android MediaCodec 因 width=0,height=0 失败并静默回退 CPU 软解）。
-            val primaryWindow = maxOf(
-                (bytesPerMs * VERIFIED_KEYFRAME_WINDOW_MS * PreparedClip.BITRATE_MARGIN).toLong(),
-                MIN_VERIFIED_KEYFRAME_SCAN_BYTES,
-            )
-            val maxWindow = maxOf(primaryWindow * 2L, MAX_VERIFIED_KEYFRAME_SCAN_BYTES)
-            val found = source.findVerifiedSlice(estimated, primaryWindow, maxWindow)
-            if (found == null) {
-                PikoLog.d(TAG, "No verified keyframe with parameter sets found in transcode stream, falling back to full stream for clip: ${logFile(detail.id, detail.name)}")
-                source.close()
-                return null
-            }
-            verified = found
-            offset = verified.sliceStartOffset
-            sliceLength = windowLengthAt(offset)
-            store?.keepSlice(offset, sliceLength, bytesPerMs)
-            SlicedByteSource(
-                inner = source,
-                offset = offset,
-                size = sliceLength,
-                nullVideoBeforeOffset = (verified.keyframeOffset - offset).coerceAtLeast(0L),
-                nullVideoPid = verified.videoPid,
-            )
-        } catch (t: Throwable) {
-            source.close()
-            throw t
-        }
-        val stream = registerProxy(slice, fileName = "clip.ts", fileLabel = logFile(detail.id, detail.name)) ?: return null
-        fun record(sliceStartMs: Long, sliceDurationMs: Long) = ClipRecord(
-            fileId = detail.id,
-            gcid = detail.hash,
-            name = detail.name,
-            parentId = detail.parentId,
-            originalBytes = detail.sizeBytes,
-            mediaId = mediaId,
-            streamBytes = source.size,
-            sliceOffset = offset,
-            sliceLength = sliceLength,
-            sliceStartMs = sliceStartMs,
-            sliceDurationMs = sliceDurationMs,
-            keyframeOffset = verified.keyframeOffset,
-            videoPid = verified.videoPid,
-        )
-        // 切片起点的时间戳已在找关键帧时读到，按 PikPak MPEG-TS 流起始 PTS（约 1480ms）直接在内存校准，不再额外请求流头与流尾
-        val calibratedStartMs = (verified.ptsMs - STREAM_START_PTS_MS).coerceAtLeast(0L).let {
-            if (videoDurationMs > 0L) it.coerceAtMost((videoDurationMs - 1L).coerceAtLeast(0L)) else it
-        }
-        return PreparedClip(
-            stream,
-            fallbackUrl = null,
-            sliced = true,
-            clipStartMs = calibratedStartMs,
-            bytesPerMs = bytesPerMs,
-            maxWindowMs = CLIP_SLICE_MS,
-            resolveStart = null,
-            resolveWindowDuration = null,
-            // 开头与末尾都在盘上了才记，记录在就当它们在
-            onWarmed = { actualStartMs, actualWindowMs -> clipCache?.remember(key, record(actualStartMs, actualWindowMs)) },
-        )
-    }
+        role: StreamRole,
+        demand: TransferDemand?,
+        onByteSource: ((ProxyByteSource) -> Unit)?,
+    ): Result<PreparedClip> =
+        clipAndStoryboard.prepareClip(fileId, startMs, videoDurationMs, role, demand, onByteSource)
 
-    /**
-     * 从 [offset] 起跨分块保持状态地扫描首个带完整 `PAT + PMT + 参数集 + 独立关键帧` 的安全切点。
-     * 常规窗口 [primaryWindow] 未命中时继续沿同一扫描器扩展至 [maxWindow]（不重读已扫块）；仍无合法切点则返回 null 拒绝裸切。
-     */
-    private suspend fun ProxyByteSource.findVerifiedSlice(
-        offset: Long,
-        primaryWindow: Long,
-        maxWindow: Long,
-    ): TsTimestamps.VerifiedSlice? {
-        suspend fun scanFrom(startOffset: Long, limitBytes: Long): TsTimestamps.VerifiedSlice? {
-            val maxAvailable = minOf(limitBytes, (size - startOffset).coerceAtLeast(0L))
-            if (maxAvailable <= 0L) return null
-            val scanner = TsTimestamps.VerifiedSliceScanner()
-            val contextOwner = currentCoroutineContext()[TransferDemand]
-            val tempOwner = if (contextOwner == null) {
-                TransferDemand(
-                    ConsumerIntent(
-                        service = ServiceIntent.WAITING,
-                        bufferBudget = BufferBudget(maxReadAheadBytes = CLIP_SCAN_READ_AHEAD_BYTES),
-                    ),
-                )
-            } else {
-                null
-            }
-            val owner = contextOwner ?: tempOwner!!
-            val ticket = beginRead(owner, startOffset, startOffset + maxAvailable)
-            var endReason = ReadEndReason.Cancelled
-            try {
-                var scanned = 0L
-                val scratch = ByteArray(minOf(KEYFRAME_SCAN_CHUNK.toLong(), maxAvailable).toInt())
-                while (scanned < maxAvailable) {
-                    val toRead = minOf(scratch.size.toLong(), maxAvailable - scanned).toInt()
-                    val filled = ticket.readSome(scratch, 0, toRead)
-                    if (filled <= 0) break
-                    val chunk = if (filled == scratch.size) scratch else scratch.copyOf(filled)
-                    scanner.feed(chunk, startOffset + scanned)?.let { return it }
-                    scanned += filled
-                }
-                endReason = ReadEndReason.RangeCompleted
-            } catch (e: CancellationException) {
-                endReason = ReadEndReason.Cancelled
-                throw e
-            } catch (e: Exception) {
-                endReason = ReadEndReason.SourceFailed
-                throw e
-            } finally {
-                ticket.endRead(endReason)
-                tempOwner?.close()
-            }
-            return scanner.finish()
-        }
+    override suspend fun clipProbe(fileId: String, urgent: Boolean): ClipProbe =
+        clipAndStoryboard.clipProbe(fileId, urgent)
 
-        scanFrom(offset, maxWindow)?.let { return it }
-        // 估算位置过于靠近片尾、剩余字节不足一个完整 GOP 时，向前退一个常规窗口再尝试一次
-        if (offset > 0L && size - offset < primaryWindow) {
-            val rewindStart = ((offset - primaryWindow).coerceAtLeast(0L) / TS_PACKET_BYTES) * TS_PACKET_BYTES
-            if (rewindStart < offset) {
-                return scanFrom(rewindStart, offset - rewindStart)
-            }
-        }
-        return null
-    }
+    override suspend fun batchClipProbe(fileIds: List<String>, urgent: Boolean): Map<String, ClipProbe> =
+        clipAndStoryboard.batchClipProbe(fileIds, urgent)
 
-    /**
-     * 为外挂字幕开一个代理会话，与视频走同一个本机代理：播放器读的是 127.0.0.1，不碰会过期的直链，
-     * 地址里带着文件名，mpv 按扩展名认格式。开不起来返回 null，调用方跳过这一条。
-     */
-    suspend fun prepareSubtitle(fileId: String): ProxyStream? =
-        withContext(Dispatchers.Default) {
-            var resolvedName = ""
-            runSuspendCatching {
-                val client = client
-                val detail = takeFreshDetail(client, fileId)
-                    ?: withApiPriority(ApiRequestPriority.INTERACTIVE) { detailOf(client, fileId) }
-                        .also { rememberFreshDetail(client, fileId, it) }
-                resolvedName = detail.name
-                val resolved = detail.resolveVariant(VariantPreference.Original)
-                openProxyStream(client, detail, resolved, leased = LeasedFile.isLeased(fileId))
-            }.logFailure(TAG, "Failed to prepare external subtitle stream: ${logFile(fileId, resolvedName)}").getOrNull()
-        }
+    override fun openStoryboardSession(source: StoryboardSource): StoryboardTransportSession =
+        clipAndStoryboard.openStoryboardSession(source)
+
+    override suspend fun resolveStoryboardStreamSize(source: StoryboardSource): Long? =
+        clipAndStoryboard.resolveStoryboardStreamSize(source)
+
+    override suspend fun fetchStoryboardRange(source: StoryboardSource, streamSize: Long, offset: Long, length: Int): ByteArray? =
+        clipAndStoryboard.fetchStoryboardRange(source, streamSize, offset, length)
+
+    override suspend fun fetchPreviewChunk(fileId: String, positionMillis: Long, durationMillis: Long, chunkBytes: Int): ByteArray? =
+        clipAndStoryboard.fetchPreviewChunk(fileId, positionMillis, durationMillis, chunkBytes)
 
     private suspend fun isPlayHistorySynced(): Boolean = preferences?.syncPlayHistoryFlow?.first() ?: false
 
-    /**
-     * 把播放进度上报到 PikPak 的播放历史。同步关闭时不做事；失败不抛，上报是附带的，不能打断播放。
-     * 服务端会悄悄丢掉同一文件间隔太短的上报（实测 1.5 秒丢、6 秒收），节流由调用方负责。
-     */
-    suspend fun reportPlay(fileId: String, positionMillis: Long, durationMillis: Long) {
-        // 归档条目与压缩包里的文件在网盘里没有常驻的文件，播放历史记不上；续播位置照样记在本机
-        if (dev.piko.shared.data.LocalLocation.isLocal(fileId) || fileId.isBlank() || LeasedFile.isLeased(fileId) || positionMillis <= 0L || durationMillis <= 0L) return
-        withContext(Dispatchers.Default) {
-            runSuspendCatching {
-                if (isPlayHistorySynced()) client.reportPlay(fileId, positionMillis / 1000, durationMillis / 1000)
-            }.logFailure(TAG, "Failed to report cloud play history: ${logFile(fileId, "")}")
+    override fun enqueuePlayHistory(
+        fileId: String,
+        positionMillis: Long,
+        durationMillis: Long,
+        urgent: Boolean,
+        title: String,
+        client: PikPakClient?,
+    ): Boolean {
+        val owner = client ?: clientManager.currentClient.value
+        if (owner == null) {
+            PikoLog.d(MEDIA_LOG_TAG, "Skipped cloud play history report (not logged in): ${logFile(fileId, title)}")
+            return false
+        }
+        return playHistoryReporter.submit(
+            client = owner,
+            fileId = fileId,
+            positionMillis = positionMillis,
+            durationMillis = durationMillis,
+            urgent = urgent,
+            title = title,
+        )
+    }
+
+    override suspend fun reportPlay(
+        fileId: String,
+        positionMillis: Long,
+        durationMillis: Long,
+        urgent: Boolean,
+        title: String,
+        client: PikPakClient?,
+    ) {
+        if (enqueuePlayHistory(fileId, positionMillis, durationMillis, urgent = urgent, title = title, client = client)) {
+            playHistoryReporter.flushAll()
         }
     }
 
-    /**
-     * PikPak 播放历史里这个文件的续播位置，毫秒。同步关闭、没有记录、已看到片尾或取不到时为 null。
-     * 服务端不能按文件查，只看第一页（最近播放的 100 条）：从历史里点进来的一定在里面，更早的就算了。
-     */
-    suspend fun cloudPlaybackPosition(fileId: String): Long? {
-        if (dev.piko.shared.data.LocalLocation.isLocal(fileId) || fileId.isBlank() || LeasedFile.isLeased(fileId)) return null
-        // 读偏好也包在里面：这只是续播的参考，任何一步失败都不该挡住开播
+    override suspend fun flushPlayHistory(timeoutMillis: Long) {
+        val bounded = timeoutMillis.coerceAtLeast(0L)
+        withTimeoutOrNull(bounded) {
+            coroutineScope {
+                launch {
+                    val localDone = CompletableDeferred<Unit>()
+                    if (localPositionOps.trySend(LocalPositionOp.Flush(localDone)).isSuccess) {
+                        localDone.await()
+                    }
+                }
+                launch {
+                    playHistoryReporter.flushAll(bounded)
+                }
+            }
+        }
+    }
+
+    override suspend fun cloudPlaybackPosition(fileId: String): Long? {
+        if (LocalLocation.isLocal(fileId) || fileId.isBlank() || LeasedFile.isLeased(fileId)) return null
         return withContext(Dispatchers.Default) {
             runSuspendCatching {
                 if (!isPlayHistorySynced()) return@runSuspendCatching null
@@ -1069,679 +443,29 @@ class PikoMediaRepository(
                 val seconds = event.playSeconds ?: return@runSuspendCatching null
                 val duration = event.playDuration
                 if (duration != null && duration > 0 && seconds * 1000 >= duration * 1000 - CLOUD_NEAR_END_MILLIS) null else seconds * 1000
-            }.logFailure(TAG, "Failed to read cloud play history for ${logFile(fileId, "")}, falling back to local resume position").getOrNull()
+            }.logFailure(MEDIA_LOG_TAG, "Failed to read cloud play history for ${logFile(fileId, "")}, falling back to local resume position").getOrNull()
         }
     }
 
-    suspend fun savePlaybackPosition(fileId: String, positionMillis: Long) {
+    override suspend fun savePlaybackPosition(fileId: String, positionMillis: Long) {
         preferences?.savePlaybackPosition(fileId, positionMillis)
     }
 
-    suspend fun getPlaybackPosition(fileId: String): Long =
+    override fun savePlaybackPositionAsync(fileId: String, positionMillis: Long) {
+        if (fileId.isBlank() || preferences == null) return
+        localPositionOps.trySend(LocalPositionOp.Save(fileId, positionMillis))
+    }
+
+    override suspend fun getPlaybackPosition(fileId: String): Long =
         preferences?.getPlaybackPosition(fileId) ?: 0L
 
-    /** 开不起来返回 null，由调用方按场景回退或报错；取消照常抛出。 */
-    private suspend fun openProxyStream(
-        client: PikPakClient,
-        detail: FileDetail,
-        resolved: ResolvedVariant,
-        leased: Boolean = false,
-        fastReactivation: Boolean = false,
-        onByteSource: ((ProxyByteSource) -> Unit)? = null,
-    ): ProxyStream? {
-        val source = openByteSource(client, detail, resolved, leased = leased, fastReactivation = fastReactivation) ?: return null
-        onByteSource?.invoke(source)
-        return registerProxy(
-            source = source,
-            fileName = if (resolved.isOrigin) detail.name else "stream.ts",
-            fileLabel = logFile(detail.id, detail.name),
-        )
-    }
-
-    internal fun playbackPrewarmRanges(
-        streamSize: Long,
-        isOrigin: Boolean,
-        startPositionMillis: Long,
-        durationMillis: Long,
-    ): List<LongRange> {
-        if (streamSize <= 0L) return emptyList()
-        val blockBytes = 256L * 1024L
-        if (isOrigin || startPositionMillis <= 0L) {
-            return listOf(0L..(minOf(streamSize, blockBytes) - 1L))
-        }
-        val rawRanges = buildList {
-            // 覆盖 MPEG-TS 头部探测窗口（512 KiB）
-            add(0L..(minOf(streamSize, 2L * blockBytes) - 1L))
-            // 覆盖 FFmpeg mpegts_read_header 读取末尾 PCR 的跳读窗口（>= 256 KiB 对齐块边界）
-            val tailStart = ((streamSize - blockBytes).coerceAtLeast(0L) / blockBytes) * blockBytes
-            add(tailStart..(streamSize - 1L))
-            // 覆盖按时长线性折算的起播初探块
-            if (durationMillis > 0L && startPositionMillis < durationMillis) {
-                val estByte = ((streamSize.toDouble() * startPositionMillis.toDouble() / durationMillis.toDouble()).toLong())
-                    .coerceIn(0L, streamSize - 1L)
-                val midStart = (estByte / blockBytes) * blockBytes
-                val midEnd = minOf(streamSize, midStart + blockBytes) - 1L
-                add(midStart..midEnd)
-            }
-        }.sortedBy { it.first }
-        val merged = ArrayList<LongRange>(rawRanges.size)
-        for (range in rawRanges) {
-            val prev = merged.lastOrNull()
-            if (prev != null && range.first <= prev.last + 1L) {
-                merged[merged.lastIndex] = prev.first..maxOf(prev.last, range.last)
-            } else {
-                merged.add(range)
-            }
-        }
-        return merged
-    }
-
-    /** 登记失败时关掉 [source] 并返回 null，由调用方按场景处理；取消照常抛出。 */
-    private suspend fun registerProxy(
-        source: ProxyByteSource,
-        fileName: String?,
-        fileLabel: String,
-        demand: TransferDemand? = null,
-    ): ProxyStream? {
-        val owner = demand ?: currentCoroutineContext()[TransferDemand]
-        return try {
-            proxy.register(source, fileName = fileName, demand = owner)
-        } catch (e: CancellationException) {
-            source.close()
-            throw e
-        } catch (e: Exception) {
-            PikoLog.w(TAG, "Failed to register loopback proxy session: $fileLabel", e)
-            source.close()
-            null
-        }
-    }
-
-    /**
-     * 按偏移读取原画，不经本机代理。给片段截取用：Android 的原因见 [RandomAccessMediaSource]，桌面端的 FFmpeg
-     * 经 AVIO 回调读它。调用方负责关闭。
-     *
-     * 给了 [retainedBy] 时，读过的块在关闭后仍留在下载暂存里，记在这个所有者名下，直到它经
-     * PikoFileCachePool.discard 放手：片段截取中断后再来，已读的部分不必重下。
-     *
-     * [mediaId] 不为 null 时读那一档转码（MPEG-TS），同样经下载暂存，与原画的暂存分开；返回的来源长度是转码流的长度。
-     */
-    suspend fun openRandomAccess(fileId: String, retainedBy: String? = null, mediaId: String? = null): Result<RandomAccessMediaSource> =
-        withContext(Dispatchers.Default) {
-            runSuspendCatching {
-                val client = client
-                if (mediaId != null) return@runSuspendCatching ReaderRandomAccessSource(transcodeSource(client, fileId, mediaId, retainedBy))
-                partialSource(client, fileId, retainedBy)?.let { return@runSuspendCatching ReaderRandomAccessSource(it.second) }
-                val detail = takeFreshDetail(client, fileId)
-                    ?: withApiPriority(ApiRequestPriority.INTERACTIVE) { detailOf(client, fileId) }
-                        .also { rememberFreshDetail(client, fileId, it) }
-                if (detail.hash.isBlank()) {
-                    error(tr("文件缺少内容哈希，无法读取", "File is missing content hash and cannot be read", "ファイルにハッシュ情報がないため読み込めません", "파일에 콘텐츠 해시가 없어 읽을 수 없습니다", "檔案缺少內容雜湊值，無法讀取"))
-                }
-                val resolved = detail.resolveVariant(VariantPreference.Original)
-                val source = openByteSource(client, detail, resolved, leased = LeasedFile.isLeased(fileId), retainedBy = retainedBy)
-                    ?: error(tr("无法打开媒体数据流", "Unable to open media stream", "メディアストリームを開けません", "미디어 스트림을 열 수 없습니다", "無法開啟媒體資料流"))
-                ReaderRandomAccessSource(source)
-            }
-        }
-
-    private suspend fun partialSource(client: PikPakClient, fileId: String, retainedBy: String? = null): Pair<DownloadTask, PikPakByteSource>? {
-        val task = partialDownload?.invoke(fileId) ?: return null
-        val pool = fileCachePool ?: return null
-        if (task.totalBytes <= 0 || task.gcid.isBlank() || !task.sparseCache) return null
-        val lease = pool.acquire(client, task.fileId, task.gcid, task.totalBytes, task.fileName,
-            parentId = task.parentId, leased = task.leasedSource || LeasedFile.isLeased(fileId),
-            retained = retainedBy != null, owner = retainedBy ?: task.fileId)
-        return task to PikPakByteSource(lease.entry.handle, lease.entry.cache, lease::close)
-    }
-
-    /**
-     * 这个视频能下载的各档：原画在前，转码按画面从高到低。拿到详情先发一次，转码档的大小服务端不给，各档同时探测
-     * （[probeTranscode]），探到一档发一次更新；没探到的 [DownloadQuality.sizeBytes] 为 null，读不出字节的标上
-     * [DownloadQuality.unreadable]。探测全部结束时流结束，查不到详情时抛出。
-     * 归档条目与压缩包里的文件只有原画：它们的对象是借来的，转码档挂在借出的对象上，取完就删了。
-     *
-     * 同一个文件的探测在 [QUALITY_PROBE_FOR] 内只做一次，对话框、片段面板、[prefetchDownloadQualities] 与
-     * 下载开始时的 [downloadVariant] 共用，进行中的也一起等。
-     */
-    fun downloadQualities(fileId: String): Flow<List<DownloadQuality>> = flow {
-        emitAll(
-            qualityProbe(fileId).state.transformWhile { probe ->
-                probe.error?.let { throw it }
-                probe.options?.let { emit(it) }
-                !probe.finished
-            },
-        )
-    }
-
-    /**
-     * 提前开始 [downloadQualities] 的探测，结果留给随后打开的对话框与片段面板。在单个视频的「下载」与「下载指定段落」
-     * 上按下或指针移入时调用：这时多半就要点，不点也只白发一次详情与每档一个 1 字节的请求。
-     */
-    fun prefetchDownloadQualities(fileId: String) {
-        backgroundScope.launch {
-            runSuspendCatching { qualityProbe(fileId) }
-                .onFailure { PikoLog.d(TAG, "Download quality prefetch skipped for ${logFile(fileId, "")}: ${it::class.simpleName}: ${it.message}") }
-        }
-    }
-
-    private class QualityProbeState(
-        val options: List<DownloadQuality>? = null,
-        val finished: Boolean = false,
-        val error: Throwable? = null,
-    )
-
-    private class QualityProbe(val state: MutableStateFlow<QualityProbeState>, val started: TimeMark)
-
-    // 按账号与文件 ID；失败的不留，下次打开重查
-    private val qualityProbes = HashMap<String, QualityProbe>()
-    private val qualityProbesLock = Mutex()
-
-    private suspend fun qualityProbe(fileId: String): QualityProbe {
-        val client = client
-        val key = "${client.account}/$fileId"
-        return qualityProbesLock.withLock {
-            qualityProbes.values.removeAll { it.state.value.finished && it.started.elapsedNow() > QUALITY_PROBE_FOR }
-            qualityProbes.getOrPut(key) {
-                QualityProbe(MutableStateFlow(QualityProbeState()), TimeSource.Monotonic.markNow()).also { probe ->
-                    backgroundScope.launch {
-                        runSuspendCatching { probeQualities(client, fileId, probe.state) }.onFailure { error ->
-                            qualityProbesLock.withLock { if (qualityProbes[key] === probe) qualityProbes.remove(key) }
-                            probe.state.value = QualityProbeState(finished = true, error = error)
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    /** 已经探完、还没过期的那一份，没有为 null。不发起探测。 */
-    private suspend fun finishedQualities(fileId: String): List<DownloadQuality>? =
-        finishedQualitiesForClient(client, fileId)
-
-    private suspend fun finishedQualitiesForClient(client: PikPakClient, fileId: String): List<DownloadQuality>? {
-        val key = "${client.account}/$fileId"
-        return qualityProbesLock.withLock {
-            qualityProbes[key]?.takeIf { it.started.elapsedNow() <= QUALITY_PROBE_FOR }?.state?.value
-                ?.takeIf { it.finished && it.error == null }?.options
-        }
-    }
-
-    private suspend fun knownTranscodeStreamSize(client: PikPakClient, detail: FileDetail, mediaId: String): Long? {
-        if (detail.id.isNotBlank()) {
-            finishedQualitiesForClient(client, detail.id)
-                ?.firstOrNull { it.mediaId == mediaId && !it.unreadable }
-                ?.sizeBytes
-                ?.takeIf { it > 0L }
-                ?.let { return it }
-        }
-        if (detail.hash.isNotBlank()) {
-            client.knownStreamSize(detail.hash, mediaId)?.takeIf { it > 0L }?.let { return it }
-            metadataSink?.lookupContent(client, detail.hash, detail.sizeBytes)
-                ?.transcodes
-                ?.firstOrNull { it.mediaId == mediaId && !it.unreadable }
-                ?.streamSizeBytes
-                ?.takeIf { it > 0L }
-                ?.let { return it }
-        }
-        return null
-    }
-
-    private fun recordTranscodeStreamSize(
-        client: PikPakClient,
-        detail: FileDetail,
-        mediaId: String,
-        streamSizeBytes: Long?,
-        unreadable: Boolean = false,
-    ) {
-        if (detail.hash.isBlank() || mediaId.isBlank()) return
-        if (streamSizeBytes != null && streamSizeBytes > 0L && !unreadable) {
-            client.rememberStreamSize(detail.hash, mediaId, streamSizeBytes)
-        }
-        metadataSink?.capture(client)?.observeTranscodeSize(
-            gcid = detail.hash,
-            fileSizeBytes = detail.sizeBytes,
-            mediaId = mediaId,
-            streamSizeBytes = streamSizeBytes?.takeIf { it > 0L },
-            unreadable = unreadable,
-        )
-    }
-
-    private suspend fun probeQualities(client: PikPakClient, fileId: String, state: MutableStateFlow<QualityProbeState>) {
-        if (!LeasedFile.isLeased(fileId)) {
-            val cachedFile = metadataSink?.lookupFile(client, fileId)
-            val cachedContent = metadataSink?.lookupContentByFileId(client, fileId)
-            val cachedTranscodes = cachedContent?.transcodes
-            if (cachedFile != null && cachedTranscodes != null && (cachedTranscodes.isNotEmpty() || cachedContent.qualityRank > 0)) {
-                val initialDurationMs = cachedContent.durationMillis?.takeIf { it > 0L }
-                    ?: cachedFile.params["duration"]?.toDoubleOrNull()?.let { (it * 1000).toLong() }
-                    ?: 0L
-                val initialOriginal = DownloadQuality(
-                    name = null,
-                    mediaId = null,
-                    height = cachedContent.height ?: cachedFile.params["height"]?.toIntOrNull() ?: 0,
-                    sizeBytes = cachedFile.sizeBytes,
-                    durationMs = initialDurationMs,
-                )
-                val initialTranscodes = cachedTranscodes
-                    .filter { it.name.isNotBlank() && it.mediaId.isNotBlank() }
-                    .sortedByDescending { it.height }
-                    .map { t ->
-                        val exactSize = client.knownStreamSize(cachedFile.hash, t.mediaId)?.takeIf { it > 0L }
-                            ?: t.streamSizeBytes?.takeIf { it > 0L }
-                        DownloadQuality(
-                            name = t.name,
-                            mediaId = t.mediaId,
-                            height = t.height,
-                            sizeBytes = if (t.unreadable) null else (exactSize ?: t.estimatedSizeBytes),
-                            durationMs = t.durationSeconds.takeIf { it > 0L }?.times(1000L) ?: initialDurationMs,
-                            unreadable = t.unreadable,
-                        )
-                    }
-                state.value = QualityProbeState(listOf(initialOriginal) + initialTranscodes)
-            }
-        }
-        val detail = takeFreshDetail(client, fileId)
-            ?: withApiPriority(ApiRequestPriority.INTERACTIVE) { detailOf(client, fileId) }
-                .also { rememberFreshDetail(client, fileId, it) }
-        val durationMs = durationMsOf(detail)
-        val original = originalQuality(detail, durationMs)
-        val transcodes = if (LeasedFile.isLeased(fileId)) emptyList() else detail.downloadableTranscodes().sortedByDescending { it.video?.height ?: 0 }
-        val content = metadataSink?.lookupContent(client, detail.hash, detail.sizeBytes)
-            ?: metadataSink?.lookupContentByFileId(client, fileId)
-        val knownByMediaId = content?.transcodes?.associateBy { it.mediaId }.orEmpty()
-        val initialOptions = transcodes.map { media ->
-            val known = knownByMediaId[media.mediaId]
-            val exactSize = client.knownStreamSize(detail.hash, media.mediaId)?.takeIf { it > 0L }
-                ?: known?.streamSizeBytes?.takeIf { it > 0L }
-            val unreadable = known?.unreadable == true
-            media.toDownloadQuality(
-                fallbackDurationMs = durationMs,
-                sizeBytes = if (unreadable) null else (exactSize ?: known?.estimatedSizeBytes),
-                unreadable = unreadable,
-            )
-        }
-        state.value = QualityProbeState(listOf(original) + initialOptions)
-        coroutineScope {
-            transcodes.forEach { media ->
-                val known = knownByMediaId[media.mediaId]
-                val exactSize = client.knownStreamSize(detail.hash, media.mediaId)?.takeIf { it > 0L }
-                    ?: known?.streamSizeBytes?.takeIf { it > 0L }
-                if (known?.unreadable == true) return@forEach
-                if (exactSize != null) {
-                    client.rememberStreamSize(detail.hash, media.mediaId, exactSize)
-                    return@forEach
-                }
-                launch {
-                    val probed = runSuspendCatching { probeTranscode(client, media) }
-                    val error = probed.exceptionOrNull()
-                    if (error is UnreadableTranscodeException) {
-                        PikoLog.w(TAG, "Transcode variant ${media.qualityName} returned unreadable stream: ${logFile(fileId, detail.name)}", error)
-                        recordTranscodeStreamSize(client, detail, media.mediaId, null, unreadable = true)
-                    } else if (error != null) {
-                        PikoLog.w(TAG, "Failed to probe transcode variant ${media.qualityName} size: ${logFile(fileId, detail.name)}", error)
-                        state.update { current ->
-                            QualityProbeState(current.options?.map { option ->
-                                if (option.mediaId != media.mediaId) option else option.copy(sizeBytes = null)
-                            })
-                        }
-                        return@launch
-                    } else {
-                        probed.getOrNull()?.let { size ->
-                            recordTranscodeStreamSize(client, detail, media.mediaId, size, unreadable = false)
-                        }
-                    }
-                    state.update { current ->
-                        QualityProbeState(current.options?.map { option ->
-                            if (option.mediaId != media.mediaId) option
-                            else probed.fold(
-                                onSuccess = { option.copy(sizeBytes = it, unreadable = false) },
-                                onFailure = { option.copy(sizeBytes = null, unreadable = true) },
-                            )
-                        })
-                    }
-                }
-            }
-        }
-        state.update { QualityProbeState(it.options, finished = true) }
-    }
-
-    /**
-     * 下载时定下的那一档转码，连同它的大小；定为原画时为 null。[name] 是用户选的档，读不出字节时以
-     * [UnreadableTranscodeException] 失败，不换成别的档，已经没有了也是 null（调用方据此失败）。[name] 为 null 时
-     * 按 [maxHeight] 挑，规则见 [downloadQualityOrder]，探出读不出的跳到下一档。文件只能借出时一律原画。
-     */
-    suspend fun downloadVariant(fileId: String, name: String?, maxHeight: Int): Result<DownloadQuality?> =
-        withContext(Dispatchers.Default) {
-            runSuspendCatching {
-                if (LeasedFile.isLeased(fileId)) return@runSuspendCatching null
-                // 刚在对话框或片段面板里列过各档，就按那次的探测结果定，不再查详情、不再探
-                finishedQualities(fileId)
-                    ?.takeIf { known -> known.all { it.isOriginal || it.unreadable || it.sizeBytes != null } }
-                    ?.let { known -> return@runSuspendCatching chooseVariant(known, name, maxHeight) }
-                val client = client
-                val detail = takeFreshDetail(client, fileId)
-                    ?: withApiPriority(ApiRequestPriority.INTERACTIVE) { detailOf(client, fileId) }
-                        .also { rememberFreshDetail(client, fileId, it) }
-                val durationMs = durationMsOf(detail)
-                val transcodes = detail.downloadableTranscodes()
-                val content = metadataSink?.lookupContent(client, detail.hash, detail.sizeBytes)
-                    ?: metadataSink?.lookupContentByFileId(client, fileId)
-                val knownByMediaId = content?.transcodes?.associateBy { it.mediaId }.orEmpty()
-                suspend fun resolveTranscodeSize(media: MediaVariant): Long {
-                    val known = knownByMediaId[media.mediaId]
-                    if (known?.unreadable == true) throw UnreadableTranscodeException()
-                    knownTranscodeStreamSize(client, detail, media.mediaId)?.let { return it }
-                    return try {
-                        probeTranscode(client, media).also { size ->
-                            recordTranscodeStreamSize(client, detail, media.mediaId, size, unreadable = false)
-                        }
-                    } catch (e: UnreadableTranscodeException) {
-                        recordTranscodeStreamSize(client, detail, media.mediaId, null, unreadable = true)
-                        throw e
-                    }
-                }
-                if (name != null) {
-                    val media = transcodes.firstOrNull { it.qualityName == name } ?: return@runSuspendCatching null
-                    return@runSuspendCatching media.toDownloadQuality(durationMs, resolveTranscodeSize(media))
-                }
-                val options = listOf(originalQuality(detail, durationMs)) + transcodes.map { media ->
-                    val known = knownByMediaId[media.mediaId]
-                    media.toDownloadQuality(durationMs, known?.streamSizeBytes, unreadable = known?.unreadable == true)
-                }
-                for (option in downloadQualityOrder(options, maxHeight)) {
-                    if (option.isOriginal) return@runSuspendCatching null
-                    val media = transcodes.first { it.mediaId == option.mediaId }
-                    val probed = runSuspendCatching { resolveTranscodeSize(media) }
-                    val error = probed.exceptionOrNull()
-                    if (error is UnreadableTranscodeException) {
-                        PikoLog.w(TAG, "Transcode variant ${media.qualityName} unreadable, trying next lower variant: ${logFile(fileId, detail.name)}", error)
-                        continue
-                    }
-                    return@runSuspendCatching option.copy(sizeBytes = probed.getOrThrow())
-                }
-                null
-            }
-        }
-
-    /** [downloadVariant] 的挑法，用在已探过的各档上（含原画）。 */
-    private fun chooseVariant(known: List<DownloadQuality>, name: String?, maxHeight: Int): DownloadQuality? {
-        if (name != null) {
-            val chosen = known.firstOrNull { !it.isOriginal && it.name == name } ?: return null
-            if (chosen.unreadable) throw UnreadableTranscodeException()
-            return chosen
-        }
-        return chooseDownloadQuality(known, maxHeight)?.takeUnless { it.isOriginal }
-    }
-
-    private fun originalQuality(detail: FileDetail, durationMs: Long) =
-        DownloadQuality(null, null, detail.medias.firstOrNull { it.isOrigin }?.video?.height ?: 0, detail.sizeBytes, durationMs)
-
-    private fun FileDetail.downloadableTranscodes(): List<MediaVariant> =
-        medias.filter { !it.isOrigin && it.video != null && it.link.url.isNotBlank() && it.qualityName != null }
-
-    private fun MediaVariant.toDownloadQuality(fallbackDurationMs: Long, sizeBytes: Long? = null, unreadable: Boolean = false) =
-        DownloadQuality(qualityName, mediaId, video?.height ?: 0, sizeBytes, video?.duration?.times(1000) ?: fallbackDurationMs, unreadable = unreadable)
-
-    /**
-     * 一档转码的长度，并确认它真能读出字节：一次 1 字节的 Range 请求，长度取 Content-Range。读不出时抛
-     * [UnreadableTranscodeException]，连不上、回错误状态码一类照原样抛出。
-     *
-     * 实测有的转码档服务端是坏的：回 206、Content-Range 写着全长，正文却是空的，换主机、隔几分钟都一样
-     * （2026-10-07，同一个视频的 1080P 正常，720P 与 480P 如此）。只看响应头的长度探测认不出，下载到第一个块才失败。
-     * 用详情里刚取的直链直接发，不经 handle：handle 读不出要换主机重试几轮才放弃，坏档要等几秒才能从列表里去掉。
-     */
-    private suspend fun probeTranscode(client: PikPakClient, media: MediaVariant): Long =
-        client.streamRangeFromUrl(media.link.url, start = 0L, length = 1L) { stream ->
-            val size = stream.totalSize?.takeIf { it > 0 } ?: error(tr("服务端未返回转码文件大小", "Server did not return transcoded file size", "サーバーから変換ファイルのサイズが返されませんでした", "서버에서 변환 파일 크기를 반환하지 않았습니다", "伺服器未傳回轉碼檔案大小"))
-            // 正文提前断开在 Ktor 里是异常，不是读到 -1，两种都算读不出
-            val read = runSuspendCatching { stream.channel.readAvailable(ByteArray(1), 0, 1) }
-            if ((read.getOrNull() ?: -1) < 1) throw UnreadableTranscodeException(read.exceptionOrNull())
-            size
-        }
-
-    /**
-     * 一档转码经下载暂存读。不走 [openByteSource]：那条路给播放用，转码只进内存缓存，
-     * 换成暂存的话边看边往盘上写整条 TS。
-     */
-    private suspend fun transcodeSource(client: PikPakClient, fileId: String, mediaId: String, retainedBy: String?): PikPakByteSource {
-        val detail = takeFreshDetail(client, fileId)
-            ?: withApiPriority(ApiRequestPriority.INTERACTIVE) { detailOf(client, fileId) }
-                .also { rememberFreshDetail(client, fileId, it) }
-        if (detail.hash.isBlank()) error(tr("文件缺少内容哈希，无法读取", "File is missing content hash and cannot be read", "ファイルにハッシュ情報がないため読み込めません", "파일에 콘텐츠 해시가 없어 읽을 수 없습니다", "檔案缺少內容雜湊值，無法讀取"))
-        val variant = detail.medias.firstOrNull { it.mediaId == mediaId && it.link.url.isNotBlank() }
-            ?: error(TRANSCODE_GONE_MESSAGE)
-        val streamSize = streamSizeOf(client, detail, mediaId)
-        val mediaRate = estimatedMediaBytesPerSecond(
-            streamSize = streamSize,
-            durationSeconds = variant.video?.duration ?: (durationMsOf(detail) / 1000L),
-            bitRateBitsPerSecond = variant.video?.bitRate,
-        )
-        val pool = fileCachePool ?: run {
-            val handle = client.fileHandle(detail, mediaId = mediaId, streamSize = streamSize, onRangeAttempt = ::logRangeAttempt)
-            return try {
-                val cache = handle.openCache(coroutineContext = proxy.readerContext)
-                if (mediaRate != null) cache.updateMediaBytesPerSecond(mediaRate)
-                PikPakByteSource(handle, cache)
-            } catch (e: Throwable) {
-                handle.close()
-                throw e
-            }
-        }
-        val lease = pool.acquire(client, detail.id, detail.hash, detail.sizeBytes, detail.name,
-            parentId = detail.parentId, leased = LeasedFile.isLeased(fileId), detail = detail,
-            retained = retainedBy != null, owner = retainedBy ?: detail.id, mediaId = mediaId,
-            streamSize = streamSize, mediaBytesPerSecond = mediaRate)
-        return PikPakByteSource(lease.entry.handle, lease.entry.cache, lease::close)
-    }
-
-    private suspend fun streamSizeOf(client: PikPakClient, detail: FileDetail, mediaId: String): Long {
-        knownTranscodeStreamSize(client, detail, mediaId)?.let { return it }
-        return client.fileHandle(detail, mediaId = mediaId, onRangeAttempt = ::logRangeAttempt)
-            .use { it.streamSize() }
-            .also { recordTranscodeStreamSize(client, detail, mediaId, it, unreadable = false) }
-    }
-
-    private fun durationMsOf(detail: FileDetail): Long =
-        detail.params["duration"]?.toDoubleOrNull()?.let { (it * 1000).toLong() }?.takeIf { it > 0L }
-            ?: detail.medias.firstOrNull { it.isOrigin }?.video?.duration?.takeIf { it > 0L }?.times(1000L)
-            ?: detail.medias.firstNotNullOfOrNull { it.video?.duration?.takeIf { d -> d > 0L } }?.times(1000L)
-            ?: 0L
-
-    private fun estimatedMediaBytesPerSecond(
-        streamSize: Long,
-        durationSeconds: Long,
-        bitRateBitsPerSecond: Long? = null,
-    ): Long? {
-        val bySize = if (streamSize > 0L && durationSeconds > 0L) streamSize / durationSeconds else null
-        val byBitRate = bitRateBitsPerSecond?.takeIf { it > 0L }?.let { it / 8L }
-        return maxOf(bySize ?: 0L, byBitRate ?: 0L).takeIf { it > 0L }
-    }
-
-    /**
-     * 建 handle 与字节来源。handle 的内容哈希、文件对象与第一条直链都取自 [detail]，第一次读不必再查。
-     * 没有 gcid 或拿不到大小时返回 null；取消照常抛出。
-     */
-    private suspend fun openByteSource(
-        client: PikPakClient,
-        detail: FileDetail,
-        resolved: ResolvedVariant,
-        blockStore: BlockStore? = null,
-        leased: Boolean = false,
-        /** 见 [openRandomAccess]。只对原画有效：只有原画经下载暂存。 */
-        retainedBy: String? = null,
-        /** 信息流冷文件只发一次唤醒并快速放手跳过，不在后台轮询长达 5 分钟卡住预备槽。 */
-        fastReactivation: Boolean = false,
-    ): PikPakByteSource? {
-        // handle 在直链被拒时按 gcid 重建文件对象，没有 gcid 就失去了它存在的意义
-        if (detail.hash.isBlank()) return null
-        val knownStreamSize = if (resolved.isOrigin) {
-            detail.sizeBytes
-        } else {
-            resolved.sizeBytes?.takeIf { it > 0L }
-                ?: resolved.mediaId?.let { knownTranscodeStreamSize(client, detail, it) }
-        }
-        val mediaRate = estimatedMediaBytesPerSecond(
-            streamSize = knownStreamSize ?: detail.sizeBytes.takeIf { resolved.isOrigin } ?: 0L,
-            durationSeconds = resolved.video?.duration ?: (durationMsOf(detail) / 1000L),
-            bitRateBitsPerSecond = resolved.video?.bitRate,
-        )
-        if (resolved.isOrigin && blockStore == null && !fastReactivation) {
-            fileCachePool?.let { pool ->
-                val lease = pool.acquire(client, detail.id, detail.hash, detail.sizeBytes, detail.name,
-                    parentId = detail.parentId, leased = leased, detail = detail,
-                    retained = retainedBy != null, owner = retainedBy ?: detail.id,
-                    mediaBytesPerSecond = mediaRate)
-                return PikPakByteSource(lease.entry.handle, lease.entry.cache, lease::close)
-            }
-        }
-        // 原文件被删后 handle 会按 gcid 秒传重建一份，落在原来的目录（fileHandle 默认取详情里的 parentId）。
-        // 归档条目的 detail 出自 leaseDetail，对象已经删了：直链过期时重建出的那份，handle 取完链同样删掉
-        val handle = if (fastReactivation) {
-            client.fileHandle(
-                detail,
-                mediaId = resolved.mediaId,
-                streamSize = knownStreamSize,
-                onRangeAttempt = ::logRangeAttempt,
-                leased = leased,
-                reactivationPollInterval = CLIP_REACTIVATION_POLL_INTERVAL,
-                reactivationTimeout = CLIP_REACTIVATION_TIMEOUT,
-            )
-        } else {
-            client.fileHandle(
-                detail,
-                mediaId = resolved.mediaId,
-                streamSize = knownStreamSize,
-                onRangeAttempt = ::logRangeAttempt,
-                leased = leased,
-            )
-        }
-        return try {
-            // 原画的大小已知；转码流若已知流大小则直接复用，未知时首次探测后回写持久化
-            val cache = handle.openCache(blockStore, proxy.readerContext)
-            if (!resolved.isOrigin && resolved.mediaId != null && cache.size > 0L) {
-                recordTranscodeStreamSize(client, detail, resolved.mediaId!!, cache.size, unreadable = false)
-            }
-            val effectiveRate = estimatedMediaBytesPerSecond(
-                streamSize = cache.size,
-                durationSeconds = resolved.video?.duration ?: (durationMsOf(detail) / 1000L),
-                bitRateBitsPerSecond = resolved.video?.bitRate,
-            ) ?: mediaRate
-            if (effectiveRate != null) cache.updateMediaBytesPerSecond(effectiveRate)
-            PikPakByteSource(handle, cache)
-        } catch (e: CancellationException) {
-            handle.close()
-            throw e
-        } catch (e: Exception) {
-            val variantLabel = if (resolved.isOrigin) ORIGINAL_QUALITY else (resolved.mediaId ?: "transcode")
-            PikoLog.w(TAG, "Failed to open byte source: ${logFile(detail.id, detail.name)}, variant=$variantLabel", e)
-            handle.close()
-            null
-        }
-    }
-
-    private fun preferenceFor(resolution: String?): VariantPreference =
-        if (resolution.isNullOrBlank() || resolution == ORIGINAL_QUALITY) {
-            VariantPreference.Original
-        } else {
-            VariantPreference.Resolution(resolution)
-        }
-
-    private fun playableMediaInfo(detail: FileDetail, resolved: ResolvedVariant, fileId: String) =
-        PlayableMediaInfo(
-            fileId = fileId,
-            name = detail.name,
-            gcid = detail.hash,
-            currentUrl = resolved.link.url,
-            durationSeconds = resolved.video?.duration?.takeIf { it > 0L } ?: (durationMsOf(detail) / 1000L),
-            currentResolution = resolved.video?.height?.toString() ?: ORIGINAL_QUALITY,
-            availableVariants = detail.medias,
-            mediaId = resolved.mediaId,
-            sizeBytes = resolved.sizeBytes ?: detail.sizeBytes,
-            width = resolved.video?.width?.takeIf { it > 0 } ?: detail.params["width"]?.toIntOrNull() ?: 0,
-            height = resolved.video?.height?.takeIf { it > 0 } ?: detail.params["height"]?.toIntOrNull() ?: 0,
-            isOrigin = resolved.isOrigin,
-        )
-
-    private suspend fun <T> runSuspendCatching(block: suspend () -> T): Result<T> = try {
-        Result.success(block())
-    } catch (e: CancellationException) {
-        throw e
-    } catch (e: Throwable) {
-        Result.failure(e)
-    }
+    override fun shouldResumePlayback(): Boolean =
+        preferences?.currentSnapshot?.resumePlaybackEnabled ?: true
 
     private companion object {
         val sharedProxy by lazy { PikoMediaProxy() }
+        const val CLOUD_NEAR_END_MILLIS = 10_000L
     }
 }
 
-private const val TAG = "Media"
-
-/** 随机片段取的转码档位：数据量比原画小得多。 */
-private const val CLIP_RESOLUTION = "720P"
-
-private const val TS_PACKET_BYTES = 188L
-
-// PikPak 的 MPEG-TS 转码流首个视频帧 PTS 固定在约 1480ms
-private const val STREAM_START_PTS_MS = 1_480L
-
-// 188 的倍数，约 256 KiB，与 SDK 的块一样大
-private const val KEYFRAME_SCAN_CHUNK = 188 * 1394
-
-// 关键帧扫描打开 4 个连续 256 KiB 分块（headSlot..headSlot+3，共约 1 MiB）并发预读窗口，一次性条带化拉回
-internal const val CLIP_SCAN_READ_AHEAD_BYTES = 3L * 256 * 1024L
-
-// 全屏起播与拖动定位在 WAITING 阶段尚未跨块证明顺序消费时，对开放式前景读取直接放行有界突发窗口，
-// 使高 RTT 线路在首包阶段即并行建连拉取首段 GOP，同时对单分块短探测保持零投机。
-internal const val PLAYBACK_WAITING_READ_AHEAD_FLOOR_BYTES = 10L * 256 * 1024L
-internal const val PLAYBACK_WAITING_READ_AHEAD_MAX_BYTES = 4L * 1024 * 1024L
-
-internal fun playbackBufferBudget(estimatedBytesPerSecond: Long? = null): BufferBudget =
-    if (estimatedBytesPerSecond != null) {
-        BufferBudget(
-            maxReadAheadBytes = (estimatedBytesPerSecond * 8L).coerceIn(
-                12L * 1024 * 1024,
-                PikPakStreamReader.DEFAULT_READ_AHEAD_BYTES,
-            ),
-            waitingReadAheadBytes = (estimatedBytesPerSecond * 3L).coerceIn(
-                PLAYBACK_WAITING_READ_AHEAD_FLOOR_BYTES,
-                PLAYBACK_WAITING_READ_AHEAD_MAX_BYTES,
-            ),
-        )
-    } else {
-        BufferBudget(
-            maxReadAheadBytes = PikPakStreamReader.DEFAULT_READ_AHEAD_BYTES,
-            waitingReadAheadBytes = PLAYBACK_WAITING_READ_AHEAD_FLOOR_BYTES,
-        )
-    }
-
-// 关键帧扫描窗口覆盖 15 秒峰值码率（保底 2 MiB、上限扩展至 6 MiB），足以跨过 10s+ 长 GOP 高码率动作段
-private const val VERIFIED_KEYFRAME_WINDOW_MS = 15_000L
-private const val MIN_VERIFIED_KEYFRAME_SCAN_BYTES = 2L * 1024 * 1024
-private const val MAX_VERIFIED_KEYFRAME_SCAN_BYTES = 6L * 1024 * 1024
-
-/** 切片按 180 秒有界窗口截取（含码率余量），覆盖多轮 30 秒续播且保证头尾 PTS 紧致可插值 seek。 */
-private const val CLIP_SLICE_MS = 180_000L
-
-/** 信息流冷文件只发一次唤醒请求并短暂等待 1.5s，未当场就绪即跳过，避免占住后台预取槽。 */
-private val CLIP_REACTIVATION_POLL_INTERVAL = 1.seconds
-private val CLIP_REACTIVATION_TIMEOUT = 1_500.milliseconds
-
-private const val SLICE_BITRATE_MARGIN = 1.5
-
-private val FRESH_DETAIL_FOR = 5.minutes
-
-// 各档的大小随内容而定，不会变；读不出的档有可能被服务端修好，所以也不留太久
-private val QUALITY_PROBE_FOR = 10.minutes
-
-/** 清晰度菜单里代表原画的那一项，也是 [PikoMediaRepository] 认的原画标识。 */
-const val ORIGINAL_QUALITY = "Original"
-
-// 云端记录停在片尾这么近时当作看完，从头播；与本机续播的判断一致
-private const val CLOUD_NEAR_END_MILLIS = 10_000L
-
-fun mediaKindOf(name: String): PlayableMediaKind = when (name.substringAfterLast('.', "").lowercase()) {
-    "avif", "bmp", "heic", "heif", "jpeg", "jpg", "png", "webp" -> PlayableMediaKind.Image
-    "gif" -> PlayableMediaKind.UnsupportedImage
-    else -> PlayableMediaKind.Video
-}
+internal const val MEDIA_LOG_TAG = "Media"

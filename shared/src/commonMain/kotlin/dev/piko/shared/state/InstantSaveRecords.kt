@@ -68,89 +68,91 @@ class InstantSaveRecords(
         val key = id ?: "${now()}-${Random.nextInt(0, Int.MAX_VALUE)}"
         _attempts.update { all ->
             val old = all.firstOrNull { it.id == key && it.account == account }
-            val work = old?.copy(finishedAtMs = null) ?: InstantSaveAttempt(key, account, title, target, files.toList(), now(),
+            val work = old?.copy(
+                finishedAtMs = null,
+                progressDone = 0,
+                progressTotal = files.size,
+                progressStatus = null,
+                progressDetail = null,
+                errorMessage = null,
+                locateOverrideId = null,
+            ) ?: InstantSaveAttempt(key, account, title, target, files.toList(), now(),
                 containerName = containerName, names = names.toMap(), keepStructure = keepStructure, reference = reference)
             all.filterNot { it.id == key } + work
         }
         return key
     }
 
+    fun updateAttemptProgress(
+        id: String,
+        account: String,
+        done: Int = 0,
+        total: Int = 0,
+        status: String? = null,
+        detail: String? = null,
+    ) {
+        if (clientProvider.currentClient.value?.account != account) return
+        _attempts.update { all ->
+            all.map { work ->
+                if (work.id == id && work.account == account && work.isRunning) {
+                    work.copy(
+                        progressDone = done.coerceAtLeast(0),
+                        progressTotal = total.coerceAtLeast(0),
+                        progressStatus = status,
+                        progressDetail = detail,
+                    )
+                } else {
+                    work
+                }
+            }
+        }
+    }
+
     fun finishAttempt(id: String, receipt: dev.piko.shared.data.InstantSaveReceipt) {
         if (clientProvider.currentClient.value?.account != receipt.account) return
         val work = _attempts.value.firstOrNull { it.id == id && it.account == receipt.account && it.isRunning } ?: return
         _attempts.update { all -> all.map { if (it.id == id && it.account == receipt.account) it.copy(receipt = receipt, finishedAtMs = now()) else it } }
-        if (receipt.requiresInspection || receipt.failed.isNotEmpty() || receipt.notAttempted.isNotEmpty())
+        if (receipt.failed.isNotEmpty() || receipt.notAttempted.isNotEmpty())
             _outcomes.tryEmit(InstantSaveAttemptOutcome(id, receipt.account, work.title, receipt.message))
-    }
-
-    private val checking = MutableStateFlow<Set<String>>(emptySet())
-    fun canRecheck(id: String): Boolean = id !in checking.value && _attempts.value.any {
-        it.id == id && !it.isRunning && it.account == clientProvider.currentClient.value?.account && it.receipt?.requiresInspection == true
-    }
-
-    /** An absent or ambiguous output stays unknown. This path never submits a write. */
-    fun recheck(id: String, repository: dev.piko.shared.data.PikoDriveRepository): Boolean {
-        if (!canRecheck(id)) return false
-        val initial = _attempts.value.firstOrNull { it.id == id } ?: return false
-        val read = repository.browsableReader(initial.account) ?: return false
-        checking.update { it + id }
-        scope.launch {
-            try {
-                val receipt = initial.receipt ?: return@launch
-                val prevConfirmed = receipt.confirmed.size
-                val prevUnknownFolder = receipt.unconfirmedFolder != null
-                val folders = receipt.folders.toMutableMap()
-                var unknownFolder = receipt.unconfirmedFolder
-                val pendingFolder = unknownFolder
-                if (pendingFolder != null) {
-                    val prefix = pendingFolder.substringBeforeLast('/', "")
-                    val parent = if (initial.containerName == pendingFolder) initial.target.id else folders[prefix]
-                    if (parent != null) {
-                        val matches = read(parent)
-                            .onFailure { err -> PikoLog.d(TAG, "Recheck folder lookup failed (attempt=$id, parent=${logFolder(parent)}): ${err.message}") }
-                            .getOrNull().orEmpty().filter { it.isFolder && it.name == pendingFolder.substringAfterLast('/') }
-                        if (matches.size == 1) {
-                            folders[if (initial.containerName == pendingFolder) "" else pendingFolder] = matches.single().id
-                        }
-                    }
-                }
-                val confirmed = receipt.confirmed.toMutableMap()
-                val naming = receipt.namingUnconfirmed.toMutableSet()
-                val contents = mutableMapOf<String, List<io.github.nihildigit.pikpak.FileStat>>()
-                for (file in initial.files.filter { it.path in receipt.unconfirmed || it.path in naming }) {
-                    val folder = folders[if (initial.keepStructure) file.path.substringBeforeLast('/', "") else ""]
-                        ?: initial.target.id.takeIf { initial.containerName == null && !initial.keepStructure } ?: continue
-                    val actual = contents[folder] ?: read(folder)
-                        .onFailure { err -> PikoLog.d(TAG, "Recheck folder listing failed (attempt=$id, folder=${logFolder(folder)}): ${err.message}") }
-                        .getOrNull()?.also { contents[folder] = it } ?: continue
-                    val expectedName = initial.names[file.path] ?: file.name
-                    val matches = actual.filter { !it.isFolder && it.isVaulted == initial.reference && it.name == expectedName && it.sizeBytes == file.size && it.hash.equals(file.gcid, true) }
-                    if (matches.size == 1) { confirmed[file.path] = matches.single().id; naming.remove(file.path) }
-                }
-                if (repository.currentAccount != initial.account) return@launch
-                if (receipt.failed.isEmpty() && receipt.notAttempted.isEmpty() &&
-                    initial.files.all { it.path in confirmed }) unknownFolder = null
-                val updated = receipt.copy(confirmed = confirmed, unconfirmed = receipt.unconfirmed - confirmed.keys,
-                    namingUnconfirmed = naming, folders = folders, unconfirmedFolder = unknownFolder)
-                val newlyConfirmed = confirmed.size - prevConfirmed
-                val folderResolved = prevUnknownFolder && unknownFolder == null
-                if (newlyConfirmed > 0 || folderResolved) {
-                    PikoLog.i(
-                        TAG,
-                        "Recheck updated instant save attempt $id (newlyConfirmed=$newlyConfirmed, confirmed=${confirmed.size}/${initial.files.size}, " +
-                            "unconfirmed=${updated.unconfirmed.size}, namingUnconfirmed=${updated.namingUnconfirmed.size}, folderResolved=$folderResolved)",
-                    )
-                }
-                _attempts.update { all -> all.map { work -> if (work === initial) work.copy(receipt = updated) else work } }
-            } finally { checking.update { it - id } }
-        }
-        return true
     }
 
     fun forgetAttempt(id: String): Boolean {
         if (_attempts.value.any { it.id == id && it.isRunning }) return false
         _attempts.update { all -> all.filterNot { it.id == id } }
         return true
+    }
+
+    fun dismissRunningAttempt(id: String, account: String) {
+        _attempts.update { all -> all.filterNot { it.id == id && it.account == account } }
+    }
+
+    fun failStreamingAttempt(
+        id: String,
+        account: String,
+        message: String,
+        confirmedCount: Int = 0,
+        locateId: String? = null,
+    ) {
+        val work = _attempts.value.firstOrNull { it.id == id && it.account == account } ?: return
+        _attempts.update { all ->
+            all.map { item ->
+                if (item.id == id && item.account == account) {
+                    item.copy(
+                        finishedAtMs = now(),
+                        progressDone = confirmedCount.coerceAtLeast(0),
+                        progressStatus = null,
+                        progressDetail = null,
+                        errorMessage = message,
+                        locateOverrideId = locateId ?: item.locateOverrideId,
+                    )
+                } else {
+                    item
+                }
+            }
+        }
+        if (clientProvider.currentClient.value?.account == account) {
+            _outcomes.tryEmit(InstantSaveAttemptOutcome(id, account, work.title, message))
+        }
     }
 
     fun clearAttempts(account: String) { _attempts.update { all -> all.filterNot { it.account == account } } }
@@ -169,16 +171,13 @@ class InstantSaveRecords(
         names: Map<String, String> = emptyMap(), keepStructure: Boolean = false): Boolean {
         val outputs = files.mapTo(HashSet()) { outputOf(it, names, keepStructure) }
         return snapshot.any { work ->
-            if (work.id == excluding || work.account != account) false else {
+            if (work.id == excluding || work.account != account || !work.isRunning) false else {
                 val sameContainer = work.target.id == targetId && work.containerName == containerName
-                val unknownContainer = sameContainer && containerName != null && work.receipt?.folders?.get("") == null &&
-                    (work.isRunning || work.receipt?.unconfirmedFolder != null)
+                val unknownContainer = sameContainer && containerName != null && work.receipt?.folders?.get("") == null
                 unknownContainer || work.files.any { original ->
-                    val blocked = work.isRunning || work.receipt?.unconfirmedFolder != null ||
-                        original.path in work.receipt?.unconfirmed.orEmpty() || original.path in work.receipt?.namingUnconfirmed.orEmpty()
                     val output = outputOf(original, work.names, work.keepStructure)
-                    blocked && ((sameContainer && output in outputs) || (containerName == null &&
-                        physicalOutputs(work, output).any { (parent, physical) -> parent == targetId && physical in outputs }))
+                    (sameContainer && output in outputs) || (containerName == null &&
+                        physicalOutputs(work, output).any { (parent, physical) -> parent == targetId && physical in outputs })
                 }
             }
         }

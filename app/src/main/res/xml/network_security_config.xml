@@ -6,6 +6,7 @@
         填的，没法在这里预先列出，所以默认放行明文。
         网盘官方接口一律走 https：下面单独把它们锁死，明文请求到官方域名仍然被拒，
         不会因为放开明文而把账号与令牌暴露在明文通道上。
+        应用内 WebView 读本地 HTML 文档走 127.0.0.1 回环，由 base-config 一并放行。
     -->
     <base-config cleartextTrafficPermitted="true" />
     <domain-config cleartextTrafficPermitted="false">

@@ -269,7 +269,7 @@ class InstantFlowSmokeTest {
         val instantRepo = InstantMagnetRepository(provider)
         val driveRepo = PikoDriveRepository(provider, prefs)
         val workspace = dev.piko.shared.presentation.DriveWorkspace(driveRepo, backgroundScope = backgroundScope)
-        val tracker = OfflinePackTracker(instantRepo, driveRepo, prefs)
+        val tracker = OfflinePackTracker(instantRepo, driveRepo, prefs, pollDelay = { kotlin.time.Duration.parse("10ms") })
         val previewFolder = PreviewTempFolder(provider, driveRepo, instantRepo, backgroundScope)
         val saveRecords = InstantSaveRecords(provider, null, backgroundScope)
 
@@ -785,8 +785,8 @@ class InstantFlowSmokeTest {
         draft.close()
         release.send(Unit)
 
-        awaitUntil("关闭后保存回执仍可检查") {
-            rig.saveRecords.attempts.value.any { it.receipt?.requiresInspection == true && !it.isRunning }
+        awaitUntil("关闭后保存失败回执仍保留") {
+            rig.saveRecords.attempts.value.any { it.receipt?.failed?.isNotEmpty() == true && !it.isRunning }
         }
         assertTrue(session.pendingCompletions.value.isEmpty())
         assertEquals(listOf("Movie.mkv"), server.children("").filter { it.name == "Movie.mkv" }.map { it.name })

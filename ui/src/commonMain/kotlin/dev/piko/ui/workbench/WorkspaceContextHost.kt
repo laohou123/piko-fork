@@ -17,18 +17,22 @@ import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.background
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Bolt
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.SaveableStateHolder
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.backhandler.BackHandler
 import androidx.compose.ui.input.key.*
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.piko.shared.data.PikoPathBreadcrumb
@@ -78,6 +82,7 @@ private fun WorkspaceStateProvider(holder: SaveableStateHolder, key: Long, conte
 internal fun WorkspaceContextHost(
     model: WorkspaceViewModel,
     onPlay: (FileStat, List<FileStat>) -> Unit,
+    onOpenDocument: (FileStat) -> Unit = {},
     onReveal: (FileStat) -> Unit,
     onTransfers: () -> Unit,
     onOpenSpaceMap: ((folderId: String, folderName: String) -> Unit)? = null,
@@ -116,6 +121,7 @@ internal fun WorkspaceContextHost(
                                     if (context.id in model.duplicateSessions) DriveScreen(
                                         onNavigateToFolder = { _, _ -> },
                                         onNavigateToVideoPlayer = onPlay,
+                                        onOpenDocument = onOpenDocument,
                                         browserSession = model.duplicateBrowser(context.id),
                                         onRevealInDrive = onReveal,
                                         onOpenSpaceMap = onOpenSpaceMap,
@@ -130,9 +136,19 @@ internal fun WorkspaceContextHost(
                         }
                         is WorkspaceContext.ImportDraft -> model.importModels[context.id]?.state?.let { draft ->
                             val content: @Composable () -> Unit = {
-                                InstantSheetContent(draft, view = model.importView(context.id), headerShown = true, fillHeight = true, onPreview = { id, name ->
-                                    onPlay(FileStat(id = id, name = name), emptyList())
-                                })
+                                InstantSheetContent(
+                                    state = draft,
+                                    view = model.importView(context.id) { dev.piko.ui.screens.instant.ImportWorkspaceViewState() },
+                                    headerShown = true,
+                                    fillHeight = true,
+                                    useImportWorkspace = wide,
+                                    onOpenLink = { url ->
+                                        if (draft.batch == null && draft.canEdit) draft.updateInput(url) else model.openImport(url)
+                                    },
+                                    onPreview = { id, name ->
+                                        onPlay(FileStat(id = id, name = name), emptyList())
+                                    },
+                                )
                             }
                             if (wide) {
                                 val summary = draft.summary()
@@ -150,7 +166,17 @@ internal fun WorkspaceContextHost(
                                             summary.status?.let { Text(it, style = MaterialTheme.typography.labelMedium, maxLines = 1) }
                                         }
                                     },
-                                    content = content,
+                                    content = {
+                                        Box(Modifier.fillMaxSize()) {
+                                            content()
+                                            SnackbarHost(
+                                                hostState = dev.piko.ui.LocalRootSnackbar.current,
+                                                modifier = androidx.compose.ui.Alignment.BottomCenter.let { align ->
+                                                    Modifier.align(align).padding(horizontal = 16.dp, vertical = 12.dp)
+                                                },
+                                            )
+                                        }
+                                    },
                                 )
                             } else {
                                 CompositionLocalProvider(LocalWorkspaceSurface provides WorkspaceSurface(context.id, onMinimize)) {
@@ -203,6 +229,7 @@ internal fun WorkspaceContextHost(
                 canClose = model::canCloseContext,
                 canPin = model::canPinContext,
                 onTogglePin = { model.togglePinContext(it) },
+                onEditNote = { id -> if (model.canEditContextNote(id)) model.requestEditContextNote(id) },
                 onCloseOthers = model::requestCloseOtherContexts,
                 onMove = model::moveContext,
                 onNewTab = model::newFileContext,
@@ -227,6 +254,42 @@ internal fun WorkspaceContextHost(
 
 @Composable
 internal fun WorkspaceContextDialogs(model: WorkspaceViewModel) {
+    model.editingNoteTabId?.let { tabId ->
+        val tab = model.driveWorkspace.tabsFlow.collectAsStateWithLifecycle().value.firstOrNull { it.id == tabId }
+        if (tab == null) {
+            LaunchedEffect(tabId) { model.dismissEditContextNote() }
+            return
+        }
+        var draft by rememberSaveable(tabId) { mutableStateOf(tab.note) }
+        PikoDialog(
+            onDismissRequest = model::dismissEditContextNote,
+            title = { Text(tr("标签页备注", "Tab note", "タブのメモ", "탭 메모", "分頁備註")) },
+            text = {
+                OutlinedTextField(
+                    value = draft,
+                    onValueChange = { draft = it },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text(tr("备注", "Note", "メモ", "메모", "備註")) },
+                    placeholder = { Text(tr("留空以清除备注", "Leave empty to clear", "空欄でメモを削除", "비워 두면 메모 삭제", "留空以清除備註")) },
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                    keyboardActions = KeyboardActions(onDone = { model.confirmEditContextNote(draft) }),
+                )
+            },
+            confirmButton = {
+                PikoDialogConfirm(
+                    label = tr("保存", "Save", "保存", "저장", "儲存"),
+                    onClick = { model.confirmEditContextNote(draft) },
+                )
+            },
+            dismissButton = {
+                TextButton(onClick = model::dismissEditContextNote) {
+                    Text(stringResource(Res.string.common_cancel))
+                }
+            },
+        )
+        return
+    }
     model.blockedCloseMessage?.let { message ->
         PikoDialog(
             onDismissRequest = model::dismissBlockedClose,

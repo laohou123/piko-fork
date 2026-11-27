@@ -197,6 +197,7 @@ class InstantMagnetRepository(
         existingFolders: Map<String, String> = emptyMap(),
         onFolderCreated: (parentId: String, id: String, name: String) -> Unit = { _, _, _ -> },
         onFoldersResolved: (Map<String, String>) -> Unit = {},
+        onProgress: (done: Int, total: Int, status: String?, detail: String?) -> Unit = { _, _, _, _ -> },
     ): Result<List<String>> {
         val owner = clientManager.currentClient.value ?: return Result.failure(IllegalStateException("Not logged in"))
         val accepted = items.toList()
@@ -206,7 +207,7 @@ class InstantMagnetRepository(
         return withContext(Dispatchers.Default) {
             saveFiles(
                 owner, accepted, targetParentId, previews, keepStructure, acceptedNames, folders,
-                onFolderCreated = onFolderCreated, onFoldersResolved = onFoldersResolved,
+                onFolderCreated = onFolderCreated, onFoldersResolved = onFoldersResolved, onProgress = onProgress,
             )
         }
     }
@@ -224,6 +225,7 @@ class InstantMagnetRepository(
         onFolderCreated: (parentId: String, id: String, name: String) -> Unit = { _, _, _ -> },
         onFoldersResolved: (Map<String, String>) -> Unit = {},
         onFreshVaultFolders: (Set<String>) -> Unit = {},
+        onProgress: (done: Int, total: Int, status: String?, detail: String?) -> Unit = { _, _, _, _ -> },
         onReferencesSaved: (Map<String, Set<String>>) -> Unit = {},
     ): Result<List<String>> {
         val owner = clientManager.currentClient.value ?: return Result.failure(IllegalStateException("未登录"))
@@ -244,6 +246,7 @@ class InstantMagnetRepository(
                 onFreshVaultFolders = onFreshVaultFolders,
                 onFolderCreated = onFolderCreated,
                 onFoldersResolved = onFoldersResolved,
+                onProgress = onProgress,
             )
         }
     }
@@ -264,6 +267,7 @@ class InstantMagnetRepository(
         onFreshVaultFolders: (Set<String>) -> Unit = {},
         onFolderCreated: (parentId: String, id: String, name: String) -> Unit = { _, _, _ -> },
         onFoldersResolved: (Map<String, String>) -> Unit = {},
+        onProgress: (done: Int, total: Int, status: String?, detail: String?) -> Unit = { _, _, _, _ -> },
     ): Result<List<String>> {
         val started = TimeSource.Monotonic.markNow()
         val readyItems = items.filter { it.file.gcid != null }
@@ -278,8 +282,19 @@ class InstantMagnetRepository(
         }
         var creatingFolder: String? = null
         val directories = if (keepStructure) files.flatMap { ancestorsOf(it.path) }.distinct().sortedBy { it.count { c -> c == '/' } } else emptyList()
+        val dirsToCreate = directories.count { it !in folderIds }
+        var createdDirCount = 0
+        val dirLock = dev.piko.shared.util.PikoLock()
         if (referenceVault != null) {
             PikoLog.i(TAG, "Reference save started: $summary, subdirs=${directories.size}")
+        }
+        if (dirsToCreate > 0) {
+            onProgress(
+                0,
+                dirsToCreate,
+                tr("正在创建目录", "Creating folders", "フォルダーを作成中", "폴더 생성 중", "正在建立資料夾"),
+                null,
+            )
         }
         val prepared = runSuspendCatching {
             for (level in directories.groupBy { it.count { c -> c == '/' } }.entries.sortedBy { it.key }.map { it.value }) {
@@ -292,6 +307,14 @@ class InstantMagnetRepository(
                             Triple(dir, parentId to folderName, runSuspendCatching {
                                 savePermits.withPermit {
                                     owner.createFolder(parentId, folderName)
+                                }.also {
+                                    val doneNow = dev.piko.shared.util.withPikoLock(dirLock) { ++createdDirCount }
+                                    onProgress(
+                                        doneNow,
+                                        dirsToCreate,
+                                        tr("正在创建目录", "Creating folders", "フォルダーを作成中", "폴더 생성 중", "正在建立資料夾"),
+                                        folderName,
+                                    )
                                 }
                             })
                         }
@@ -307,7 +330,6 @@ class InstantMagnetRepository(
                 }
                 val failure = results.firstOrNull { it.third.isFailure }
                 if (failure != null) {
-                    creatingFolder = results.firstOrNull { it.third.isFailure && !definitelyNotSaved(it.third.exceptionOrNull()) }?.first
                     throw failure.third.exceptionOrNull()!!
                 }
             }
@@ -318,17 +340,16 @@ class InstantMagnetRepository(
             val mode = if (referenceVault != null) "reference save" else "instant save"
             PikoLog.w(
                 TAG,
-                "Subfolder creation failed during $mode ($summary, createdFolders=${freshlyCreatedFolderIds.size}, unconfirmedFolder=${creatingFolder != null}, elapsedMs=${started.elapsedNow().inWholeMilliseconds})",
+                "Subfolder creation failed during $mode ($summary, createdFolders=${freshlyCreatedFolderIds.size}, elapsedMs=${started.elapsedNow().inWholeMilliseconds})",
                 error,
             )
             val receipt = InstantSaveReceipt(owner.account, targetParentId,
-                notAttempted = files.mapTo(HashSet()) { it.path }, folders = folderIds.toMap(),
-                unconfirmedFolder = creatingFolder)
+                notAttempted = files.mapTo(HashSet()) { it.path }, folders = folderIds.toMap())
             return Result.failure(InstantSaveIncomplete(receipt, error))
         }
         if (referenceVault != null) {
             val confirmed = linkedMapOf<String, String>()
-            val unknown = linkedSetOf<String>()
+            val failed = linkedSetOf<String>()
             val remaining = files.mapTo(linkedSetOf()) { it.path }
             var failure: Throwable? = null
             val directoryByFolderId = LinkedHashMap<String, String>()
@@ -347,6 +368,14 @@ class InstantMagnetRepository(
                     meta = item.meta,
                 )
             }
+            var writtenItems = 0
+            val writeProgressLock = dev.piko.shared.util.PikoLock()
+            onProgress(
+                0,
+                files.size,
+                tr("正在写入引用清单", "Writing reference manifests", "参照リストを書き込み中", "참조 목록 작성 중", "正在寫入引用清單"),
+                directoryByFolderId.values.firstOrNull { it.isNotEmpty() }?.substringAfterLast('/'),
+            )
             val writes = VaultIngest.ingestFolders(
                 batches = batches,
                 folderPermits = savePermits,
@@ -355,8 +384,18 @@ class InstantMagnetRepository(
                 writeFolder = { folderId, entries, isFresh ->
                     referenceVault.update(folderId, VaultEdits.add(entries), freshlyCreatedFolder = isFresh).map { }
                 },
-                verifyCommittedOnFailure = { folderId ->
-                    referenceVault.committed(folderId).getOrNull()
+                onFolderCommitted = { folderId, drafts, _ ->
+                    val doneNow = dev.piko.shared.util.withPikoLock(writeProgressLock) {
+                        writtenItems += drafts.size
+                        writtenItems
+                    }
+                    val folderLabel = directoryByFolderId[folderId].orEmpty().substringAfterLast('/').takeIf { it.isNotEmpty() }
+                    onProgress(
+                        doneNow,
+                        files.size,
+                        tr("正在写入引用清单", "Writing reference manifests", "参照リストを書き込み中", "참조 목록 작성 중", "正在寫入引用清單"),
+                        folderLabel,
+                    )
                 },
             )
             for (outcome in writes) {
@@ -366,8 +405,8 @@ class InstantMagnetRepository(
                 outcome.drafts.zip(outcome.entries).forEach { (draft, entry) ->
                     if (actualIds?.contains(entry.id) == true) {
                         confirmed[draft.sourcePath] = entry.virtualId
-                    } else if (outcome.writeResult.exceptionOrNull() is VaultWriteUnconfirmed) {
-                        unknown += draft.sourcePath
+                    } else {
+                        failed += draft.sourcePath
                     }
                 }
                 if (outcome.drafts.any { it.sourcePath in confirmed }) {
@@ -378,12 +417,12 @@ class InstantMagnetRepository(
                     }
                     onReferencesSaved(tree)
                 }
-                remaining.removeAll(confirmed.keys + unknown)
+                remaining.removeAll(confirmed.keys + failed)
                 if (outcome.failure != null && failure == null) failure = outcome.failure
             }
-            val receipt = InstantSaveReceipt(owner.account, targetParentId, confirmed = confirmed, unconfirmed = unknown,
+            val receipt = InstantSaveReceipt(owner.account, targetParentId, confirmed = confirmed, failed = failed,
                 notAttempted = remaining, folders = folderIds.toMap())
-            return if (failure == null && remaining.isEmpty() && unknown.isEmpty()) {
+            return if (failure == null && remaining.isEmpty() && failed.isEmpty()) {
                 if (freshlyCreatedFolderIds.isNotEmpty()) {
                     onFreshVaultFolders(freshlyCreatedFolderIds.toSet())
                 }
@@ -393,10 +432,10 @@ class InstantMagnetRepository(
                 )
                 Result.success(files.map { confirmed.getValue(it.path) })
             } else {
-                val cause = failure ?: IllegalStateException("引用保存待确认")
+                val cause = failure ?: IllegalStateException(tr("引用保存失败", "Reference save failed", "参照保存に失敗しました", "참조 저장 실패", "引用儲存失敗"))
                 PikoLog.w(
                     TAG,
-                    "Reference save incomplete: confirmed=${confirmed.size}, unconfirmed=${unknown.size}, notAttempted=${remaining.size}, targetFolders=${batches.size}, target=${logFolder(targetParentId)}, elapsedMs=${started.elapsedNow().inWholeMilliseconds}",
+                    "Reference save failed: confirmed=${confirmed.size}, failed=${failed.size}, notAttempted=${remaining.size}, targetFolders=${batches.size}, target=${logFolder(targetParentId)}, elapsedMs=${started.elapsedNow().inWholeMilliseconds}",
                     cause,
                 )
                 Result.failure(InstantSaveIncomplete(receipt, cause))
@@ -405,6 +444,11 @@ class InstantMagnetRepository(
         val consumedPreviews = HashSet<String>()
         val previews = files.associate { file ->
             file.path to reuse[file.gcid]?.takeIf { consumedPreviews.add(it) }
+        }
+        var savedFilesProgress = 0
+        val fileProgressLock = dev.piko.shared.util.PikoLock()
+        if (files.isNotEmpty()) {
+            onProgress(0, files.size, tr("正在保存", "Saving", "保存中", "저장 중", "正在儲存"), null)
         }
         val outcomes = runSuspendCatching {
             // 逐个串行时 84 个文件约 20 秒。并发数取得保守：SDK 自带限流，再高也快不了多少
@@ -415,7 +459,7 @@ class InstantMagnetRepository(
                             val parentId = folderIds[file.path.substringBeforeLast('/', "")] ?: targetParentId
                             val existing = previews[file.path]
                             val name = names[file.path] ?: file.name
-                            if (existing == null) {
+                            val out = if (existing == null) {
                                 val created = runSuspendCatching { owner.instantCreate(file = file, parentId = parentId, name = name) }
                                 InstantFileOutcome(file.path, created.getOrNull(), created.exceptionOrNull())
                             } else {
@@ -423,10 +467,16 @@ class InstantMagnetRepository(
                                 val delivery = if (moved.isSuccess) true else runSuspendCatching { owner.getFile(existing) }
                                     .getOrNull()?.let { !it.trashed && it.parentId == parentId } == true
                                 if (!delivery) InstantFileOutcome(file.path, null, moved.exceptionOrNull()) else {
-                                    val renamed = if (name == file.name) Result.success(Unit) else runSuspendCatching { owner.rename(existing, name) }
-                                    InstantFileOutcome(file.path, existing, renamed.exceptionOrNull(), namingUnconfirmed = renamed.isFailure)
+                                    if (name != file.name) {
+                                        runSuspendCatching { owner.rename(existing, name) }
+                                            .logFailure(TAG, "Failed to rename reused preview file $existing to $name")
+                                    }
+                                    InstantFileOutcome(file.path, existing, null)
                                 }
                             }
+                            val doneNow = dev.piko.shared.util.withPikoLock(fileProgressLock) { ++savedFilesProgress }
+                            onProgress(doneNow, files.size, tr("正在保存", "Saving", "保存中", "저장 중", "正在儲存"), name)
+                            out
                         }
                     }
                 }.awaitAll()
@@ -436,9 +486,8 @@ class InstantMagnetRepository(
         val errors = saved.mapNotNull { it.error }
         val receipt = InstantSaveReceipt(owner.account, targetParentId,
             confirmed = saved.mapNotNull { outcome -> outcome.id?.let { outcome.path to it } }.toMap(),
-            unconfirmed = saved.filter { it.id == null && !definitelyNotSaved(it.error) }.mapTo(HashSet()) { it.path },
-            failed = saved.filter { it.id == null && definitelyNotSaved(it.error) }.mapTo(HashSet()) { it.path },
-            folders = folderIds.toMap(), namingUnconfirmed = saved.filter { it.namingUnconfirmed }.mapTo(HashSet()) { it.path })
+            failed = saved.filter { it.id == null }.mapTo(HashSet()) { it.path },
+            folders = folderIds.toMap())
         val result = when {
             errors.isEmpty() -> Result.success(saved.mapNotNull { it.id })
             saved.size == 1 && receipt.confirmed.isEmpty() && receipt.failed.size == 1 && errors.single() is InstantContentUnavailableException -> Result.failure(errors.single())
@@ -452,16 +501,13 @@ class InstantMagnetRepository(
                 val cause = (err as? InstantSaveIncomplete)?.cause ?: err
                 PikoLog.w(
                     TAG,
-                    "Instant save failed: $summary, confirmed=${receipt.confirmed.size}, failed=${receipt.failed.size}, unconfirmed=${receipt.unconfirmed.size}, namingUnconfirmed=${receipt.namingUnconfirmed.size}, elapsedMs=${started.elapsedNow().inWholeMilliseconds}",
+                    "Instant save failed: $summary, confirmed=${receipt.confirmed.size}, failed=${receipt.failed.size}, elapsedMs=${started.elapsedNow().inWholeMilliseconds}",
                     cause,
                 )
             }
     }
 
-    private data class InstantFileOutcome(val path: String, val id: String?, val error: Throwable?, val namingUnconfirmed: Boolean = false)
-
-    private fun definitelyNotSaved(error: Throwable?): Boolean = error is InstantContentUnavailableException ||
-        error is PikPakException && error.httpStatus in setOf(400, 401, 403, 404, 409, 422)
+    private data class InstantFileOutcome(val path: String, val id: String?, val error: Throwable?)
 
     /** 秒传单个文件到 [parentId]，给预览用。 */
     suspend fun instantCreate(file: ResolvedFile, parentId: String): Result<String> = withContext(Dispatchers.Default) {

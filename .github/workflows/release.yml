@@ -151,11 +151,43 @@ jobs:
             "$build_tools/apksigner" verify --verbose "$apk"
           done
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
-          name: android-dist
-          path: dist/*
-          compression-level: 0
+          name: piko-${{ needs.version.outputs.name }}-arm64-v8a.apk
+          path: dist/piko-${{ needs.version.outputs.name }}-arm64-v8a.apk
+          archive: false
+          if-no-files-found: error
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: piko-${{ needs.version.outputs.name }}-armeabi-v7a.apk
+          path: dist/piko-${{ needs.version.outputs.name }}-armeabi-v7a.apk
+          archive: false
+          if-no-files-found: error
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: piko-${{ needs.version.outputs.name }}-x86_64.apk
+          path: dist/piko-${{ needs.version.outputs.name }}-x86_64.apk
+          archive: false
+          if-no-files-found: error
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: piko-${{ needs.version.outputs.name }}-universal.apk
+          path: dist/piko-${{ needs.version.outputs.name }}-universal.apk
+          archive: false
+          if-no-files-found: error
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: piko-${{ needs.version.outputs.name }}-mapping.txt
+          path: dist/piko-${{ needs.version.outputs.name }}-mapping.txt
+          archive: false
           if-no-files-found: error
           retention-days: 7
 
@@ -198,15 +230,24 @@ jobs:
         if: matrix.arch == 'arm64' || (github.event_name == 'workflow_dispatch' && inputs.windows-only)
         shell: pwsh
         run: |
-          .\gradlew.bat :desktopApp:desktopTest --stacktrace
+          .\gradlew.bat :desktopApp:desktopTest --no-daemon --stacktrace `
+            '-Dorg.gradle.jvmargs=-Xmx2560m -XX:MaxMetaspaceSize=768m -XX:+UseParallelGC -Dfile.encoding=UTF-8' `
+            '-Dkotlin.daemon.jvmargs=-Xmx2048m -XX:MaxMetaspaceSize=768m -XX:+UseParallelGC'
           if ($LASTEXITCODE -ne 0) {
             Write-Warning "desktopTest failed on first attempt (exit $LASTEXITCODE), archiving report and retrying..."
             "retried=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
             if (Test-Path desktopApp/build/reports/tests) {
               Copy-Item desktopApp/build/reports/tests desktopApp/build/reports/tests-attempt1 -Recurse -Force
             }
-            .\gradlew.bat :desktopApp:desktopTest --stacktrace --rerun-tasks
+            .\gradlew.bat :desktopApp:desktopTest --no-daemon --stacktrace --rerun-tasks `
+              '-Dorg.gradle.jvmargs=-Xmx2560m -XX:MaxMetaspaceSize=768m -XX:+UseParallelGC -Dfile.encoding=UTF-8' `
+              '-Dkotlin.daemon.jvmargs=-Xmx2048m -XX:MaxMetaspaceSize=768m -XX:+UseParallelGC'
           }
+          $testExit = $LASTEXITCODE
+          Get-CimInstance Win32_Process -Filter "Name='java.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -like '*KotlinCompileDaemon*' } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+          if ($testExit -ne 0) { exit $testExit }
 
       - name: Upload test report
         if: failure() || steps.test.outputs.retried == 'true'
@@ -232,7 +273,17 @@ jobs:
         run: bash .github/scripts/update-bases.sh "$VERSION" "${{ matrix.arch }}" "$RUNNER_TEMP/update-bases" "$RUNNER_TEMP/update-retired"
 
       - name: Build application image
-        run: .\gradlew.bat :desktopApp:createReleaseDistributable --stacktrace
+        shell: pwsh
+        run: |
+          .\gradlew.bat :desktopApp:createReleaseDistributable --no-daemon --no-configuration-cache --no-parallel --stacktrace `
+            '-DGRADLE_ACTIONS_SKIP_BUILD_RESULT_CAPTURE=true' `
+            '-Dorg.gradle.jvmargs=-Xmx2560m -XX:MaxMetaspaceSize=768m -XX:+UseParallelGC -Dfile.encoding=UTF-8' `
+            '-Dkotlin.daemon.jvmargs=-Xmx2048m -XX:MaxMetaspaceSize=768m -XX:+UseParallelGC'
+          $buildExit = $LASTEXITCODE
+          Get-CimInstance Win32_Process -Filter "Name='java.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -like '*KotlinCompileDaemon*' } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+          if ($buildExit -ne 0) { exit $buildExit }
 
       # 打包出的类逐个让 JVM 校验。ProGuard 改写过的字节码可能校验不过，而那只在装上之后
       # 进到某一页才崩，gradle run 与单测都走不到（见 desktopApp/package/VerifyClasses.java）
@@ -276,7 +327,13 @@ jobs:
           exit 0
 
       - name: Package application
-        run: .\gradlew.bat :desktopApp:packageReleaseMsi :desktopApp:packageReleaseUpdate --stacktrace "-PpikoSignedAppImage=$env:RUNNER_TEMP/signed-image/Piko" "-PpikoUpdateBases=$env:RUNNER_TEMP/update-bases" "-PpikoUpdateRetired=$env:RUNNER_TEMP/update-retired"
+        shell: pwsh
+        run: |
+          .\gradlew.bat :desktopApp:packageReleaseMsi :desktopApp:packageReleaseUpdate --no-daemon --no-configuration-cache --no-parallel --stacktrace `
+            '-DGRADLE_ACTIONS_SKIP_BUILD_RESULT_CAPTURE=true' `
+            '-Dorg.gradle.jvmargs=-Xmx2560m -XX:MaxMetaspaceSize=768m -XX:+UseParallelGC -Dfile.encoding=UTF-8' `
+            '-Dkotlin.daemon.jvmargs=-Xmx2048m -XX:MaxMetaspaceSize=768m -XX:+UseParallelGC' `
+            "-PpikoSignedAppImage=$env:RUNNER_TEMP/signed-image/Piko" "-PpikoUpdateBases=$env:RUNNER_TEMP/update-bases" "-PpikoUpdateRetired=$env:RUNNER_TEMP/update-retired"
 
       - name: Collect artifacts
         shell: powershell
@@ -348,10 +405,29 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
-          name: windows-${{ matrix.arch }}-dist
-          path: dist/*
+          name: piko-windows-${{ matrix.arch }}-${{ needs.version.outputs.name }}.msi
+          path: dist/piko-windows-${{ matrix.arch }}-${{ needs.version.outputs.name }}.msi
+          archive: false
+          if-no-files-found: error
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: piko-windows-${{ matrix.arch }}-${{ needs.version.outputs.name }}.7z
+          path: dist/piko-windows-${{ matrix.arch }}-${{ needs.version.outputs.name }}.7z
+          archive: false
+          if-no-files-found: error
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-${{ matrix.arch }}-update-dist
+          path: |
+            dist/*
+            !dist/*.msi
+            !dist/*.7z
           compression-level: 0
           if-no-files-found: error
           retention-days: 7
@@ -366,7 +442,7 @@ jobs:
 
       - uses: actions/download-artifact@v7
         with:
-          pattern: 'windows-{x64,arm64}-dist'
+          pattern: '{piko-windows-*,windows-*-update-dist}'
           path: in-dist
           merge-multiple: true
 
@@ -407,7 +483,7 @@ jobs:
       - uses: gradle/actions/setup-gradle@v5
 
       - name: Build
-        run: ./gradlew :desktopApp:packageReleaseDmg --no-daemon --stacktrace
+        run: ./gradlew :desktopApp:packageReleaseDmg --no-daemon --no-configuration-cache --stacktrace
 
       - name: Verify classes
         run: java -Xverify:all desktopApp/package/VerifyClasses.java desktopApp/build/compose/binaries/main-release/app/Piko.app/Contents/app
@@ -422,11 +498,11 @@ jobs:
           codesign -dv desktopApp/build/compose/binaries/main-release/app/Piko.app 2>&1 || true
           ls -l dist
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
-          name: macos-dist
-          path: dist/*
-          compression-level: 0
+          name: piko-macos-arm64-${{ needs.version.outputs.name }}.dmg
+          path: dist/piko-macos-arm64-${{ needs.version.outputs.name }}.dmg
+          archive: false
           if-no-files-found: error
           retention-days: 7
 
@@ -454,7 +530,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zsync appstream desktop-file-utils xvfb xauth
 
       - name: Build
-        run: xvfb-run -a ./gradlew :desktopApp:packageReleaseAppImage --no-daemon --stacktrace
+        run: xvfb-run -a ./gradlew :desktopApp:packageReleaseAppImage --no-daemon --no-configuration-cache --stacktrace
 
       - name: Verify classes
         run: java -Xverify:all desktopApp/package/VerifyClasses.java desktopApp/build/compose/binaries/main-release/app/Piko/lib/app
@@ -469,11 +545,27 @@ jobs:
             tar --transform='s,^Piko,piko,' -czf - Piko) > "dist/piko-linux-x64-$VERSION.tar.gz"
           ls -lh dist
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
-          name: linux-dist
-          path: dist/*
-          compression-level: 0
+          name: piko-linux-x64-${{ needs.version.outputs.name }}.AppImage
+          path: dist/piko-linux-x64-${{ needs.version.outputs.name }}.AppImage
+          archive: false
+          if-no-files-found: error
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: piko-linux-x64-${{ needs.version.outputs.name }}.AppImage.zsync
+          path: dist/piko-linux-x64-${{ needs.version.outputs.name }}.AppImage.zsync
+          archive: false
+          if-no-files-found: error
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: piko-linux-x64-${{ needs.version.outputs.name }}.tar.gz
+          path: dist/piko-linux-x64-${{ needs.version.outputs.name }}.tar.gz
+          archive: false
           if-no-files-found: error
           retention-days: 7
 
@@ -485,7 +577,7 @@ jobs:
     with:
       version: ${{ needs.version.outputs.name }}
       version-code: ${{ needs.version.outputs.code }}
-      artifact-name: ios-dist
+      artifact-name: piko-ios-arm64-${{ needs.version.outputs.name }}.ipa
     secrets: inherit
 
   release:
@@ -506,7 +598,7 @@ jobs:
       # 合并六端正式产物与提前构建好的 Windows 差分包，排除 test job 上传的 windows-smoke-dist
       - uses: actions/download-artifact@v7
         with:
-          pattern: '{android,windows-x64,windows-arm64,windows-deltas,macos,linux,ios}-dist'
+          pattern: '{piko-*,windows-*-update-dist,windows-deltas-dist}'
           path: dist
           merge-multiple: true
 

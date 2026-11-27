@@ -5,7 +5,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import dev.piko.shared.library.SubtitleFileSaver
 import dev.piko.shared.log.PikoLog
-import dev.piko.shared.media.PikoMediaRepository
+import dev.piko.shared.media.MediaService
 import dev.piko.shared.media.player.SubtitleBrowserState
 import dev.piko.shared.translate.SubtitleProgress
 import dev.piko.shared.translate.TranslationGateway
@@ -36,7 +36,7 @@ import kotlinx.coroutines.withTimeoutOrNull
 class SubtitleTranslateState(
     /** 同目录字幕列表，直接复用播放器的浏览器状态。 */
     val browser: SubtitleBrowserState,
-    private val media: PikoMediaRepository,
+    private val media: MediaService,
     private val http: HttpClient,
     private val uploads: PikoUploadCoordinator,
     private val saver: SubtitleFileSaver?,

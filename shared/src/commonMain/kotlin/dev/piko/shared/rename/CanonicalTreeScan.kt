@@ -47,15 +47,30 @@ class CanonicalTreeScan(
     private val driveRepo: PikoDriveRepository,
     private val scope: CoroutineScope,
     val root: PikoPathBreadcrumb,
+    private val includeRoot: Boolean = true,
 ) {
-    constructor(clients: PikoClientProvider, driveRepo: PikoDriveRepository, scope: CoroutineScope, root: PikoPathBreadcrumb) : this(
+    constructor(
+        clients: PikoClientProvider,
+        driveRepo: PikoDriveRepository,
+        scope: CoroutineScope,
+        root: PikoPathBreadcrumb,
+        includeRoot: Boolean = true,
+    ) : this(
         listFolder = { folderId ->
             val client = clients.currentClient.value ?: error("Not logged in")
-            driveRepo.scanRealChildren(folderId, client)
+            val real = driveRepo.scanRealChildren(folderId, client)
+            if (real.any(VaultStore::looksLikeManifest)) {
+                val entries = driveRepo.driveTreeIndex.vaultEntries(folderId)
+                    ?: driveRepo.vault.read(folderId, real).getOrDefault(emptyList())
+                real + entries.filter { it.isArchived }.map { it.toFileStat(folderId) }
+            } else {
+                real
+            }
         },
         driveRepo = driveRepo,
         scope = scope,
         root = root,
+        includeRoot = includeRoot,
     )
 
     enum class Phase { SCANNING, DONE, FAILED }
@@ -108,7 +123,7 @@ class CanonicalTreeScan(
         job = scope.launch {
             val started = TimeSource.Monotonic.markNow()
             try {
-                val rootEntry = loadRoot()
+                val rootEntry = if (includeRoot) loadRoot() else null
                 var scanned: List<ScannedFile> = emptyList()
                 scanner.scan(root.id).collect { event ->
                     when (event) {
@@ -122,7 +137,9 @@ class CanonicalTreeScan(
                             scanStop = event.stop
                             failedFolders = event.failedFolders
                             // 归档清单与 .piko 里的同步文件是 Piko 自己的，不是要整理的内容
-                            scanned = (event.subfolders + event.files).filterNot { VaultStore.looksLikeManifest(it.file) }
+                            scanned = (event.subfolders + event.files).filterNot {
+                                VaultStore.looksLikeManifest(it.file) || VaultStore.isRecoveryFile(it.file)
+                            }
                         }
                     }
                 }

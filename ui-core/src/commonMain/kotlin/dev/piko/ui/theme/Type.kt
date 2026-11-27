@@ -1,0 +1,114 @@
+package dev.piko.ui.theme
+
+import androidx.compose.material3.Typography
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.intl.Locale
+import androidx.compose.ui.text.intl.LocaleList
+import androidx.compose.ui.text.style.LineHeightStyle
+import androidx.compose.ui.unit.sp
+import dev.piko.data.auth.AppLanguage
+import dev.piko.shared.i18n.PikoLocale
+
+/** 等宽数字特性，用于进度百分比、速率、配额、时长与计数，避免数字跳动时引起横向抖动。 */
+val TextStyle.tabular: TextStyle
+    get() = copy(fontFeatureSettings = "tnum")
+
+private val cjkLineHeightStyle = LineHeightStyle(
+    alignment = LineHeightStyle.Alignment.Center,
+    trim = LineHeightStyle.Trim.None,
+)
+
+private fun cjkTextStyle(
+    fontFamily: FontFamily,
+    localeList: LocaleList?,
+    size: Int,
+    lineHeight: Int,
+    weight: FontWeight,
+    tracking: Double = 0.0,
+) = TextStyle(
+    fontFamily = fontFamily,
+    localeList = localeList,
+    fontWeight = weight,
+    fontSize = size.sp,
+    lineHeight = lineHeight.sp,
+    letterSpacing = tracking.sp,
+    lineHeightStyle = cjkLineHeightStyle,
+)
+
+/**
+ * 显式绑定随应用语言变化的 [LocaleList]：
+ * 1. 让日文、韩文在系统缺字回退时确定性落到简中字库而非宋体或旧韩汉字体；
+ * 2. 让静态文本组件在运行时切换语言后随 [TextStyle] 失效立即重排，杜绝新旧回退字形同屏混杂。
+ */
+fun pikoLocaleList(
+    effectiveLanguage: AppLanguage,
+    systemLanguage: AppLanguage = PikoLocale.systemLanguage,
+): LocaleList = when (effectiveLanguage) {
+    AppLanguage.ZH_CN -> LocaleList(Locale("zh-CN"))
+    AppLanguage.ZH_HANT -> LocaleList(Locale("zh-TW"))
+    AppLanguage.JA -> LocaleList(Locale("ja-JP"), Locale("zh-CN"))
+    AppLanguage.KO -> LocaleList(Locale("ko-KR"), Locale("zh-CN"))
+    AppLanguage.EN, AppLanguage.SYSTEM -> when (systemLanguage) {
+        AppLanguage.ZH_HANT -> LocaleList(Locale("en-US"), Locale("zh-TW"))
+        AppLanguage.JA -> LocaleList(Locale("en-US"), Locale("ja-JP"), Locale("zh-CN"))
+        AppLanguage.KO -> LocaleList(Locale("en-US"), Locale("ko-KR"), Locale("zh-CN"))
+        else -> LocaleList(Locale("en-US"), Locale("zh-CN"))
+    }
+}
+
+/**
+ * Piko 排版规范：15 档基线 + 15 档 Emphasized 变体。
+ * 针对中文字形特性：字距归零、小字号行高增加 2sp，杜绝正文拥挤。
+ *
+ * Documentation references:
+ * - Material 3 Typography Scale: `m3-material-mirror/pages/styles/typography.md`
+ * - Android Material 3 Typography: `android-docs-mirror/pages/develop/ui/compose/designsystems/material3.md`
+ */
+fun pikoTypography(fontFamily: FontFamily, localeList: LocaleList? = null): Typography {
+    fun cjkStyle(size: Int, lineHeight: Int, weight: FontWeight, tracking: Double = 0.0) =
+        cjkTextStyle(fontFamily, localeList, size, lineHeight, weight, tracking)
+    return Typography(
+        displayLarge = cjkStyle(57, 64, FontWeight.Normal, -0.25),
+        displayMedium = cjkStyle(45, 52, FontWeight.Normal),
+        displaySmall = cjkStyle(36, 44, FontWeight.Normal),
+
+        headlineLarge = cjkStyle(32, 40, FontWeight.Normal),
+        headlineMedium = cjkStyle(28, 36, FontWeight.Normal),
+        headlineSmall = cjkStyle(24, 32, FontWeight.Normal),
+
+        titleLarge = cjkStyle(22, 28, FontWeight.Normal),
+        titleMedium = cjkStyle(16, 24, FontWeight.Medium),
+        titleSmall = cjkStyle(14, 22, FontWeight.Medium),
+
+        bodyLarge = cjkStyle(16, 24, FontWeight.Normal),
+        bodyMedium = cjkStyle(14, 22, FontWeight.Normal),
+        bodySmall = cjkStyle(12, 18, FontWeight.Normal),
+
+        labelLarge = cjkStyle(14, 20, FontWeight.Medium, 0.1),
+        labelMedium = cjkStyle(12, 16, FontWeight.Medium, 0.5),
+        labelSmall = cjkStyle(11, 16, FontWeight.Medium, 0.5),
+
+        // 15 档 Emphasized (通过字重提升一级，保持同字号和行高，避免布局跳跃)
+        displayLargeEmphasized = cjkStyle(57, 64, FontWeight.Medium, -0.25),
+        displayMediumEmphasized = cjkStyle(45, 52, FontWeight.Medium),
+        displaySmallEmphasized = cjkStyle(36, 44, FontWeight.Medium),
+
+        headlineLargeEmphasized = cjkStyle(32, 40, FontWeight.Medium),
+        headlineMediumEmphasized = cjkStyle(28, 36, FontWeight.Medium),
+        headlineSmallEmphasized = cjkStyle(24, 32, FontWeight.Medium),
+
+        titleLargeEmphasized = cjkStyle(22, 28, FontWeight.Medium),
+        titleMediumEmphasized = cjkStyle(16, 24, FontWeight.SemiBold),
+        titleSmallEmphasized = cjkStyle(14, 22, FontWeight.SemiBold),
+
+        bodyLargeEmphasized = cjkStyle(16, 24, FontWeight.Medium),
+        bodyMediumEmphasized = cjkStyle(14, 22, FontWeight.Medium),
+        bodySmallEmphasized = cjkStyle(12, 18, FontWeight.Medium),
+
+        labelLargeEmphasized = cjkStyle(14, 20, FontWeight.SemiBold, 0.1),
+        labelMediumEmphasized = cjkStyle(12, 16, FontWeight.SemiBold, 0.5),
+        labelSmallEmphasized = cjkStyle(11, 16, FontWeight.SemiBold, 0.5),
+    )
+}

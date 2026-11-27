@@ -19,6 +19,7 @@ class DesktopPikoTreeDatabaseFactory internal constructor(
         val release = TreeDatabaseLeases.acquire(file)
         var connection: Connection? = null
         try {
+            ensureSqliteTmpDir()
             loadDriver()
             val opened = connect("jdbc:sqlite:${file.absolutePath}")
             connection = opened
@@ -40,12 +41,24 @@ class DesktopPikoTreeDatabaseFactory internal constructor(
 
     companion object {
         private val driver by lazy {
-            val natives = PikoHome.root.resolve("cache/natives").toFile()
-            check(natives.isDirectory || natives.mkdirs()) { "Cannot create SQLite native directory" }
-            System.setProperty("org.sqlite.tmpdir", natives.absolutePath)
+            // 始终指定 tmpdir 至 PikoHome 下（随包加载时 SQLiteJDBCLoader.cleanup 也会枚举 tmpdir，避免去扫系统 %TEMP%）
+            if (System.getProperty("org.sqlite.tmpdir").isNullOrBlank()) {
+                val natives = PikoHome.root.resolve("cache/natives").toFile()
+                System.setProperty("org.sqlite.tmpdir", natives.absolutePath)
+            }
+            ensureSqliteTmpDir()
             // Direct reference also preserves the driver through release shrinking.
             Class.forName(org.sqlite.JDBC::class.java.name)
         }
+
+        private fun ensureSqliteTmpDir() {
+            val configured = System.getProperty("org.sqlite.tmpdir")?.takeIf { it.isNotBlank() } ?: return
+            val dir = File(configured)
+            if (!dir.isDirectory) {
+                dir.mkdirs()
+            }
+        }
+
         private fun loadDriver() { driver }
     }
 }

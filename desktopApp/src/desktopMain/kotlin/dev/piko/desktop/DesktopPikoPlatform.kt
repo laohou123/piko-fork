@@ -8,14 +8,17 @@ import dev.piko.ui.platform.LaunchAtStartup
 
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.grid.LazyGridState
 import androidx.compose.material3.ColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Modifier
 import dev.piko.data.auth.AppLanguage
 import dev.piko.shared.i18n.PikoLocale
@@ -36,6 +39,7 @@ import org.jetbrains.skia.ImageInfo
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import dev.piko.desktop.media.PreviewFrameDecoder
 import dev.piko.desktop.ui.player.MediampPlaybackBackend
 import dev.piko.desktop.update.DesktopAppUpdater
 import dev.piko.desktop.winrt.FolderPickResult
@@ -44,15 +48,24 @@ import dev.piko.desktop.winrt.SaveFilePicker
 import dev.piko.desktop.winrt.WinRTSupport
 import dev.piko.desktop.winrt.WindowsExternalPlayer
 import dev.piko.desktop.winrt.WindowsLinkAssociation
+import dev.piko.desktop.winrt.WindowsNetworkKind
+import dev.piko.desktop.winrt.WindowsSystemStatus
 import dev.piko.shared.media.player.PlaybackBackend
+import dev.piko.shared.media.storyboard.StoryboardIdrDecoder
 import dev.piko.ui.LocalPikoServices
 import dev.piko.ui.platform.DownloadLocationPicker
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.runBlocking
 import dev.piko.ui.platform.ExternalVideoPlayer
 import dev.piko.ui.platform.LinkAssociation
 import dev.piko.ui.platform.LocalFileActions
 import dev.piko.ui.platform.PikoPlatform
+import dev.piko.ui.platform.PlayerNetworkType
+import dev.piko.ui.platform.PlayerSystemStatusInfo
 import dev.piko.ui.platform.PlatformToggle
 import dev.piko.ui.platform.DiskSpace
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -77,7 +90,7 @@ import java.net.URI
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import org.openani.mediamp.compose.MediampPlayerSurface
+import dev.piko.desktop.ui.player.PikoMpvVideoSurface
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
 import org.openani.mediamp.MediampPlayer
@@ -156,10 +169,37 @@ class DesktopPikoPlatform(
             return if (picked == null) FontFamily.Default else FontFamily(picked)
         }
 
+    @OptIn(androidx.compose.ui.text.ExperimentalTextApi::class)
+    override fun resolveSubtitleFontFamily(fontName: String): FontFamily? {
+        val trimmed = fontName.trim()
+        if (trimmed.isEmpty()) return null
+        val exists = runCatching {
+            FontMgr.default.matchFamily(trimmed).use { it.count() > 0 }
+        }.getOrDefault(false)
+        return if (exists) FontFamily(trimmed) else null
+    }
+
     override val shortcutModifier: ShortcutModifier = if (isMacOs) ShortcutModifier.Command else ShortcutModifier.Ctrl
 
     override val deviceSummary: String =
         "${System.getProperty("os.name")} ${System.getProperty("os.version")}，${System.getProperty("os.arch")}，Java ${System.getProperty("java.version")}"
+
+    override fun observeSystemStatus(): Flow<PlayerSystemStatusInfo?> {
+        if (!WinRTSupport.isWindows) return emptyFlow()
+        return WindowsSystemStatus.observe().map { snapshot ->
+            PlayerSystemStatusInfo(
+                batteryPercent = snapshot.batteryPercent,
+                isCharging = snapshot.isCharging,
+                networkType = when (snapshot.networkKind) {
+                    WindowsNetworkKind.Wifi -> PlayerNetworkType.Wifi
+                    WindowsNetworkKind.Ethernet -> PlayerNetworkType.Ethernet
+                    WindowsNetworkKind.Cellular -> PlayerNetworkType.Cellular
+                    WindowsNetworkKind.Offline -> PlayerNetworkType.Offline
+                    WindowsNetworkKind.Unknown -> null
+                },
+            )
+        }
+    }
 
     /**
      * 系统的保存框，默认放在下载目录。Windows 上用原生保存框，放在单独的线程上：AWT 的 FileDialog
@@ -218,33 +258,67 @@ class DesktopPikoPlatform(
             val w = skiaBitmap.width
             val h = skiaBitmap.height
             if (w <= 0 || h <= 0) return@runCatching null
-            val info = ImageInfo(w, h, ColorType.BGRA_8888, ColorAlphaType.UNPREMUL)
-            val rawBytes = skiaBitmap.readPixels(info, w * 4, 0, 0) ?: return@runCatching null
-            val argb = IntArray(w * h) { idx ->
-                val o = idx * 4
-                val b = rawBytes[o].toInt() and 0xFF
-                val g = rawBytes[o + 1].toInt() and 0xFF
-                val r = rawBytes[o + 2].toInt() and 0xFF
-                val a = rawBytes[o + 3].toInt() and 0xFF
-                (a shl 24) or (r shl 16) or (g shl 8) or b
-            }
             val radius = BackdropBlurKernel.equivalentRadiusPx(w, h, containerWidthPx, containerHeightPx, targetBlurPx)
-            val blurred = BackdropBlurKernel.blurArgb(argb, w, h, radius)
-            val outBytes = ByteArray(w * h * 4)
-            for (idx in blurred.indices) {
-                val c = blurred[idx]
-                val o = idx * 4
-                outBytes[o] = (c and 0xFF).toByte()
-                outBytes[o + 1] = ((c ushr 8) and 0xFF).toByte()
-                outBytes[o + 2] = ((c ushr 16) and 0xFF).toByte()
-                outBytes[o + 3] = ((c ushr 24) and 0xFF).toByte()
-            }
-            val outBitmap = Bitmap()
-            outBitmap.allocPixels(info)
-            outBitmap.installPixels(info, outBytes, w * 4)
-            outBitmap.setImmutable()
-            outBitmap.asComposeImageBitmap()
+            blurCoilBitmap(skiaBitmap, radius)?.asComposeImageBitmap()
         }.getOrNull()
+    }
+
+    override suspend fun decodeVideoPreviewFrame(bytes: ByteArray, maxWidthPx: Int): ImageBitmap? =
+        PreviewFrameDecoder.decodeFromBytes(bytes, maxWidthPx)
+
+    override suspend fun decodeLocalVideoPreviewFrame(path: String, positionMillis: Long, maxWidthPx: Int): ImageBitmap? =
+        PreviewFrameDecoder.decodeFromLocalFile(path, positionMillis, maxWidthPx)
+
+    override fun createStoryboardIdrDecoder(): StoryboardIdrDecoder? =
+        PreviewFrameDecoder.createPersistentHevcDecoder()
+
+    override fun decodeEncodedImageBitmap(bytes: ByteArray): ImageBitmap? =
+        PreviewFrameDecoder.decodeEncodedImage(bytes)
+
+    @Volatile
+    private var cachedSubtitleFonts: List<String>? = null
+
+    override suspend fun listSubtitleFonts(): List<String> {
+        cachedSubtitleFonts?.let { return it }
+        return withContext(Dispatchers.IO) {
+            cachedSubtitleFonts?.let { return@withContext it }
+            val discovered = runCatching { discoverDesktopSubtitleFonts() }.getOrDefault(emptyList())
+            cachedSubtitleFonts = discovered
+            discovered
+        }
+    }
+
+    override fun blurCoilBitmap(input: Bitmap, radiusPx: Int): Bitmap? {
+        val w = input.width
+        val h = input.height
+        if (w <= 0 || h <= 0) return null
+        val info = ImageInfo(w, h, ColorType.BGRA_8888, ColorAlphaType.UNPREMUL)
+        val rawBytes = input.readPixels(info, w * 4, 0, 0) ?: return null
+        val argb = IntArray(w * h) { idx ->
+            val o = idx * 4
+            val b = rawBytes[o].toInt() and 0xFF
+            val g = rawBytes[o + 1].toInt() and 0xFF
+            val r = rawBytes[o + 2].toInt() and 0xFF
+            val a = rawBytes[o + 3].toInt() and 0xFF
+            (a shl 24) or (r shl 16) or (g shl 8) or b
+        }
+        val blurred = BackdropBlurKernel.blurArgb(argb, w, h, radiusPx)
+        val outBytes = ByteArray(w * h * 4)
+        for (idx in blurred.indices) {
+            val c = blurred[idx]
+            val o = idx * 4
+            outBytes[o] = (c and 0xFF).toByte()
+            outBytes[o + 1] = ((c ushr 8) and 0xFF).toByte()
+            outBytes[o + 2] = ((c ushr 16) and 0xFF).toByte()
+            outBytes[o + 3] = ((c ushr 24) and 0xFF).toByte()
+        }
+        val outBitmap = Bitmap()
+        if (!outBitmap.installPixels(info, outBytes, w * 4)) {
+            outBitmap.close()
+            return null
+        }
+        outBitmap.setImmutable()
+        return outBitmap
     }
 
     override fun readClipboardText(): String? = runCatching {
@@ -306,11 +380,33 @@ class DesktopPikoPlatform(
 
         @Composable
         override fun rememberLauncher(onPicked: (String) -> Unit): () -> Unit {
+            val latestOnPicked by rememberUpdatedState(onPicked)
+            val pick = rememberPickerLauncher { picked -> if (picked != null) latestOnPicked(picked) }
+            return { pick("") }
+        }
+
+        @Composable
+        override fun rememberPickerLauncher(onResult: (String?) -> Unit): (initialPath: String) -> Unit {
             val scope = rememberCoroutineScope()
-            return {
+            val latestOnResult by rememberUpdatedState(onResult)
+            return { initialPath ->
                 val owner = activeWindow()
+                val initial = initialPath.takeIf { it.isNotBlank() }?.let(::File)?.takeIf { it.isDirectory }
+                    ?: settings.downloadDirectory
                 scope.launch {
-                    pickFolder(owner, settings.downloadDirectory, tr("选择下载位置", "Choose download location", "ダウンロード先を選択", "다운로드 위치 선택", "選擇下載位置"))?.let { onPicked(it.absolutePath) }
+                    val picked = try {
+                        pickFolder(
+                            owner,
+                            initial,
+                            tr("选择下载位置", "Choose download location", "ダウンロード先を選択", "다운로드 위치 선택", "選擇下載位置"),
+                        )
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Throwable) {
+                        PikoLog.w("Platform", "Failed to open download folder picker", e)
+                        null
+                    }
+                    latestOnResult(picked?.absolutePath)
                 }
             }
         }
@@ -419,7 +515,7 @@ class DesktopPikoPlatform(
 
         @Composable
         override fun Surface(backend: PreviewBackend, modifier: Modifier) {
-            MediampPlayerSurface((backend as MediampPreviewBackend).inner.player, modifier)
+            PikoMpvVideoSurface((backend as MediampPreviewBackend).inner.player, modifier)
         }
     }
 
@@ -430,9 +526,16 @@ class DesktopPikoPlatform(
         systemBarsVisible: Boolean,
         content: @Composable () -> Unit,
     ) {
-        // 窗口内的一层，Esc 由 dismissOnBackPress 关闭
+        val topInset = dev.piko.ui.platform.LocalDesktopTitleBarInset.current
+        // 窗口内的一层，Esc 由 dismissOnBackPress 关闭；组合期间挂起底层紧凑标题栏拖动区与按钮命中，
+        // 并在外层存在独立标题栏（Windows 非紧凑态或 macOS 红绿灯栏）时让出顶部高度。
         Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
-            Box(Modifier.fillMaxSize()) { content() }
+            dev.piko.ui.platform.ModalCaptionBlocker()
+            androidx.compose.runtime.CompositionLocalProvider(dev.piko.ui.platform.LocalWindowCaption provides null) {
+                Box(Modifier.fillMaxSize().padding(top = topInset)) {
+                    content()
+                }
+            }
         }
     }
 
@@ -504,4 +607,70 @@ private fun desktopPrimaryFontCandidates(
             listOf("Microsoft YaHei UI", "Microsoft YaHei")
         }
     }
+}
+
+private val DESKTOP_PRIORITY_SUBTITLE_FONTS = listOf(
+    "Microsoft YaHei",
+    "Microsoft JhengHei",
+    "PingFang SC",
+    "PingFang TC",
+    "Noto Sans CJK SC",
+    "Noto Sans CJK TC",
+    "Noto Sans SC",
+    "Source Han Sans SC",
+    "Source Han Sans CN",
+    "LXGW WenKai",
+    "LXGW WenKai Screen",
+    "Sarasa Gothic SC",
+    "Sarasa Mono SC",
+    "SimHei",
+    "SimSun",
+    "KaiTi",
+    "FangSong",
+    "Songti SC",
+    "Songti TC",
+    "Hiragino Sans",
+    "Hiragino Mincho ProN",
+    "Yu Gothic",
+    "Malgun Gothic",
+    "Noto Serif CJK SC",
+    "Source Han Serif SC",
+    "Segoe UI",
+    "SF Pro Text",
+    "Arial",
+    "Georgia",
+    "Consolas",
+)
+
+private val DESKTOP_EXCLUDED_SUBTITLE_FONTS = setOf(
+    "marlett",
+    "symbol",
+    "webdings",
+    "wingdings",
+    "wingdings 2",
+    "wingdings 3",
+    "segoe mdl2 assets",
+    "segoe fluent icons",
+    "hololens mdl2 assets",
+    "segoe ui emoji",
+    "segoe ui symbol",
+    "apple color emoji",
+    "noto color emoji",
+)
+
+private fun discoverDesktopSubtitleFonts(): List<String> {
+    val fontMgr = FontMgr.default
+    val seen = LinkedHashMap<String, String>()
+    for (i in 0 until fontMgr.familiesCount) {
+        val raw = fontMgr.getFamilyName(i).trim()
+        if (raw.isEmpty() || raw.startsWith("@") || raw.startsWith(".")) continue
+        val key = raw.lowercase()
+        if (key in DESKTOP_EXCLUDED_SUBTITLE_FONTS) continue
+        if ("emoji" in key || "icon" in key || "wingding" in key || "webding" in key) continue
+        seen.putIfAbsent(key, raw)
+    }
+    val priorityOrder = DESKTOP_PRIORITY_SUBTITLE_FONTS.withIndex().associate { it.value.lowercase() to it.index }
+    return seen.values.sortedWith(
+        compareBy<String>({ priorityOrder[it.lowercase()] ?: Int.MAX_VALUE }, { it.lowercase() }),
+    )
 }

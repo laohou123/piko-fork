@@ -104,11 +104,15 @@ jobs:
           )
           global_patterns = (
               "gradle/*", "gradle/**", "gradlew*", "build.gradle.kts", "settings.gradle.kts",
+              "build-logic/*", "build-logic/**", "compose-stability.conf",
               "gradle.properties", ".github/workflows/test.yml",
           )
 
           def matches(path, patterns):
               return any(fnmatch.fnmatch(path, pat) for pat in patterns)
+
+          def is_ui_platform_src(path, source_set):
+              return path.startswith(f"ui/src/{source_set}/") or fnmatch.fnmatch(path, f"ui-*/src/{source_set}/*") or fnmatch.fnmatch(path, f"ui-*/src/{source_set}/**")
 
           flags = {k: False for k in ("jvm", "desktop_unit", "macos_keychain", "ios", "android")}
           for f in files:
@@ -118,9 +122,9 @@ jobs:
                   for k in flags:
                       flags[k] = True
                   break
-              if f.startswith(("iosApp/", "shared/src/iosMain/", "shared/src/nativeInterop/", "ui/src/iosMain/")) or f == ".github/workflows/ios-native.yml":
+              if f.startswith(("iosApp/", "shared/src/iosMain/", "shared/src/nativeInterop/")) or is_ui_platform_src(f, "iosMain") or f == ".github/workflows/ios-native.yml":
                   flags["ios"] = True
-              elif f.startswith(("app/", "shared/src/androidMain/", "ui/src/androidMain/")):
+              elif f.startswith(("app/", "shared/src/androidMain/")) or is_ui_platform_src(f, "androidMain"):
                   flags["android"] = True
               elif f.startswith("desktopApp/"):
                   flags["jvm"] = True
@@ -129,10 +133,10 @@ jobs:
                   flags["jvm"] = True
                   flags["desktop_unit"] = True
                   flags["macos_keychain"] = True
-              elif f.startswith("ui/src/desktopMain/") or f.startswith(("cli/", "shots/")):
+              elif is_ui_platform_src(f, "desktopMain") or f.startswith(("cli/", "shots/")):
                   flags["jvm"] = True
                   flags["desktop_unit"] = True
-              elif f.startswith("shared/src/jvmSharedMain/"):
+              elif f.startswith("shared/src/jvmSharedMain/") or is_ui_platform_src(f, "jvmSharedMain"):
                   flags["jvm"] = True
                   flags["desktop_unit"] = True
                   flags["macos_keychain"] = True
@@ -176,7 +180,11 @@ jobs:
       - uses: gradle/actions/setup-gradle@v5
 
       - name: Shared smoke tests
-        run: ./gradlew :shared:desktopTest :ui:desktopTest --no-daemon --stacktrace
+        run: >-
+          ./gradlew :shared:desktopTest
+          :ui-core:desktopTest :ui-drive:desktopTest :ui-player:desktopTest
+          :ui-settings:desktopTest :ui-transfers:desktopTest :ui-reader:desktopTest :ui:desktopTest
+          --no-daemon --stacktrace
 
       - name: Upload test reports
         if: failure()
@@ -185,6 +193,12 @@ jobs:
           name: jvm-smoke-reports
           path: |
             shared/build/reports/tests/
+            ui-core/build/reports/tests/
+            ui-drive/build/reports/tests/
+            ui-player/build/reports/tests/
+            ui-settings/build/reports/tests/
+            ui-transfers/build/reports/tests/
+            ui-reader/build/reports/tests/
             ui/build/reports/tests/
           if-no-files-found: ignore
 
@@ -321,16 +335,12 @@ jobs:
           path: app/build/reports/tests
           retention-days: 7
 
-  android:
-    # 模拟器是 x86_64，验证的是 libmpv 的 x86_64 .so；arm64 与 x86_64 出自同一套构建脚本，
-    # 打包或格式覆盖出问题时两者一起坏，差异只在机型硬解，这部分 CI 本来就测不到。
+  android-apks:
+    # 单次编译主 APK 与测试 APK，供下方多版本 Android 模拟器矩阵（API 26 / 29 / 34）并行下载复测，避免重复编译。
     needs: [changes]
     if: needs.changes.outputs.android == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
-    env:
-      # 34 覆盖前台服务类型、后台启动限制等新平台行为
-      API_LEVEL: 34
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
 
@@ -352,15 +362,54 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v5
 
+      - name: Build test APKs
+        run: ./gradlew :app:assembleDebug :app:assembleDebugAndroidTest -Ppiko.enableAbiSplits=false --no-daemon --stacktrace
+
+      - name: Upload test APKs
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-test-apks
+          path: |
+            app/build/outputs/apk/debug/*.apk
+            app/build/outputs/apk/androidTest/debug/*.apk
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+
+  android:
+    name: android (API ${{ matrix.api }}, ${{ matrix.suite }})
+    # 模拟器是 x86_64，并行覆盖三个关键 Android 分水岭：
+    # - API 26 (Android 8.0): minSdk 底线 + SQLite 3.18 + 旧 CursorWindow 分支；
+    # - API 29 (Android 10): SQLite 3.22 + Api28SqliteWindow 256 KiB/4 MiB 池化交叉雷区；
+    # - API 34 (Android 14): 完整冒烟（libmpv、回环代理、前台服务类型、通知权限与 SQLite 索引）。
+    needs: [android-apks]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - api: 26
+            suite: compat
+            instrument_args: '-e class dev.piko.smoke.AndroidSqliteTreeIndexSmokeTest,dev.piko.smoke.AndroidPlatformCompatSmokeTest'
+          - api: 29
+            suite: compat
+            instrument_args: '-e class dev.piko.smoke.AndroidSqliteTreeIndexSmokeTest,dev.piko.smoke.AndroidPlatformCompatSmokeTest'
+          - api: 34
+            suite: full
+            instrument_args: ''
+    steps:
+      - name: Download test APKs
+        uses: actions/download-artifact@v7
+        with:
+          name: android-test-apks
+          path: apks
+
       - name: Enable KVM
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
-
-      - name: Build test APKs
-        # 先在模拟器外编好，模拟器启动的那段时间不被 Gradle 占着
-        run: ./gradlew :app:assembleDebug :app:assembleDebugAndroidTest -Ppiko.enableAbiSplits=false --no-daemon --stacktrace
 
       - name: AVD cache
         uses: actions/cache@v5
@@ -369,39 +418,79 @@ jobs:
           path: |
             ~/.android/avd/*
             ~/.android/adb*
-          key: avd-${{ env.API_LEVEL }}-x86_64-v1
+          key: avd-${{ matrix.api }}-x86_64-v1
 
       - name: Create AVD snapshot
         if: steps.avd-cache.outputs.cache-hit != 'true'
         uses: reactivecircus/android-emulator-runner@v2
         with:
-          api-level: ${{ env.API_LEVEL }}
+          api-level: ${{ matrix.api }}
           arch: x86_64
           target: default
           force-avd-creation: false
-          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          emulator-options: -no-metrics -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: false
-          script: echo "AVD snapshot created"
+          script: echo "AVD snapshot created"; pkill -9 -f crashpad_handler 2>/dev/null || true
 
-      - name: Instrumented smoke tests
+      - name: Prepare instrumentation runner script
+        shell: bash
+        run: |
+          cat <<'EOF' > run-instrument.sh
+          #!/usr/bin/env bash
+          set -euo pipefail
+          # Android 模拟器退出后 crashpad_handler 常残留并占住 stdout/stderr 管道，导致 runner 无限挂起；
+          # Linux /proc/<pid>/comm 上限 15 字符（crashpad_handler 为 16 字符），pkill 必须带 -f 匹配完整命令行
+          trap 'pkill -9 -f crashpad_handler 2>/dev/null || true' EXIT
+          mkdir -p test-logs
+          APP_APK="$(find apks -name '*debug.apk' ! -name '*androidTest*' | head -n 1)"
+          TEST_APK="$(find apks -name '*androidTest*.apk' | head -n 1)"
+          test -f "$APP_APK"
+          test -f "$TEST_APK"
+          # 缓存 AVD 里可能残留上一次 CI 临时 debug.keystore 签名的旧包，先卸载避免 INSTALL_FAILED_UPDATE_INCOMPATIBLE
+          adb uninstall dev.piko.debug || true
+          adb uninstall dev.piko.debug.test || true
+          adb install -r -t "$APP_APK"
+          adb install -r -t "$TEST_APK"
+          adb logcat -c || true
+          set +e
+          adb shell am instrument -w -r ${INSTRUMENT_ARGS:-} dev.piko.debug.test/androidx.test.runner.AndroidJUnitRunner | tee test-logs/instrument.log
+          STATUS=${PIPESTATUS[0]}
+          set -e
+          adb logcat -d -s AndroidSqliteSmoke:I AndroidRuntime:E SQLiteLog:E > test-logs/logcat.log || true
+          if [ "$STATUS" -ne 0 ]; then
+            echo "Instrumentation exited with status $STATUS"
+            exit "$STATUS"
+          fi
+          if grep -qE "FAILURES!!!|INSTRUMENTATION_FAILED|Process crashed|SHORTMSG=Process crashed|OK \(0 tests\)" test-logs/instrument.log; then
+            echo "Instrumentation reported failures or zero tests"
+            exit 1
+          fi
+          if ! grep -qE "OK \([1-9][0-9]* tests?\)" test-logs/instrument.log; then
+            echo "Instrumentation did not report passing test summary"
+            exit 1
+          fi
+          EOF
+          chmod +x run-instrument.sh
+
+      - name: Instrumented tests (API ${{ matrix.api }} - ${{ matrix.suite }})
+        env:
+          INSTRUMENT_ARGS: ${{ matrix.instrument_args }}
         uses: reactivecircus/android-emulator-runner@v2
         with:
-          api-level: ${{ env.API_LEVEL }}
+          api-level: ${{ matrix.api }}
           arch: x86_64
           target: default
           force-avd-creation: false
-          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          emulator-options: -no-metrics -no-snapshot -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
           disable-animations: true
-          script: ./gradlew :app:connectedDebugAndroidTest -Ppiko.enableAbiSplits=false --no-daemon --stacktrace
+          script: bash run-instrument.sh
 
       - name: Upload test reports
         if: failure()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
-          name: android-smoke-reports-api${{ env.API_LEVEL }}
-          path: |
-            app/build/reports/androidTests/
-            app/build/outputs/androidTest-results/
+          name: android-smoke-reports-api${{ matrix.api }}
+          path: test-logs/
           if-no-files-found: ignore
 
   # 全新安装与应用内更新：同一份源码打两个版本（9.9.0 与 9.9.1），装旧的、让它自己更新成新的，
@@ -453,7 +542,10 @@ jobs:
           $bases = "$env:RUNNER_TEMP/smoke-bases"
           foreach ($version in @('9.9.0', '9.9.1')) {
             $extra = @(if ($version -eq '9.9.1') { "-PpikoUpdateBases=$bases" })
-            .\gradlew.bat :desktopApp:packageReleaseMsi :desktopApp:packageReleaseUpdate --no-daemon --stacktrace `
+            .\gradlew.bat :desktopApp:packageReleaseMsi :desktopApp:packageReleaseUpdate --no-daemon --no-configuration-cache --no-parallel --stacktrace `
+              '-DGRADLE_ACTIONS_SKIP_BUILD_RESULT_CAPTURE=true' `
+              '-Dorg.gradle.jvmargs=-Xmx2560m -XX:MaxMetaspaceSize=768m -XX:+UseParallelGC -Dfile.encoding=UTF-8' `
+              '-Dkotlin.daemon.jvmargs=-Xmx2048m -XX:MaxMetaspaceSize=768m -XX:+UseParallelGC' `
               "-PpikoDesktopVersion=$version" "-PpikoDesktopUpgradeUuid=$env:SMOKE_UPGRADE_CODE" "-PpikoDesktopPackageName=$env:SMOKE_PACKAGE" @extra
             if ($LASTEXITCODE -ne 0) { throw "build $version failed" }
             $out = "smoke-dist/$version"
@@ -553,7 +645,10 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          .\gradlew.bat :desktopApp:packageReleaseMsi :desktopApp:packageReleaseUpdate --no-daemon --stacktrace `
+          .\gradlew.bat :desktopApp:packageReleaseMsi :desktopApp:packageReleaseUpdate --no-daemon --no-configuration-cache --no-parallel --stacktrace `
+            '-DGRADLE_ACTIONS_SKIP_BUILD_RESULT_CAPTURE=true' `
+            '-Dorg.gradle.jvmargs=-Xmx2560m -XX:MaxMetaspaceSize=768m -XX:+UseParallelGC -Dfile.encoding=UTF-8' `
+            '-Dkotlin.daemon.jvmargs=-Xmx2048m -XX:MaxMetaspaceSize=768m -XX:+UseParallelGC' `
             "-PpikoDesktopVersion=9.9.1" "-PpikoUpdateBases=old-bases" "-PpikoUpdateRetired=old-retired"
           if ($LASTEXITCODE -ne 0) { throw 'build failed' }
           $binaries = 'desktopApp/build/compose/binaries/main-release'
@@ -664,7 +759,7 @@ jobs:
         run: |
           set -euo pipefail
           for version in 9.9.0 9.9.1; do
-            ./gradlew :desktopApp:packageReleaseDmg --no-daemon --stacktrace \
+            ./gradlew :desktopApp:packageReleaseDmg --no-daemon --no-configuration-cache --stacktrace \
               "-PpikoDesktopVersion=$version" "-PpikoDesktopPackageName=$SMOKE_PACKAGE"
             mkdir -p "smoke-dist/$version"
             # 按版本号取：上一轮的 DMG 可能还留在同一个目录里
@@ -719,7 +814,7 @@ jobs:
         run: |
           set -euo pipefail
           for version in 9.9.0 9.9.1; do
-            xvfb-run -a ./gradlew :desktopApp:packageReleaseAppImage --no-daemon --stacktrace "-PpikoDesktopVersion=$version"
+            xvfb-run -a ./gradlew :desktopApp:packageReleaseAppImage --no-daemon --no-configuration-cache --stacktrace "-PpikoDesktopVersion=$version"
             mkdir -p "smoke-dist/$version"
             cp desktopApp/build/compose/binaries/main-release/appimage/piko-linux-x64-"$version".AppImage* "smoke-dist/$version/"
           done

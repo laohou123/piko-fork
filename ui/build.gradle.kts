@@ -1,116 +1,60 @@
 plugins {
-    alias(libs.plugins.kotlin.multiplatform)
-    alias(libs.plugins.kotlin.compose)
-    alias(libs.plugins.kotlin.serialization)
-    alias(libs.plugins.compose)
-    alias(libs.plugins.android.kotlin.multiplatform.library)
+    id("piko.kmp.ui")
 }
 
-compose.resources {
-    generateResClass = always
-    publicResClass = true
-    packageOfResClass = "dev.piko.ui.resources"
-}
+val enableAndroid: Boolean = providers.gradleProperty("piko.enableAndroid").map { it.toBoolean() }.orNull
+    ?: providers.gradleProperty("piko.desktopOnly").map { !it.toBoolean() }.orNull
+    ?: (
+        providers.environmentVariable("CI").orNull.equals("true", ignoreCase = true) ||
+            providers.gradleProperty("android.injected.invoked.from.ide").orNull.equals("true", ignoreCase = true) ||
+            gradle.startParameter.taskNames.any {
+                it.startsWith(":app:") || it == ":app" ||
+                    it.contains("Android", ignoreCase = true) ||
+                    it.contains("Debug", ignoreCase = true) ||
+                    it.contains("assembleRelease", ignoreCase = true) ||
+                    it.contains("bundleRelease", ignoreCase = true)
+            }
+        )
+val enableIosTargets = providers.gradleProperty("piko.enableIos")
+    .map { it.toBoolean() }
+    .orElse(providers.systemProperty("os.name").map { it.startsWith("Mac", ignoreCase = true) })
+    .get()
 
-// 两端共用的 Material 3 Expressive 界面。与 shared 分开：shared 只放状态与业务，
-// 冒烟测试编译它时不必带上整套 material3 与图标库。
+// 共享界面的聚合入口与工作台外壳；领域界面按职责拆分至 :ui-core 与五个并行叶模块。
+// iOS 静态框架 PikoKit 仍由本模块导出，Xcode 工程配置保持不变。
 kotlin {
-    android {
-        namespace = "dev.piko.ui"
-        compileSdk {
-            version = release(37) { minorApiLevel = 1 }
-        }
-        minSdk = 26
-        androidResources {
-            enable = true
-        }
-    }
-    jvm("desktop")
-    listOf(iosArm64(), iosSimulatorArm64()).forEach { target ->
-        target.binaries.configureEach {
-            freeCompilerArgs += "-Xoverride-konan-properties=minVersion.ios=15.0"
-        }
-        target.binaries.framework {
-            baseName = "PikoKit"
-            isStatic = true
+    if (enableIosTargets) {
+        listOf(iosArm64(), iosSimulatorArm64()).forEach { target ->
+            target.binaries.framework {
+                baseName = "PikoKit"
+                isStatic = true
+            }
         }
     }
 
     sourceSets {
-        all {
-            // BackHandler 在 CMP 里仍标着实验性，两端的返回（系统手势与 Esc）都靠它
-            languageSettings.optIn("androidx.compose.ui.ExperimentalComposeUiApi")
-            // 桌面端的 material3 停在 1.12.0-alpha03，其中不少 API 仍标着实验性，而 Android 端
-            // 的 BOM 版本里已经转正；在模块级统一选择加入，免得同一行代码两端要求不同
-            languageSettings.optIn("androidx.compose.material3.ExperimentalMaterial3Api")
-            languageSettings.optIn("androidx.compose.material3.ExperimentalMaterial3ExpressiveApi")
-        }
         commonMain.dependencies {
-            api(libs.cmp.components.resources)
-            api(project(":shared"))
-            api(libs.cmp.runtime)
-            api(libs.cmp.foundation)
-            api(libs.cmp.ui)
-            api(libs.cmp.material3)
-            // 桌面端由 Esc 触发返回，Android 端接系统返回手势
-            implementation(libs.cmp.ui.backhandler)
+            api(project(":ui-core"))
+            implementation(project(":ui-drive"))
+            implementation(project(":ui-player"))
+            implementation(project(":ui-settings"))
+            implementation(project(":ui-transfers"))
+            implementation(project(":ui-reader"))
             implementation(libs.cmp.material3.adaptive.navigation.suite)
-            implementation(libs.cmp.adaptive)
-            // 返回栈的呈现（NavDisplay）与宽窗口的列表加详情两栏
             implementation(libs.cmp.navigation3.ui)
             implementation(libs.cmp.adaptive.navigation3)
-            implementation(libs.cmp.material.icons.extended)
-            // 导出日志的文件名与抬头要本地时间
-            implementation(libs.kotlinx.datetime)
-            // Screen 继承 NavKey，Android 入口把播放器页交进来时要看得到它
             api(libs.androidx.navigation3.runtime)
-            implementation(libs.androidx.lifecycle.runtime.compose)
-            implementation(libs.androidx.lifecycle.viewmodel.compose)
-            implementation(libs.coil.compose)
-            implementation(libs.zoomimage.compose.coil3)
-            implementation(libs.kotlinx.coroutines.core)
-            implementation(libs.kotlinx.serialization.json)
-            // 海报墙刮削源与字幕源共用的 HTTP 客户端工厂返回 io.ktor.client.HttpClient，
-            // 签名在 ui 模块里就要看得到（引擎本身在各端入口建）
-            implementation(libs.ktor.client.core)
         }
-        commonTest.dependencies {
-            implementation(kotlin("test"))
-        }
-        // Native 不使用 JVM ServiceLoader/OkHttp，显式装配 Ktor 3 fetcher。
-        iosMain.dependencies {
-            implementation(libs.ktor.client.core)
-            implementation(libs.coil.network.ktor3)
-        }
-        // CMP 的 material3 在 Android 上重定向到 androidx 的构件，版本比 app 用的 BOM 旧；
-        // 这里对齐到同一份 BOM，ui 模块编译时看到的就是 app 运行时的那套 API
-        androidMain.dependencies {
-            // Coil 的 OkHttp 网络引擎（Android 入口注册），封面从 MetaTube 取图靠它。
-            // 只放 JVM 侧：这个构件没有 iOS 变体，放进 commonMain 会让 apple 目标解析失败
-            implementation(libs.coil.network.okhttp)
-            implementation(project.dependencies.platform(libs.androidx.compose.bom))
-            implementation(libs.androidx.navigation3.ui)
-            implementation(libs.androidx.adaptive.navigation3)
-        }
-        val desktopMain by getting {
-            dependencies {
-                implementation(libs.coil.network.okhttp)
+        if (enableIosTargets) {
+            iosMain.dependencies {
+                implementation(libs.ktor.client.core)
+                implementation(libs.coil.network.ktor3)
             }
         }
-        // 只测纯函数的规则（命令栏显隐这类 internal 的），界面行为的测试在 desktopApp
-        val desktopTest by getting {
-            dependencies {
-                implementation(kotlin("test"))
-                // Official resource lookup reads the desktop theme through Skiko.
-                val hostOs = System.getProperty("os.name").let {
-                    when {
-                        it.startsWith("Windows") -> "windows"
-                        it.startsWith("Mac") -> "macos"
-                        else -> "linux"
-                    }
-                }
-                val hostArch = if (System.getProperty("os.arch") == "aarch64") "arm64" else "x64"
-                runtimeOnly("org.jetbrains.compose.desktop:desktop-jvm-$hostOs-$hostArch:${libs.versions.composeMultiplatform.get()}")
+        if (enableAndroid) {
+            getByName("androidMain").dependencies {
+                implementation(libs.androidx.navigation3.ui)
+                implementation(libs.androidx.adaptive.navigation3)
             }
         }
     }

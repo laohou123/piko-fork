@@ -24,13 +24,26 @@ internal fun useBundledJnaDispatch() {
 }
 
 /**
+ * sqlite-jdbc 默认每次启动都在 tmpdir 下释放带随机 UUID 的 `sqlite-<ver>-<uuid>-sqlitejdbc.dll` 并写 `.lck` 后载入。
+ * 安装包在构建期从 sqlite-jdbc jar 预提取随包 `sqlite/` 目录里的同一份 DLL，启动时指向该目录免去运行期释放。
+ * 必须在首次加载 `org.sqlite.JDBC` 之前设置；资源目录里没有时（开发版、测试）沿用原有提取逻辑。
+ */
+internal fun useBundledSqlite() {
+    val dir = bundledResources?.resolve("sqlite") ?: return
+    val libName = System.mapLibraryName("sqlitejdbc")
+    if (!dir.resolve(libName).isFile) return
+    System.setProperty("org.sqlite.lib.path", dir.absolutePath)
+    System.setProperty("org.sqlite.lib.name", libName)
+}
+
+/**
  * 安装包把 mpv 与 FFmpeg 的原生库放在资源目录的 mpv 子目录里，指给 mediamp，免得它把库从 jar 解压到新的临时目录。
  *
  * 指过去时 mediamp 会校验并加载封装层，连带 mpv 与 FFmpeg 一串依赖，实测约 100 至 150 毫秒，所以启动时放后台线程做，
  * 不挡首帧；建播放器之前再经 [ensure] 等它做完。不等的话，后台还没做完时建出的播放器找不到运行库：
  * 安装包的类路径里没有 mpv 运行库的 jar，mediamp 退不到解压那条路，直接报错。
  */
-internal object BundledMpvRuntime {
+object BundledMpvRuntime {
     private val started = AtomicBoolean(false)
     private val done = CountDownLatch(1)
 
@@ -46,6 +59,8 @@ internal object BundledMpvRuntime {
     }
 
     private fun prepare() {
+        // 赶在 libmediampv / libmpv / libavutil 加载前预载宿主 libva，避免与随包旧版 libva 产生 VA-API 驱动 ABI 冲突
+        LinuxDesktop.preloadHostLibva()
         val dir = bundledResources?.resolve("mpv") ?: return
         // Windows 上是 mediampv.dll，macOS 上是 libmediampv.dylib，Linux 上是 libmediampv.so
         if (!dir.resolve(System.mapLibraryName("mediampv")).isFile) return

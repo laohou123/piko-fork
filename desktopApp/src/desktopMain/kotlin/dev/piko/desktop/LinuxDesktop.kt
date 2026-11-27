@@ -6,9 +6,16 @@ import dev.piko.shared.log.PikoLog
 import java.awt.SystemTray
 import java.awt.Toolkit
 import java.io.File
+import java.lang.foreign.Arena
+import java.lang.foreign.FunctionDescriptor
+import java.lang.foreign.Linker
+import java.lang.foreign.SymbolLookup
+import java.lang.foreign.ValueLayout.ADDRESS
+import java.lang.foreign.ValueLayout.JAVA_INT
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import org.jetbrains.skia.FontMgr
 
 internal val isLinux: Boolean = System.getProperty("os.name").startsWith("Linux")
@@ -43,6 +50,62 @@ internal object LinuxDesktop {
      * 静态字段，要 --add-opens java.desktop/sun.awt.X11（见 build.gradle.kts 的 linuxJvmArgs）。
      * 在建任何窗口之前调；XToolkit 在首次取 Toolkit 时初始化，之后再改才不会被它盖回去。
      */
+    /**
+     * WSLg（存在 `/dev/dxg` 虚拟 GPU 设备）默认未设置 `GALLIUM_DRIVER` 时，Mesa GLX 会回退到 `llvmpipe`，
+     * 进而被 Skiko 拒绝并降级为软件渲染。在 AWT/Skiko 加载 `libGL` 之前经 POSIX `setenv` 注入 `d3d12`
+     *（`overwrite = 0` 不覆盖用户显式配置），使开发运行与安装包在 WSLg 下开箱即走硬件 OpenGL。
+     */
+    fun enableWslgHardwareOpenGl() {
+        if (!File("/dev/dxg").exists()) return
+        if (!System.getenv("GALLIUM_DRIVER").isNullOrBlank()) return
+        if (!System.getenv("LIBGL_ALWAYS_SOFTWARE").isNullOrBlank()) return
+        runCatching {
+            val linker = Linker.nativeLinker()
+            val setenv = linker.defaultLookup().find("setenv").orElse(null) ?: return
+            val handle = linker.downcallHandle(
+                setenv,
+                FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT),
+            )
+            Arena.ofConfined().use { arena ->
+                val key = arena.allocateFrom("GALLIUM_DRIVER")
+                val value = arena.allocateFrom("d3d12")
+                handle.invokeExact(key, value, 0) as Int
+            }
+        }
+    }
+
+    private val hostLibvaLock = Any()
+
+    @Volatile
+    private var hostLibvaPreloaded = false
+
+    /**
+     * 优先将宿主系统的 libva 载入进程链接表：mediamp-mpv-runtime-linux-x64 随包附带 Ubuntu 24.04 构建的
+     * `libva.so.2` / `libva-drm.so.2` / `libva-x11.so.2`，而宿主机 `/usr/lib/.../dri/` 下的驱动模块
+     * 由宿主机较新版 libva 编译；若先加载随包旧版 libva 会引发 `__vaDriverInit_1_0` ABI 失配导致
+     * VA-API 硬解全部失效（issue #60）。glibc `ld.so` 解析 `DT_NEEDED` 时先按 SONAME 复用已加载库
+     * （优先于 `$ORIGIN` RUNPATH），同时保留 `mpv/` 内随包副本作为最小化系统或无 `libva-x11` 环境下的
+     * 兜底回退，避免 `libmpv.so.2` 无法加载。
+     */
+    fun preloadHostLibva() {
+        if (!isLinux || hostLibvaPreloaded) return
+        synchronized(hostLibvaLock) {
+            if (hostLibvaPreloaded) return
+            val loaded = mutableListOf<String>()
+            for (soname in listOf("libva.so.2", "libva-drm.so.2", "libva-x11.so.2", "libva-wayland.so.2")) {
+                val ok = runCatching {
+                    SymbolLookup.libraryLookup(soname, Arena.global())
+                    true
+                }.getOrDefault(false)
+                if (ok) loaded += soname
+            }
+            hostLibvaPreloaded = true
+            if (loaded.isNotEmpty()) {
+                PikoLog.i(TAG, "Preloaded host VA-API libraries: ${loaded.joinToString()}")
+            }
+        }
+    }
+
     fun setWmClass() {
         runCatching {
             val toolkit = Toolkit.getDefaultToolkit()

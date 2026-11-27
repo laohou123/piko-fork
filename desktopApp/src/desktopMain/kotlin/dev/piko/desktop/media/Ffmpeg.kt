@@ -48,16 +48,19 @@ internal class Ffmpeg private constructor(avutil: SymbolLookup, avcodec: SymbolL
     val sideDataGet = avcodec.function("av_packet_side_data_get", FunctionDescriptor.of(ADDRESS, ADDRESS, JAVA_INT, JAVA_INT))
     val frameAlloc = avutil.function("av_frame_alloc", FunctionDescriptor.of(ADDRESS))
     val frameFree = avutil.function("av_frame_free", FunctionDescriptor.ofVoid(ADDRESS))
+    val frameUnref = avutil.function("av_frame_unref", FunctionDescriptor.ofVoid(ADDRESS))
     val decoderAlloc = avcodec.function("avcodec_alloc_context3", FunctionDescriptor.of(ADDRESS, ADDRESS))
     val decoderFree = avcodec.function("avcodec_free_context", FunctionDescriptor.ofVoid(ADDRESS))
     val parametersToContext = avcodec.function("avcodec_parameters_to_context", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS))
     val decoderOpen = avcodec.function("avcodec_open2", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS))
+    val flushBuffers = avcodec.function("avcodec_flush_buffers", FunctionDescriptor.ofVoid(ADDRESS))
     val sendPacket = avcodec.function("avcodec_send_packet", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS))
     val receiveFrame = avcodec.function("avcodec_receive_frame", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS))
 
     val packetAlloc = avcodec.function("av_packet_alloc", FunctionDescriptor.of(ADDRESS))
     val packetFree = avcodec.function("av_packet_free", FunctionDescriptor.ofVoid(ADDRESS))
     val packetUnref = avcodec.function("av_packet_unref", FunctionDescriptor.ofVoid(ADDRESS))
+    val packetNew = avcodec.function("av_new_packet", FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT))
     val parametersCopy = avcodec.function("avcodec_parameters_copy", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS))
 
     val allocContext = avformat.function("avformat_alloc_context", FunctionDescriptor.of(ADDRESS))
@@ -135,7 +138,11 @@ internal class Ffmpeg private constructor(avutil: SymbolLookup, avcodec: SymbolL
             val files = names.map { name ->
                 directory.resolve(name).takeIf { it.isFile } ?: throw FfmpegException("FFmpeg library not found: $name")
             }
-            if (os.startsWith("Windows")) files.forEach(WindowsDllLoader::load)
+            if (os.startsWith("Windows")) {
+                files.forEach(WindowsDllLoader::load)
+            } else if (!os.startsWith("Mac")) {
+                dev.piko.desktop.LinuxDesktop.preloadHostLibva()
+            }
             val (avutil, avcodec, avformat, swscale) = files.map { SymbolLookup.libraryLookup(it.toPath(), Arena.global()) }
             return Ffmpeg(avutil, avcodec, avformat, swscale)
         }
@@ -156,13 +163,16 @@ internal class Ffmpeg private constructor(avutil: SymbolLookup, avcodec: SymbolL
 internal class FfmpegException(message: String, cause: Throwable? = null) : Exception(message, cause)
 
 /**
- * Windows 上按完整路径载入 DLL 时，系统只在程序目录、系统目录与 PATH 里找它的依赖，不找它所在的目录；
+ * Windows 上按完整路径载入 DLL 时，系统默认只在程序目录、系统目录与 PATH 里找它的依赖，不找它所在的目录；
  * avformat 依赖同目录的 avcodec、zlib 等，SymbolLookup.libraryLookup 直接载会报找不到模块。
- * 先以 LOAD_WITH_ALTERED_SEARCH_PATH 载一次，依赖就从 DLL 所在目录找；之后 libraryLookup 拿到的是已载入的同一个模块。
+ * 先以 LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32 载一次，把依赖搜索限定在 DLL 所在目录与
+ * System32（同时避免从未知当前目录或 PATH 查找）；之后 libraryLookup 拿到的是已载入的同一个模块。
  * 不靠 mediamp 设的 SetDllDirectoryW：转封装可能先于播放器用到这些库，测试进程里也没有它。
  */
 private object WindowsDllLoader {
-    private const val LOAD_WITH_ALTERED_SEARCH_PATH = 0x00000008
+    private const val LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR = 0x00000100
+    private const val LOAD_LIBRARY_SEARCH_SYSTEM32 = 0x00000800
+    private const val LOAD_FLAGS = LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR or LOAD_LIBRARY_SEARCH_SYSTEM32
     private val callStateLayout = Linker.Option.captureStateLayout()
     private val lastErrorOffset = callStateLayout.byteOffset(MemoryLayout.PathElement.groupElement("GetLastError"))
 
@@ -178,10 +188,10 @@ private object WindowsDllLoader {
     fun load(file: File) {
         Arena.ofConfined().use { arena ->
             val capturedState = arena.allocate(callStateLayout)
-            val path = file.absolutePath + "\u0000"
+            val path = file.canonicalFile.absolutePath + "\u0000"
             val wide = arena.allocate(path.length * 2L)
             path.forEachIndexed { index, char -> wide.setAtIndex(JAVA_CHAR, index.toLong(), char) }
-            val module = loadLibraryEx.invokeWithArguments(capturedState, wide, MemorySegment.NULL, LOAD_WITH_ALTERED_SEARCH_PATH) as MemorySegment
+            val module = loadLibraryEx.invokeWithArguments(capturedState, wide, MemorySegment.NULL, LOAD_FLAGS) as MemorySegment
             if (module == MemorySegment.NULL) {
                 val lastError = capturedState.get(JAVA_INT, lastErrorOffset)
                 throw FfmpegException("Failed to load ${file.name} (Win32 error $lastError)")
@@ -216,15 +226,32 @@ internal object FfmpegLayout {
     const val PAR_NB_SIDE_DATA = 40L
     const val PAR_WIDTH = 72L
     const val PAR_HEIGHT = 76L
+    const val PAR_CH_LAYOUT_NB_CHANNELS = 132L
+    const val PAR_SAMPLE_RATE = 152L
     const val PAR_SIZE = 12L
     const val PAR_VIDEO_PREFIX_SIZE = 80L
+    const val PAR_AUDIO_PREFIX_SIZE = 160L
 
     // AVFrame：只映射解码帧的公开前缀，不自行分配结构体。
+    const val FRAME_DATA = 0L
     const val FRAME_LINESIZE = 64L
+    const val FRAME_EXTENDED_DATA = 96L
     const val FRAME_WIDTH = 104L
     const val FRAME_HEIGHT = 108L
+    const val FRAME_NB_SAMPLES = 112L
     const val FRAME_FORMAT = 116L
     const val FRAME_PREFIX_SIZE = 120L
+
+    const val AV_SAMPLE_FMT_U8 = 0
+    const val AV_SAMPLE_FMT_S16 = 1
+    const val AV_SAMPLE_FMT_S32 = 2
+    const val AV_SAMPLE_FMT_FLT = 3
+    const val AV_SAMPLE_FMT_DBL = 4
+    const val AV_SAMPLE_FMT_U8P = 5
+    const val AV_SAMPLE_FMT_S16P = 6
+    const val AV_SAMPLE_FMT_S32P = 7
+    const val AV_SAMPLE_FMT_FLTP = 8
+    const val AV_SAMPLE_FMT_DBLP = 9
 
     // AVPacketSideData
     const val SIDE_DATA_BYTES = 0L
@@ -237,6 +264,8 @@ internal object FfmpegLayout {
     // AVPacket
     const val PACKET_PTS = 8L
     const val PACKET_DTS = 16L
+    const val PACKET_DATA = 24L
+    const val PACKET_DATA_SIZE = 32L
     const val PACKET_STREAM_INDEX = 36L
     const val PACKET_FLAGS = 40L
     const val PACKET_DURATION = 64L
@@ -249,6 +278,7 @@ internal object FfmpegLayout {
 
     const val AVMEDIA_TYPE_VIDEO = 0
     const val AVMEDIA_TYPE_AUDIO = 1
+    const val AV_CODEC_ID_H264 = 27
     const val AV_CODEC_ID_HEVC = 173
     const val AV_DISPOSITION_ATTACHED_PIC = 0x400
     const val AV_PKT_FLAG_KEY = 1

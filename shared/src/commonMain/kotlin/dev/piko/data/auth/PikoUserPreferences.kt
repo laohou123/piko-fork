@@ -1,8 +1,16 @@
 package dev.piko.data.auth
 
+import dev.piko.shared.data.DriveAppearancePrefs
+import dev.piko.shared.media.player.PlayerLayoutPrefs
+import dev.piko.shared.media.player.SubtitleStylePrefs
 import dev.piko.shared.net.ProxySetting
+import dev.piko.shared.sync.PortableDigest
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flowOf
+
+/** 将账号标识映射为固定长度的十六进制存储槽位键，避免特殊字符并隐去手机号或邮箱明文。 */
+fun accountPreferenceKey(account: String): String =
+    PortableDigest.sha256(account.encodeToByteArray()).toHexString()
 
 /** 网盘空间用量。取到之前先用账号列表里记着的上一次的值，免得卡片整块缺席。 */
 data class QuotaSnapshot(val usageBytes: Long, val limitBytes: Long)
@@ -78,8 +86,34 @@ object PlayerGestureDefaults {
     const val BOOST_SPEED = 2f
     val BoostSpeedChoices = listOf(1.5f, 2f, 2.5f, 3f)
 
-    /** 播放画质上限的档位，画面高度，0 是原画。PikPak 的转码一般是这三档 */
+    /** 播放画质自动档：按网络速度与当前倍速自动升降画质（默认），仅用于在线播放。 */
+    const val PLAYBACK_AUTO_HEIGHT = -1
+
+    /** 固定画质上限的档位，画面高度，0 是原画。PikPak 的转码一般是这三档 */
     val MaxHeightChoices = listOf(0, 1080, 720, 480)
+}
+
+/** 本地缓存上限与过期清理天数的默认值与可选档位（设备本地设置，不参与跨设备同步）。 */
+object CachePolicyDefaults {
+    const val DEFAULT_MAX_BYTES: Long = 2L * 1024L * 1024L * 1024L
+    const val DEFAULT_MAX_AGE_DAYS: Int = 14
+    val MaxBytesChoices: List<Long> = listOf(
+        512L * 1024L * 1024L,
+        1L * 1024L * 1024L * 1024L,
+        2L * 1024L * 1024L * 1024L,
+        5L * 1024L * 1024L * 1024L,
+        10L * 1024L * 1024L * 1024L,
+        0L,
+    )
+    val MaxAgeDaysChoices: List<Int> = listOf(3, 7, 14, 30, 0)
+}
+
+/** 同时下载文件数的默认值与范围（设备本地设置，不参与跨设备同步）。 */
+object DownloadConcurrencyDefaults {
+    const val MIN = 1
+    const val MAX = 8
+    const val DEFAULT = 3
+    fun sanitize(value: Int?): Int = (value ?: DEFAULT).coerceIn(MIN, MAX)
 }
 
 enum class AppLanguage(val tag: String, val nativeLabel: String) {
@@ -118,7 +152,57 @@ enum class AppLanguage(val tag: String, val nativeLabel: String) {
     }
 }
 
+/**
+ * 启动与高频界面路径的无锁偏好快照，避免在组合或 ViewModel 初始化期间调用 `runBlocking`。
+ * 带内存缓存的实现（`StoredPikoPreferences`、已预加载的 `SessionManager`）直接返回最新值；测试替身回退至默认值。
+ */
+data class PikoPreferencesSnapshot(
+    val appLanguage: AppLanguage = AppLanguage.SYSTEM,
+    val themeMode: String? = null,
+    val themeSeed: String? = null,
+    val pureBlack: Boolean = false,
+    val einkMode: Boolean = false,
+    val spoilerBlurEnabled: Boolean = false,
+    val reduceMotion: Boolean = false,
+    val motionPreference: String? = null,
+    val predictiveBack: Boolean = true,
+    val maxConcurrentDownloads: Int = DownloadConcurrencyDefaults.DEFAULT,
+    val hardwareDecoding: Boolean = true,
+    val playbackMaxHeight: Int = PlayerGestureDefaults.PLAYBACK_AUTO_HEIGHT,
+    val driveViewMode: String = "POSTER",
+    val driveSortOrder: String = "TIME_DESC",
+    val foldersFirst: Boolean = true,
+    val perFolderSort: Boolean = false,
+    val aiSubtitleLanguage: String = "",
+    val aiSubtitleOnDemand: Boolean = true,
+    val aiSubtitleSavedSeconds: Long = 0L,
+    val galleryShowImages: Boolean = true,
+    val sidebarCollapsed: Boolean = false,
+    val showExtensions: Boolean = false,
+    val proxySetting: ProxySetting = ProxySetting(),
+    val tileSizes: Map<String, String> = emptyMap(),
+    val playerLayout: PlayerLayoutPrefs = PlayerLayoutPrefs.Default,
+    val subtitleStyle: SubtitleStylePrefs = SubtitleStylePrefs.DEFAULT,
+    val driveAppearance: DriveAppearancePrefs = DriveAppearancePrefs.DEFAULT,
+    val skipFeedExitConfirm: Boolean = false,
+    val cacheMaxBytes: Long = CachePolicyDefaults.DEFAULT_MAX_BYTES,
+    val cacheMaxAgeDays: Int = CachePolicyDefaults.DEFAULT_MAX_AGE_DAYS,
+    val playbackCacheEnabled: Boolean = true,
+    val resumePlaybackEnabled: Boolean = true,
+    val askDownloadLocation: Boolean = true,
+    val clipVolume: Float = 1f,
+    val clipMuted: Boolean = false,
+) {
+    fun tileSize(view: String): String = tileSizes[view].orEmpty()
+}
+
 interface PikoUserPreferences {
+    /** 无锁读取当前偏好快照，供启动初始化与界面初值使用。 */
+    val currentSnapshot: PikoPreferencesSnapshot get() = PikoPreferencesSnapshot()
+
+    /** 无锁读取指定视图的卡片大小偏好，未设置时返回空串。 */
+    fun currentTileSize(view: String): String = currentSnapshot.tileSize(view)
+
     /** 当前设备记住的引用保存选择，不参与跨设备设置同步。 */
     val saveAsReferenceFlow: Flow<Boolean> get() = kotlinx.coroutines.flow.flowOf(false)
     suspend fun setSaveAsReference(enabled: Boolean) {}
@@ -178,12 +262,36 @@ interface PikoUserPreferences {
     val themeSeedFlow: Flow<String?>
     suspend fun setThemeSeed(seed: String?)
 
+    /** 纯黑深色模式（OLED），仅在深色外观下生效，默认关闭。随设置跨设备同步。 */
+    val pureBlackFlow: Flow<Boolean> get() = flowOf(false)
+    suspend fun setPureBlack(enabled: Boolean) {}
+
+    /** 水墨屏模式（纯黑白高对比度、清晰描边与自动关闭动画），默认关闭。每台设备各自独立，不随账号跨设备同步。 */
+    val einkModeFlow: Flow<Boolean> get() = flowOf(false)
+    suspend fun setEinkMode(enabled: Boolean) {}
+
     /**
      * 网盘列表的视图，存 ui 里 DriveViewMode 的名字：列表、海报墙或图库。全局记住，不随进出目录或重启复位。
      * 旧版只存是否海报墙，没有新键时由它换算，已有的选择不丢。
      */
     val driveViewModeFlow: Flow<String>
     suspend fun setDriveViewMode(mode: String)
+
+    /** 网盘全局默认排序方式，存 `PikoFileSortOrder.name`（如 `TIME_DESC`）。跨重启持久化并随设置同步。 */
+    val driveSortOrderFlow: Flow<String> get() = kotlinx.coroutines.flow.flowOf("TIME_DESC")
+    suspend fun setDriveSortOrder(order: String) {}
+
+    /** AI 实时字幕的目标语言码，空串表示原语言转写。跨重启持久化并随设置同步。 */
+    val aiSubtitleLanguageFlow: Flow<String> get() = kotlinx.coroutines.flow.flowOf("")
+    suspend fun setAiSubtitleLanguage(language: String) {}
+
+    /** AI 字幕「按需启用」（本地 Silero VAD 跳过无对白段以节省额度），默认开启。 */
+    val aiSubtitleOnDemandFlow: Flow<Boolean> get() = kotlinx.coroutines.flow.flowOf(true)
+    suspend fun setAiSubtitleOnDemand(enabled: Boolean) {}
+
+    /** 本地 Silero VAD 累计为用户节省的 AI 字幕额度秒数。 */
+    val aiSubtitleSavedSecondsFlow: Flow<Long> get() = kotlinx.coroutines.flow.flowOf(0L)
+    suspend fun addAiSubtitleSavedSeconds(deltaSeconds: Long) {}
 
     /**
      * 引用视频按体积过滤的模式，见 [VaultSizeFilter]。每台设备各自的：空间够不够看的是这份账号，
@@ -234,6 +342,10 @@ interface PikoUserPreferences {
     suspend fun setDownloadDirPath(path: String)
     suspend fun getDownloadDirPath(): String
 
+    /** 每次下载前手动选择保存位置，默认开启。仅保存在当前设备，不参与跨设备同步。 */
+    val askDownloadLocationFlow: Flow<Boolean> get() = flowOf(true)
+    suspend fun setAskDownloadLocation(enabled: Boolean) {}
+
     /** 本地下载任务表的 JSON。空串表示从未保存。 */
     suspend fun loadDownloadTasks(): String
     suspend fun saveDownloadTasks(serialized: String)
@@ -264,10 +376,20 @@ interface PikoUserPreferences {
     /** 最近移动到过的目录路径，JSON，见 MoveHistory。空串表示从未保存。 */
     val recentMoveTargetsFlow: Flow<String>
     suspend fun saveRecentMoveTargets(serialized: String)
+    fun recentMoveTargetsFlowFor(account: String): Flow<String> =
+        if (account.isBlank()) flowOf("") else recentMoveTargetsFlow
+    suspend fun saveRecentMoveTargetsFor(account: String, serialized: String) {
+        if (account.isNotBlank()) saveRecentMoveTargets(serialized)
+    }
 
     /** 固定到快速访问的文件夹，JSON，见 PinnedFolders。空串表示从未保存。 */
     val pinnedFoldersFlow: Flow<String>
     suspend fun savePinnedFolders(serialized: String)
+    fun pinnedFoldersFlowFor(account: String): Flow<String> =
+        if (account.isBlank()) flowOf("") else pinnedFoldersFlow
+    suspend fun savePinnedFoldersFor(account: String, serialized: String) {
+        if (account.isNotBlank()) savePinnedFolders(serialized)
+    }
 
     /** 文件夹优先显示，关闭后与文件按同一排序混排，默认开。 */
     val foldersFirstFlow: Flow<Boolean> get() = flowOf(true)
@@ -280,6 +402,11 @@ interface PikoUserPreferences {
     /** 按文件夹记住的排序方式，JSON（folderId -> PikoFileSortOrder.name），按账号隔离。 */
     val folderSortOrdersFlow: Flow<String> get() = flowOf("")
     suspend fun saveFolderSortOrders(serialized: String) {}
+    fun folderSortOrdersFlowFor(account: String): Flow<String> =
+        if (account.isBlank()) flowOf("") else folderSortOrdersFlow
+    suspend fun saveFolderSortOrdersFor(account: String, serialized: String) {
+        if (account.isNotBlank()) saveFolderSortOrders(serialized)
+    }
 
     /** 批量重命名上次的选项与最近用过的查找、替换串，JSON，见 BatchRenameMemory。空串表示从未保存。每台设备各自的，不同步。 */
     val batchRenameFlow: Flow<String>
@@ -331,10 +458,9 @@ interface PikoUserPreferences {
     suspend fun setHardwareDecoding(enabled: Boolean)
 
     /**
-     * 播放画质上限：画面高度，0 是原画（默认）。播放时挑不高于它的最大一档转码；
-     * 这一档没有（例如设了 480 而片源最低只有 720）就取高一档里最接近的那个，只有完全没有转码才放原画。
-     * 见 transcodeNameAtMost。
-     * 每台设备各自的，不同步：手机走流量想要 720P，电脑上要原画。
+     * 播放画质设置：-1（[PlayerGestureDefaults.PLAYBACK_AUTO_HEIGHT]）是自动（默认，按网速与倍速调节），
+     * 0 是原画，正整数是画面高度上限（播放时挑不高于它的最大一档转码，没有就放原画，见 transcodeNameAtMost）。
+     * 每台设备各自的，不同步：手机走流量想要 720P，电脑上要自动或原画。
      */
     val playbackMaxHeightFlow: Flow<Int>
     suspend fun setPlaybackMaxHeight(height: Int)
@@ -359,6 +485,58 @@ interface PikoUserPreferences {
     val clipAutoExtendFlow: Flow<Boolean>
     suspend fun setClipAutoExtend(enabled: Boolean)
 
+    /** 信息流本机音量（0..1）与静音状态。仅保存在当前设备，不参与跨设备同步。 */
+    val clipVolumeFlow: Flow<Float> get() = flowOf(1f)
+    val clipMutedFlow: Flow<Boolean> get() = flowOf(false)
+    suspend fun setClipAudio(volume: Float, muted: Boolean) {}
+
+    /**
+     * 界面动画程度（"Reduced" / "Standard" / "Expressive"，null 表示跟随当前平台默认档：桌面 Standard，移动 Expressive）。
+     * 仅保存在当前设备，不参与跨设备同步。
+     */
+    val motionPreferenceFlow: Flow<String?> get() = flowOf(null)
+    suspend fun setMotionPreference(style: String?) {}
+
+    /** 系统预测性返回手势（侧滑实时预览上一页），默认开启。仅在支持该能力的平台展示，保存在当前设备。 */
+    val predictiveBackFlow: Flow<Boolean> get() = flowOf(true)
+    suspend fun setPredictiveBack(enabled: Boolean) {}
+
+    /** 同时下载文件数上限（1..8，默认 3）。仅保存在当前设备，不参与跨设备同步。 */
+    val maxConcurrentDownloadsFlow: Flow<Int> get() = flowOf(DownloadConcurrencyDefaults.DEFAULT)
+    suspend fun setMaxConcurrentDownloads(count: Int) {}
+
+    /** 播放器四态自定义布局、听音频与手势配置。跟着设置同步。 */
+    val playerLayoutPrefsFlow: Flow<PlayerLayoutPrefs> get() = flowOf(PlayerLayoutPrefs.Default)
+    suspend fun setPlayerLayoutPrefs(prefs: PlayerLayoutPrefs) {}
+
+    /** 播放器字幕外观偏好（底色、字体、字号、纵向位置与 ASS 覆盖）。跟着设置同步。 */
+    val subtitleStylePrefsFlow: Flow<SubtitleStylePrefs> get() = flowOf(SubtitleStylePrefs.DEFAULT)
+    suspend fun setSubtitleStylePrefs(prefs: SubtitleStylePrefs) {}
+
+    /** 网盘三视图（列表 / 网格 / 瀑布流）文件外观自定义配置。跟着设置同步。 */
+    val driveAppearancePrefsFlow: Flow<DriveAppearancePrefs> get() = flowOf(DriveAppearancePrefs.DEFAULT)
+    suspend fun setDriveAppearancePrefs(prefs: DriveAppearancePrefs) {}
+
+    /** 退出瀑布流与信息流时跳过确认弹窗直接退出，默认关闭。跨设备同步。 */
+    val skipFeedExitConfirmFlow: Flow<Boolean> get() = flowOf(false)
+    suspend fun setSkipFeedExitConfirm(skip: Boolean) {}
+
+    /** 本地缓存容量上限（字节；0 表示无限制）。仅保存在当前设备，不同步。 */
+    val cacheMaxBytesFlow: Flow<Long> get() = flowOf(CachePolicyDefaults.DEFAULT_MAX_BYTES)
+    suspend fun setCacheMaxBytes(bytes: Long) {}
+
+    /** 本地缓存过期自动清理天数（0 表示永不自动按时间清理）。仅保存在当前设备，不同步。 */
+    val cacheMaxAgeDaysFlow: Flow<Int> get() = flowOf(CachePolicyDefaults.DEFAULT_MAX_AGE_DAYS)
+    suspend fun setCacheMaxAgeDays(days: Int) {}
+
+    /** 在线播放时将视频分块持久化到磁盘供复播复用，默认开启。仅保存在当前设备，不同步。 */
+    val playbackCacheEnabledFlow: Flow<Boolean> get() = flowOf(true)
+    suspend fun setPlaybackCacheEnabled(enabled: Boolean) {}
+
+    /** 打开视频时自动续播上次进度，默认开启；关闭后每次从头播放。跨设备同步。 */
+    val resumePlaybackEnabledFlow: Flow<Boolean> get() = flowOf(true)
+    suspend fun setResumePlaybackEnabled(enabled: Boolean) {}
+
     /**
      * 网盘页的目录图（FolderMap）开着与钉着，默认都否。两项各自独立：× 关掉不改钉住，再打开照旧钉着；
      * 没钉住的目录图停在边沿时不用就收成把手。每台设备各自的，不同步：目录图只在宽窗口里有，
@@ -375,12 +553,17 @@ interface PikoUserPreferences {
 
     /**
      * 用户自己部署的 MetaTube 服务地址，如「http://192.168.1.2:8080」。空串表示不用刮削，界面上不出现任何刮削入口。
-     * 跨设备经 MetaTubeSync 加密同步，不进入普通设置同步文件。
+     * 按账号隔离存储，跨设备经 MetaTubeSync 加密同步，不进入普通设置同步文件。
      */
     val metaTubeUrlFlow: Flow<String>
     suspend fun setMetaTubeUrl(url: String)
+    fun metaTubeUrlFlowFor(account: String): Flow<String> =
+        if (account.isBlank()) flowOf("") else metaTubeUrlFlow
+    suspend fun setMetaTubeUrlFor(account: String, url: String) {
+        if (account.isNotBlank()) setMetaTubeUrl(url)
+    }
 
-    /** MetaTube 的访问令牌（服务端的 TOKEN）。机密，由平台加密存放，跨设备仅经 MetaTubeSync 加密同步。空串表示没填。 */
+    /** MetaTube 的访问令牌（服务端的 TOKEN）。机密，按账号由平台加密存放，跨设备仅经 MetaTubeSync 加密同步。空串表示没填。 */
     val metaTubeTokenFlow: Flow<String>
     suspend fun setMetaTubeToken(token: String)
 
@@ -447,6 +630,12 @@ interface PikoUserPreferences {
      */
     val translationConcurrencyFlow: Flow<Int>
     suspend fun setTranslationConcurrency(count: Int)
+
+    fun metaTubeTokenFlowFor(account: String): Flow<String> =
+        if (account.isBlank()) flowOf("") else metaTubeTokenFlow
+    suspend fun setMetaTubeTokenFor(account: String, token: String) {
+        if (account.isNotBlank()) setMetaTubeToken(token)
+    }
 }
 
 /** 没选过并发时的默认值：比早期的 3/4 翻倍，又不至于把免费额度打到限流。 */

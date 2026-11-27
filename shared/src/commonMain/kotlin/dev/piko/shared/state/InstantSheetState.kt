@@ -1,5 +1,6 @@
 package dev.piko.shared.state
 
+import dev.piko.shared.i18n.enCount
 import dev.piko.shared.i18n.tr
 
 import androidx.compose.runtime.derivedStateOf
@@ -21,7 +22,6 @@ import dev.piko.shared.log.logFolder
 import dev.piko.shared.log.reportFailure
 import dev.piko.shared.data.InstantMagnetRepository
 import dev.piko.shared.data.MagnetResolutionResult
-import dev.piko.shared.data.TruncatedReason
 import dev.piko.shared.data.OfflinePackTracker
 import dev.piko.shared.data.PikoDriveRepository
 import dev.piko.shared.data.PikoPathBreadcrumb
@@ -80,6 +80,8 @@ sealed interface InstantSaveOutcome {
     data class InstantSaved(
         val createdIds: List<String>,
         override val target: PikoPathBreadcrumb,
+        val itemCount: Int = createdIds.size,
+        val isReference: Boolean = false,
     ) : InstantSaveOutcome
 
     data class OfflineTaskCreated(
@@ -188,7 +190,7 @@ class InstantSheetState private constructor(
     private var offlineWorkId: Long? = null
     private var offlineWorks by mutableStateOf(instantRepo.offlineSubmissions.works.value)
     private var targetRulesVersion by mutableStateOf(0L)
-    val hasPendingOfflineSubmission: Boolean get() = offlineWorks.any { it.id == offlineWorkId && it.status == OfflineSubmitStatus.UNCONFIRMED }
+    val hasPendingOfflineSubmission: Boolean get() = offlineWorks.any { it.id == offlineWorkId && it.isRunning }
     fun containsOfflineSubmission(id: Long): Boolean = offlineWorkId == id || batch?.rows?.any { it.state.containsOfflineSubmission(id) } == true
     val hasRetainedOfflineSubmission: Boolean get() = offlineWorks.any { containsOfflineSubmission(it.id) }
     private var savedContainer: PikoPathBreadcrumb? = null
@@ -200,13 +202,13 @@ class InstantSheetState private constructor(
     fun containsInstantAttempt(id: String): Boolean = instantAttemptId == id || batch?.rows?.any { it.state.containsInstantAttempt(id) } == true
     val hasRetainedInstantAttempt: Boolean get() = saveAttempts.any { containsInstantAttempt(it.id) }
     val retryFileCount: Int get() = instantRetry?.let { retry ->
-        if (retry.receipt.unconfirmedFolder != null) 0 else retry.files.count { it.file.path in (retry.receipt.failed + retry.receipt.notAttempted) }
+        retry.files.count { it.file.path in (retry.receipt.failed + retry.receipt.notAttempted) }
     } ?: 0
     val retryNeededBytes: Long get() = instantRetry?.let { retry ->
         retry.files.filter { it.file.path in (retry.receipt.failed + retry.receipt.notAttempted) }.sumOf { it.file.size }
     } ?: 0L
-    val canEdit: Boolean get() = !isSaving && !hasPendingOfflineSubmission && batch?.isSaving != true && instantRetry == null && saveIssue?.requiresInspection != true &&
-        batch?.rows?.none { it.state.hasInstantRetry || it.state.hasPendingOfflineSubmission || it.state.saveIssue?.requiresInspection == true } != false
+    val canEdit: Boolean get() = !isSaving && !hasPendingOfflineSubmission && batch?.isSaving != true && instantRetry == null &&
+        batch?.rows?.none { it.state.hasInstantRetry || it.state.hasPendingOfflineSubmission } != false
 
     private fun resetEditableAttempt() {
         if (saveIssue == null) return
@@ -222,19 +224,29 @@ class InstantSheetState private constructor(
         val account = saveAccount
         if (target != null) (saveTargetContext.availability(target.id) as? dev.piko.shared.presentation.ActionAvailability.Blocked)?.let { return@derivedStateOf it.reason }
         if (target != null && account != null && instantRepo.offlineSubmissions.conflict(account, submittedUrl(), target.id, offlineWorks) != null)
-            return@derivedStateOf tr("此文件夹有待确认的离线下载请求，请先在任务页核对", "Cloud download submission in this folder is unconfirmed. Check Tasks first", "このフォルダーのクラウドダウンロード送信結果が未確認です。先にタスク画面で確認してください", "이 폴더의 클라우드 다운로드 제출 결과가 미확인입니다. 먼저 작업 페이지에서 확인해 주세요", "此資料夾有待確認的離線下載請求，請先至任務頁核對")
+            return@derivedStateOf tr("此文件夹已有进行中的离线下载请求，请稍后再试", "A cloud download submission in this folder is already running", "このフォルダーではクラウドダウンロードの送信が進行中です", "이 폴더에서 클라우드 다운로드 제출이 진행 중입니다", "此資料夾已有進行中的離線下載請求，請稍後再試")
         if (target != null && account != null && saveRecords.pendingConflict(account, target.id, itemsToSave.map { it.file },
                 excluding = instantAttemptId, snapshot = saveAttempts, containerName = if (willCreateFolder) driveFolderName(folderNameToSave) else null,
-                names = SaveNaming(itemsToSave).fileNames, keepStructure = willCreateFolder)) tr("目标位置有进行中或待确认的保存任务，请先在任务页处理", "A save to this destination is running or unconfirmed. Check Tasks first", "同じ保存先への保存が進行中または未確認です。先にタスク画面で確認してください", "같은 대상에 저장이 진행 중이거나 미확인입니다. 먼저 작업 페이지에서 확인해 주세요", "目標位置有進行中或待確認的儲存任務，請先至任務頁處理") else null
+                names = SaveNaming(itemsToSave).fileNames, keepStructure = willCreateFolder)) tr("目标位置已有进行中的保存任务，请稍后再试", "A save to this destination is already running", "同じ保存先への保存が進行中です", "같은 대상에 저장이 진행 중입니다", "目標位置已有進行中的儲存任務，請稍後再試") else null
     }
     var resolution by mutableStateOf<MagnetResolutionResult?>(null)
         private set
-    var selectedIndices by mutableStateOf<Set<Int>>(emptySet())
+    var shareTree by mutableStateOf<ShareTreeBrowser?>(null)
         private set
+    val isLazyShareMode: Boolean get() = shareTree?.isLazyMode == true
+    private var shareSaveJob: Job? = null
+
+    private var selectionState by mutableStateOf(CompactIndexSelection.EMPTY)
+    val selectedIndices: Set<Int> get() = selectionState
+    val compactSelection: CompactIndexSelection get() = selectionState
+    private var subtitleIndexSet: Set<Int> = emptySet()
     private var selectionPicked by mutableStateOf(false)
 
     val hasPickedFiles: Boolean
-        get() = saveIssue != null || hasPendingOfflineSubmission || (selectionPicked && selectedIndices.isNotEmpty()) || batch?.rows?.any { it.state.hasPickedFiles } == true
+        get() = saveIssue != null || hasPendingOfflineSubmission ||
+            (shareTree?.let { it.isLazyMode && it.selectionEdited && it.hasSelection } == true) ||
+            (selectionPicked && selectionState.isNotEmpty()) ||
+            batch?.rows?.any { it.state.hasPickedFiles } == true
 
     var errorMessage by mutableStateOf<String?>(null)
         private set
@@ -283,7 +295,7 @@ class InstantSheetState private constructor(
 
     private val selectedVideos: List<AvInfo> by derivedStateOf {
         val videos = canonical?.videos ?: return@derivedStateOf emptyList()
-        selectedIndices.sorted().mapNotNull { videos.getOrNull(it) }
+        selectionState.selectedIndicesSorted().mapNotNull { videos.getOrNull(it) }
     }
 
     private val folderCode: String? by derivedStateOf {
@@ -322,6 +334,9 @@ class InstantSheetState private constructor(
     var previewingIndex by mutableStateOf<Int?>(null)
         private set
 
+    var previewingShareNodeId by mutableStateOf<String?>(null)
+        private set
+
     private val previewedIds get() = shared.previewedIds
 
     private val _outcomes = MutableSharedFlow<InstantSaveOutcome>()
@@ -341,23 +356,25 @@ class InstantSheetState private constructor(
         get() = input.isBlank() && resolution == null && batch == null && !isResolving && !isSaving
 
     val selectedItems: List<InstantFileItem> by derivedStateOf {
-        selectedIndices.sorted().mapNotNull(items::getOrNull)
+        selectionState.selectedIndicesSorted().mapNotNull(items::getOrNull)
     }
 
     private var saveAttachedSubtitles by mutableStateOf(true)
     private var sourceSelectionEdited by mutableStateOf(false)
 
+    val sourceSelection: CompactIndexSelection by derivedStateOf {
+        if (saveAttachedSubtitles || sourceSelectionEdited || subtitleIndexSet.isEmpty()) selectionState
+        else selectionState.withSelected(subtitleIndexSet, false)
+    }
+
     private val itemsToSave: List<InstantFileItem> by derivedStateOf {
-        sourceSelectedIndices.sorted().mapNotNull(items::getOrNull)
+        sourceSelection.selectedIndicesSorted().mapNotNull(items::getOrNull)
     }
 
     val referenceItemsToSave: List<InstantFileItem> by derivedStateOf { itemsToSave.filter { it.file.gcid != null } }
     val missingReferenceCount: Int by derivedStateOf { itemsToSave.size - referenceItemsToSave.size }
 
-    val sourceSelectedIndices: Set<Int> by derivedStateOf {
-        if (saveAttachedSubtitles || sourceSelectionEdited) selectedIndices
-        else selectedIndices - tree?.rows?.flatMap { it.subtitleIndices }?.toSet().orEmpty()
-    }
+    val sourceSelectedIndices: Set<Int> get() = sourceSelection
 
     val projectedSaveFiles: List<io.github.nihildigit.pikpak.ResolvedFile> by derivedStateOf {
         projectedSaveEntries.map { it.second }
@@ -370,7 +387,7 @@ class InstantSheetState private constructor(
                 row.state.projectedSaveEntries.map { (idx, file) -> (rowIndex * BATCH_INDEX_STRIDE + idx) to file }
             }
         } else {
-            sourceSelectedIndices.sorted().filter { !effectiveSaveAsReference || items[it].file.gcid != null }.map { index ->
+            sourceSelection.selectedIndicesSorted().filter { !effectiveSaveAsReference || items[it].file.gcid != null }.map { index ->
                 val item = items[index]
                 val name = nameToSave(index)
                 val relative = if (willCreateFolder) item.file.path.substringBeforeLast('/', "").let { dir ->
@@ -381,11 +398,15 @@ class InstantSheetState private constructor(
         }
     }
 
-    val willCreateFolder: Boolean by derivedStateOf { resolution != null && selectedEntryCount > 1 }
+    val willCreateFolder: Boolean by derivedStateOf { !isLazyShareMode && resolution != null && selectedEntryCount > 1 }
 
     val canSaveSelection: Boolean by derivedStateOf {
-        !isSaving && selectedItems.isNotEmpty() && (!effectiveSaveAsReference || referenceItemsToSave.isNotEmpty()) && target != null && saveBlockReason == null &&
-            !(willCreateFolder && folderNameToSave.isBlank())
+        if (isLazyShareMode) {
+            !isSaving && shareTree?.hasSelection == true && target != null && saveBlockReason == null
+        } else {
+            !isSaving && selectionState.isNotEmpty() && (!effectiveSaveAsReference || referenceItemsToSave.isNotEmpty()) && target != null && saveBlockReason == null &&
+                !(willCreateFolder && folderNameToSave.isBlank())
+        }
     }
 
     val offlineLeft: Int? get() = shared.account.value.offlineLeft
@@ -396,22 +417,36 @@ class InstantSheetState private constructor(
         private set
 
     val savePlan: SavePlan? by derivedStateOf {
-        if (effectiveSaveAsReference && selectedItems.isNotEmpty()) SavePlan(SaveRoute.INSTANT, referenceItemsToSave.size, skippedCount = missingReferenceCount)
-        else if (findShareLink(input) != null && itemsToSave.isNotEmpty() && itemsToSave.all { it.file.gcid != null })
-            planSave(items, selectedIndices, selectedEntryCount, remainingBytes, shared.account.value.copy(free = true))
-        else planSave(items, selectedIndices, selectedEntryCount, remainingBytes, shared.account.value,
-            catalogComplete = resolution?.resource?.truncated == false)
+        if (isLazyShareMode) {
+            if (shareTree?.hasSelection == true) SavePlan(SaveRoute.INSTANT, fileCount = 1) else null
+        } else if (effectiveSaveAsReference && selectionState.isNotEmpty()) {
+            SavePlan(SaveRoute.INSTANT, referenceItemsToSave.size, skippedCount = missingReferenceCount)
+        } else if (findShareLink(input) != null && itemsToSave.isNotEmpty() && itemsToSave.all { it.file.gcid != null }) {
+            planSave(items, selectionState, selectedEntryCount, remainingBytes, shared.account.value.copy(free = true))
+        } else {
+            planSave(
+                items, selectionState, selectedEntryCount, remainingBytes, shared.account.value,
+                catalogComplete = resolution?.resource?.truncated == false,
+            )
+        }
     }
 
     val isAllSelected: Boolean by derivedStateOf {
-        items.isNotEmpty() && selectedIndices.size == items.size
+        if (isLazyShareMode) shareTree?.isAllSelected == true else selectionState.isAllSelected
     }
 
     var tree by mutableStateOf<InstantTree?>(null)
         private set
 
     val entryCount: Int by derivedStateOf { tree?.rows?.size ?: 0 }
-    val selectedEntryCount: Int by derivedStateOf { tree?.rows?.count { it.index in selectedIndices } ?: 0 }
+    val selectedEntryCount: Int by derivedStateOf {
+        val currentTree = tree ?: return@derivedStateOf 0
+        when {
+            selectionState.isAllSelected -> currentTree.rows.size
+            selectionState.isEmpty() -> 0
+            else -> currentTree.rows.count { it.index in selectionState }
+        }
+    }
     private val expandedGroups = mutableStateMapOf<String, Boolean>()
 
     fun isGroupExpanded(group: InstantGroup): Boolean = expandedGroups[group.key] ?: group.defaultExpanded
@@ -448,7 +483,6 @@ class InstantSheetState private constructor(
     val primaryAction: InstantPrimaryAction? by derivedStateOf {
         when {
             instantRetry != null -> InstantPrimaryAction(InstantActionKind.INSTANT_SAVE, retryFileCount, !isSaving && retryFileCount > 0 && saveBlockReason == null)
-            saveIssue?.requiresInspection == true -> InstantPrimaryAction(InstantActionKind.INSTANT_SAVE, 0, false)
             resolution != null && contentMissing -> InstantPrimaryAction(
                 kind = InstantActionKind.SUBMIT_OFFLINE,
                 fileCount = 0,
@@ -493,7 +527,7 @@ class InstantSheetState private constructor(
             if (!isSaving) attempts.firstOrNull { it.id == instantAttemptId }?.let { work ->
                 work.receipt?.let { receipt ->
                     val hadIssue = saveIssue != null
-                    saveIssue = receipt.takeIf { it.requiresInspection || it.failed.isNotEmpty() || it.notAttempted.isNotEmpty() }
+                    saveIssue = receipt.takeIf { it.failed.isNotEmpty() || it.notAttempted.isNotEmpty() }
                     instantRetry = instantRetry?.copy(receipt = receipt)
                     if (hadIssue && work.isComplete) {
                         val destination = savedContainer ?: work.target
@@ -548,56 +582,32 @@ class InstantSheetState private constructor(
     private suspend fun resolveShare(url: String): Result<MagnetResolutionResult?> = runSuspendCatching {
         val id = requireNotNull(shareIdFromUrl(url))
         val info = driveRepo.shareInfo(id, sharePassCode).getOrThrow()
-        val root = info.files.singleOrNull()?.takeIf { it.isFolder }
-        val items = mutableListOf<InstantFileItem>()
-        val visited = mutableSetOf<String>()
-        // 第一个撞上的上限就是用户要看的那个原因：先撞顶层，再谈目录多少没意义
-        var truncatedBy = if (info.nextPageToken.isNotEmpty()) TruncatedReason.SHARE_ROOT else null
-        var frontier = info.files.map { it to if (it == root) "" else it.name }
-        while (frontier.isNotEmpty()) {
-            val foldersToExpand = mutableListOf<Pair<io.github.nihildigit.pikpak.FileStat, String>>()
-            for ((file, path) in frontier) {
-                if (file.isFolder) {
-                    if (!visited.add(file.id)) continue
-                    if (visited.size > MAX_SHARE_FOLDERS) {
-                        truncatedBy = truncatedBy ?: TruncatedReason.FOLDER_LIMIT
-                        continue
-                    }
-                    foldersToExpand += file to path
-                } else {
-                    val resolved = io.github.nihildigit.pikpak.ResolvedFile(path, file.sizeBytes, file.hash.ifBlank { null })
-                    val meta = dev.piko.shared.data.VaultMediaMeta.fromFileStat(file).takeUnless { it.isEmpty }
-                    items += InstantFileItem(resolved, resolved.gcid != null, meta = meta)
-                }
-            }
-            if (foldersToExpand.isEmpty()) break
-            val nextFrontier = mutableListOf<Pair<io.github.nihildigit.pikpak.FileStat, String>>()
-            for (chunk in foldersToExpand.chunked(8)) {
-                val listings = coroutineScope {
-                    chunk.map { (folder, path) ->
-                        async {
-                            path to driveRepo.shareFolderFull(id, info.passCodeToken, folder.id).getOrThrow()
-                        }
-                    }.awaitAll()
-                }
-                for ((parentPath, page) in listings) {
-                    val (children, subTruncated) = page
-                    if (subTruncated) truncatedBy = truncatedBy ?: TruncatedReason.PAGE_LIMIT
-                    for (child in children) {
-                        nextFrontier += child to if (parentPath.isEmpty()) child.name else "$parentPath/${child.name}"
-                    }
-                }
-            }
-            frontier = nextFrontier
+        val browser = ShareTreeBrowser(
+            shareId = id,
+            info = info,
+            dataSource = driveRepo.asShareTreeDataSource(),
+            scope = scope,
+        )
+        shareTree = browser
+        if (browser.isLazyMode) {
+            return@runSuspendCatching MagnetResolutionResult(
+                resource = io.github.nihildigit.pikpak.MagnetResource(browser.title, emptyList(), truncated = false),
+                items = emptyList(),
+                instantReadyCount = 0,
+                totalCount = 0,
+            )
         }
-        if (truncatedBy != null) {
-            // 日志里记下是哪一种：用户来问「为什么少了文件」时，不用再猜
-            PikoLog.w(TAG, "分享 $id 的清单不完整（$truncatedBy）：已解析 ${items.size} 个文件、${visited.size} 个目录")
+        val items = info.files.map { file ->
+            val resolved = io.github.nihildigit.pikpak.ResolvedFile(file.name, file.sizeBytes, file.hash.ifBlank { null })
+            val meta = dev.piko.shared.data.VaultMediaMeta.fromFileStat(file).takeUnless { it.isEmpty }
+            InstantFileItem(resolved, resolved.gcid != null, meta = meta)
         }
         val files = items.map { it.file }
         MagnetResolutionResult(
-            io.github.nihildigit.pikpak.MagnetResource(root?.name ?: info.title, files, truncatedBy != null),
-            items, items.count { it.isInstantReady }, items.size, truncatedBy,
+            io.github.nihildigit.pikpak.MagnetResource(browser.title, files, truncated = false),
+            items,
+            items.count { it.isInstantReady },
+            items.size,
         )
     }
 
@@ -636,7 +646,7 @@ class InstantSheetState private constructor(
     }
 
     fun toggleItem(index: Int) {
-        setItemSelected(index, index !in selectedIndices)
+        setItemSelected(index, index !in selectionState)
     }
 
     fun setItemSelected(index: Int, selected: Boolean) {
@@ -653,10 +663,9 @@ class InstantSheetState private constructor(
             return
         }
         resetEditableAttempt()
-        val valid = indices.filterTo(HashSet()) { it in items.indices }
-        val current = sourceSelectedIndices
+        val current = sourceSelection
         sourceSelectionEdited = true
-        selectedIndices = if (selected) current + valid else current - valid
+        selectionState = current.withSelected(indices, selected)
         selectionPicked = true
     }
 
@@ -667,20 +676,54 @@ class InstantSheetState private constructor(
     private fun setItemsSelected(indices: Collection<Int>, selected: Boolean) {
         if (!canEdit) return
         resetEditableAttempt()
-        val affected = indices.flatMap { index -> tree?.rowOf(index)?.indices ?: listOf(index) }.toSet()
-        selectedIndices = if (selected) selectedIndices + affected else selectedIndices - affected
+        val affected = if (indices.size == 1) {
+            val single = indices.first()
+            tree?.rowOf(single)?.indices ?: listOf(single)
+        } else {
+            val currentTree = tree
+            if (currentTree == null) indices
+            else indices.flatMapTo(LinkedHashSet()) { index -> currentTree.rowOf(index)?.indices ?: listOf(index) }
+        }
+        selectionState = selectionState.withSelected(affected, selected)
         selectionPicked = true
     }
 
     fun deselectUnindexed() {
-        setSourceSelected(items.indices.filter { items[it].file.gcid == null }.toSet(), false)
+        val unindexed = ArrayList<Int>()
+        for (i in items.indices) {
+            if (items[i].file.gcid == null) unindexed.add(i)
+        }
+        if (unindexed.isNotEmpty()) {
+            resetEditableAttempt()
+            val current = sourceSelection
+            sourceSelectionEdited = true
+            selectionState = current.withSelected(unindexed, false)
+            selectionPicked = true
+        }
     }
 
     fun toggleSelectAll() {
         if (!canEdit) return
         resetEditableAttempt()
-        selectedIndices = if (isAllSelected) emptySet() else items.indices.toSet()
+        val browser = shareTree
+        if (browser != null && browser.isLazyMode) {
+            browser.toggleSelectAll()
+            return
+        }
+        selectionState = if (selectionState.isAllSelected) CompactIndexSelection.none(items.size) else CompactIndexSelection.all(items.size)
         selectionPicked = true
+    }
+
+    fun canPreviewShareNode(node: ShareTreeNode): Boolean =
+        !node.isFolder && node.hash.isNotBlank() && node.name.fileCategory() == FileCategory.VIDEO
+
+    fun previewShareNode(node: ShareTreeNode) {
+        val gcid = node.hash.ifBlank { null } ?: return
+        previewFile(io.github.nihildigit.pikpak.ResolvedFile(node.relativePath, node.sizeBytes, gcid), index = null, shareNodeId = node.id)
+    }
+
+    fun cancelShareSave() {
+        shareSaveJob?.cancel()
     }
 
     fun updateFolderName(value: String) {
@@ -715,14 +758,15 @@ class InstantSheetState private constructor(
         return lease.put(file).onSuccess { fileId -> previewedIds[gcid] = fileId }
     }
 
-    private fun previewFile(file: io.github.nihildigit.pikpak.ResolvedFile, index: Int) {
+    private fun previewFile(file: io.github.nihildigit.pikpak.ResolvedFile, index: Int?, shareNodeId: String? = null) {
         val gcid = file.gcid ?: return
         previewedIds[gcid]?.let { fileId ->
             _previewRequests.tryEmit(InstantPreviewRequest(fileId, file.name))
             return
         }
-        if (previewingIndex != null) return
+        if (previewingIndex != null || previewingShareNodeId != null) return
         previewingIndex = index
+        previewingShareNodeId = shareNodeId
         scope.launch {
             try {
                 requireNotNull(shared.previewLease).put(file)
@@ -734,17 +778,40 @@ class InstantSheetState private constructor(
                     .onFailure { _messages.emit(dev.piko.shared.notice.PikoErrorMapper.failure(tr("预览", "Preview", "プレビュー", "미리 보기", "預覽"), it)) }
             } finally {
                 previewingIndex = null
+                previewingShareNodeId = null
             }
         }
     }
 
     fun saveSelection() {
+        val browser = shareTree
+        if (browser != null && browser.isLazyMode) {
+            if (!scope.isActive || isSaving || !browser.hasSelection) return
+            saveBlockReason?.let { errorMessage = it; return }
+            errorMessage = null
+            isSaving = true
+            shareSaveJob = saveScope.launch {
+                try {
+                    val targetBread = target ?: resolveTarget()
+                    val outcome = if (effectiveSaveAsReference) {
+                        saveShareTreeAsReferences(targetBread, browser)
+                    } else {
+                        saveShareTreeRestore(targetBread, browser)
+                    }
+                    outcome.onSuccess { _outcomes.emit(it) }
+                } finally {
+                    shareSaveJob = null
+                    isSaving = false
+                }
+            }
+            return
+        }
         if (effectiveSaveAsReference && itemsToSave.isNotEmpty() && referenceItemsToSave.isEmpty()) { errorMessage = tr("所选项目均缺少引用，无法以引用保存", "Selected items lack references and cannot be saved as references", "選択した項目に参照情報がないため、参照として保存できません", "선택한 항목에 참조가 없어 참조로 저장할 수 없습니다", "所選項目均缺少引用，無法以引用儲存"); return }
         if (!effectiveSaveAsReference && normalizedMagnet == null && findShareLink(input) == null) { submitOfflineTask(); return }
         if (!scope.isActive || isSaving) return
         saveBlockReason?.let { errorMessage = it; return }
         if (instantRetry != null) {
-            if (retryFileCount == 0) { errorMessage = tr("请先在任务页核对本次保存结果，避免重复提交", "Check this save result in Tasks before submitting again", "再送信する前にタスク画面で今回の保存結果を確認してください", "다시 제출하기 전에 작업 페이지에서 이번 저장 결과를 확인해 주세요", "請先至任務頁核對本次儲存結果，避免重複提交"); return }
+            if (retryFileCount == 0) { errorMessage = tr("没有需要重试的文件", "No failed files to retry", "再試行するファイルがありません", "다시 시도할 파일이 없습니다", "沒有需要重試的檔案"); return }
             isSaving = true
             saveScope.launch {
                 try {
@@ -754,7 +821,6 @@ class InstantSheetState private constructor(
             }
             return
         }
-        if (saveIssue?.requiresInspection == true) return
         val plan = savePlan ?: return
         if (isSaving || plan.blocked) return
         val toSave = if (effectiveSaveAsReference) referenceItemsToSave else itemsToSave
@@ -766,9 +832,10 @@ class InstantSheetState private constructor(
                     SaveRoute.INSTANT -> if (willCreateFolder) {
                         saveIntoNewFolder(targetBread, toSave).onSuccess { _outcomes.emit(it) }
                     } else {
+                        val ref = effectiveSaveAsReference
                         saveInstantOrOffline(targetBread, toSave).onSuccess { ids ->
                             _outcomes.emit(
-                                if (ids != null) InstantSaveOutcome.InstantSaved(ids, targetBread) else InstantSaveOutcome.OfflineTaskCreated(targetBread),
+                                if (ids != null) InstantSaveOutcome.InstantSaved(ids, targetBread, isReference = ref) else InstantSaveOutcome.OfflineTaskCreated(targetBread),
                             )
                         }
                     }
@@ -792,11 +859,213 @@ class InstantSheetState private constructor(
         }
     }
 
+    private suspend fun saveShareTreeRestore(
+        target: PikoPathBreadcrumb,
+        browser: ShareTreeBrowser,
+    ): Result<InstantSaveOutcome.InstantSaved> {
+        if (!canReceiveAt(target)) return Result.failure(IllegalStateException(errorMessage))
+        val account = saveAccount?.takeIf { it == driveRepo.currentAccount }
+            ?: return Result.failure(IllegalStateException(tr("当前保存会话已结束", "This save session has ended", "保存セッションは終了しました", "현재 저장 세션이 종료되었습니다", "目前的儲存工作階段已結束")))
+        val title = browser.title.ifBlank { target.name }
+        val attemptId = saveRecords.beginAttempt(account, title, target, emptyList(), keepStructure = true, reference = false)
+        instantAttemptId = attemptId
+        if (attemptId != null) {
+            saveRecords.updateAttemptProgress(
+                id = attemptId,
+                account = account,
+                status = tr("正在提交云端转存", "Submitting share save", "共有ファイルの保存を送信中", "공유 파일 저장 제출 중", "正在提交雲端轉存"),
+            )
+        }
+        acceptSave()
+        var settled = false
+        return try {
+            browser.restoreSelected(target.id)
+                .map { count ->
+                    settled = true
+                    if (count > 0) {
+                        saveRecords.add(
+                            title,
+                            count,
+                            0L,
+                            target.name,
+                            locateId = target.id,
+                            id = attemptId,
+                            expectedAccount = account,
+                        )
+                    } else if (attemptId != null) {
+                        saveRecords.dismissRunningAttempt(attemptId, account)
+                    }
+                    InstantSaveOutcome.InstantSaved(emptyList(), target, itemCount = count, isReference = false)
+                }
+                .onFailure { err ->
+                    settled = true
+                    if (attemptId != null) {
+                        val msg = dev.piko.shared.notice.PikoErrorMapper.failure(tr("转存分享", "Save shared files", "共有ファイルの保存", "공유 파일 저장", "轉存分享"), err)
+                        saveRecords.failStreamingAttempt(attemptId, account, msg)
+                    }
+                }
+                .reportSaveFailure()
+        } finally {
+            if (!settled && attemptId != null) {
+                saveRecords.dismissRunningAttempt(attemptId, account)
+            }
+            if (instantAttemptId == attemptId) instantAttemptId = null
+        }
+    }
+
+    private suspend fun saveShareTreeAsReferences(
+        target: PikoPathBreadcrumb,
+        browser: ShareTreeBrowser,
+    ): Result<InstantSaveOutcome.InstantSaved> {
+        if (!canReceiveAt(target)) return Result.failure(IllegalStateException(errorMessage))
+        val account = saveAccount?.takeIf { it == driveRepo.currentAccount }
+            ?: return Result.failure(IllegalStateException(tr("当前保存会话已结束", "This save session has ended", "保存セッションは終了しました", "현재 저장 세션이 종료되었습니다", "目前的儲存工作階段已結束")))
+        val vault = driveRepo.vaultAccess(account)
+            ?: return Result.failure(IllegalStateException(tr("账号会话已结束", "Account session ended", "アカウントのセッションが終了しました", "계정 세션이 종료되었습니다", "帳號工作階段已結束")))
+        val title = browser.title.ifBlank { target.name }
+        val attemptId = saveRecords.beginAttempt(account, title, target, emptyList(), keepStructure = true, reference = true)
+        instantAttemptId = attemptId
+        acceptSave()
+        var resolvedFolders = mapOf("" to target.id)
+        val createdIds = mutableListOf<String>()
+        var totalBytes = 0L
+        var settled = false
+        val source = referenceSource()
+        val recordNewFolder: (String, String, String) -> Unit = { parentId, id, name ->
+            if (driveRepo.currentAccount == account) {
+                driveRepo.applyChange(dev.piko.shared.data.DriveChange.Created(parentId, id, name, isFolder = true))
+            }
+        }
+        fun locateFolderId(): String =
+            resolvedFolders.entries.filter { it.key.isNotEmpty() && '/' !in it.key }.singleOrNull()?.value ?: target.id
+        return try {
+            val streamResult = browser.streamSelectedForVault(
+                onProgress = { progress ->
+                    if (attemptId != null) {
+                        val currentName = progress.currentFolderName.takeIf { it.isNotBlank() }
+                        val scanSummary = buildString {
+                            append(
+                                tr(
+                                    "已扫描 ${progress.foldersScanned} 个目录，读取 ${progress.filesCollected} 项",
+                                    "Scanned ${enCount(progress.foldersScanned, "folder", "folders")}, read ${enCount(progress.filesCollected, "item", "items")}",
+                                    "${progress.foldersScanned} フォルダーをスキャン、${progress.filesCollected} 項目を読み込み",
+                                    "폴더 ${progress.foldersScanned}개 스캔, ${progress.filesCollected}개 항목 읽음",
+                                    "已掃描 ${progress.foldersScanned} 個目錄，讀取 ${progress.filesCollected} 項",
+                                ),
+                            )
+                            if (currentName != null && currentName != title) {
+                                append("（")
+                                append(currentName)
+                                append("）")
+                            }
+                        }
+                        val hasSavedAny = progress.filesSaved > 0
+                        saveRecords.updateAttemptProgress(
+                            id = attemptId,
+                            account = account,
+                            done = progress.filesSaved,
+                            total = if (hasSavedAny) maxOf(progress.filesCollected, progress.filesSaved) else 0,
+                            status = if (hasSavedAny) {
+                                tr("正在以引用保存", "Saving as references", "参照として保存中", "참조로 저장 중", "正在以引用儲存")
+                            } else {
+                                tr("正在扫描分享目录", "Scanning shared folders", "共有フォルダーをスキャン中", "공유 폴더 스캔 중", "正在掃描分享目錄")
+                            },
+                            detail = scanSummary,
+                        )
+                    }
+                },
+            ) { batch ->
+                val batchTotal = maxOf(createdIds.size + batch.size, browser.vaultProgress?.filesCollected ?: 0)
+                val ids = instantRepo.saveReferences(
+                    items = batch,
+                    targetParentId = target.id,
+                    keepStructure = true,
+                    names = emptyMap(),
+                    existingFolders = resolvedFolders,
+                    vault = vault,
+                    source = source,
+                    targetIsFreshFolder = false,
+                    knownMetaLookup = driveRepo.knownVaultMetaLookupFor(batch),
+                    onFolderCreated = recordNewFolder,
+                    onFoldersResolved = { resolvedFolders = it },
+                    onFreshVaultFolders = { freshIds ->
+                        if (driveRepo.currentAccount == account) driveRepo.rememberFullyVaulted(freshIds)
+                    },
+                    onProgress = { batchDone, _, status, detail ->
+                        if (attemptId != null) {
+                            saveRecords.updateAttemptProgress(
+                                id = attemptId,
+                                account = account,
+                                done = createdIds.size + batchDone.coerceAtMost(batch.size),
+                                total = batchTotal,
+                                status = status,
+                                detail = detail,
+                            )
+                        }
+                    },
+                ) { members ->
+                    if (driveRepo.currentAccount == account) driveRepo.vaultTrees.merge(members)
+                }.getOrThrow()
+                createdIds += ids
+                totalBytes += batch.sumOf { it.file.size }
+                Result.success(ids.size)
+            }
+            if (driveRepo.currentAccount == account) {
+                driveRepo.notifyFoldersRefreshed(setOf(target.id))
+            }
+            streamResult.map {
+                settled = true
+                if (createdIds.isNotEmpty()) {
+                    saveRecords.add(
+                        title,
+                        createdIds.size,
+                        totalBytes,
+                        target.name,
+                        locateId = locateFolderId(),
+                        id = attemptId,
+                        expectedAccount = account,
+                    )
+                } else if (attemptId != null) {
+                    saveRecords.dismissRunningAttempt(attemptId, account)
+                }
+                InstantSaveOutcome.InstantSaved(createdIds, target, itemCount = createdIds.size, isReference = true)
+            }.onFailure { err ->
+                settled = true
+                if (attemptId != null) {
+                    val msg = dev.piko.shared.notice.PikoErrorMapper.failure(tr("以引用保存", "Save as references", "参照として保存", "참조로 저장", "以引用儲存"), err)
+                    saveRecords.failStreamingAttempt(
+                        id = attemptId,
+                        account = account,
+                        message = msg,
+                        confirmedCount = createdIds.size,
+                        locateId = locateFolderId(),
+                    )
+                }
+            }.reportSaveFailure()
+        } finally {
+            if (!settled && attemptId != null) {
+                if (createdIds.isNotEmpty()) {
+                    saveRecords.add(
+                        title,
+                        createdIds.size,
+                        totalBytes,
+                        target.name,
+                        locateId = locateFolderId(),
+                        id = attemptId,
+                        expectedAccount = account,
+                    )
+                } else {
+                    saveRecords.dismissRunningAttempt(attemptId, account)
+                }
+            }
+            if (instantAttemptId == attemptId) instantAttemptId = null
+        }
+    }
+
     fun saveSelectionInstantly() {
         if (!scope.isActive) return
         saveBlockReason?.let { errorMessage = it; return }
         if (instantRetry != null) { saveSelection(); return }
-        if (saveIssue?.requiresInspection == true) return
         if (isSaving || savePlan?.fallback == null) return
         val toSave = itemsToSave.filter { it.isInstantReady }
         isSaving = true
@@ -828,11 +1097,9 @@ class InstantSheetState private constructor(
         saveParent = target
         val folderId = driveRepo.createFolder(target.id, name).getOrElse { err ->
             PikoLog.w(TAG, "Failed to create destination folder in ${logFolder(target.id)} for instant save (items=${toSave.size})", err)
-            errorMessage = dev.piko.shared.notice.PikoErrorMapper.failure(tr("新建文件夹", "Create folder", "フォルダーを作成", "폴더 만들기", "新增資料夾"), err)
-            val definitelyRefused = err is PikPakException && err.httpStatus in setOf(400, 401, 403, 404, 409, 422)
-            val receipt = InstantSaveReceipt(requireNotNull(saveAccount), target.id, notAttempted = toSave.mapTo(HashSet()) { it.file.path },
-                unconfirmedFolder = name.takeUnless { definitelyRefused })
-            errorMessage = receipt.message
+            val failureMessage = dev.piko.shared.notice.PikoErrorMapper.failure(tr("新建文件夹", "Create folder", "フォルダーを作成", "폴더 만들기", "新增資料夾"), err)
+            val receipt = InstantSaveReceipt(requireNotNull(saveAccount), target.id, notAttempted = toSave.mapTo(HashSet()) { it.file.path })
+            errorMessage = failureMessage
             saveIssue = receipt
             instantAttemptId?.let { saveRecords.finishAttempt(it, receipt) }
             driveRepo.applyChange(dev.piko.shared.data.DriveChange.ContentsChanged(setOf(target.id)))
@@ -841,19 +1108,20 @@ class InstantSheetState private constructor(
         val folder = PikoPathBreadcrumb(folderId, name)
         savedContainer = folder
         instantAttemptId?.let { saveRecords.observeContainer(it, requireNotNull(saveAccount), folderId) }
+        val ref = effectiveSaveAsReference
         return instantSave(folder, toSave, naming, keepStructure = true, targetIsFreshFolder = true).map { ids ->
             saveRecords.add(name, ids.size, toSave.sumOf { it.file.size }, target.name, locateId = folderId,
                 id = instantAttemptId, expectedAccount = saveAccount)
             instantAttemptId = null
             savedContainer = null
             saveParent = null
-            InstantSaveOutcome.InstantSaved(ids, folder)
+            InstantSaveOutcome.InstantSaved(ids, folder, isReference = ref)
         }
     }
 
     fun submitOfflineTask() {
         if (!scope.isActive) return
-        if (instantRetry != null || saveIssue?.requiresInspection == true || saveBlockReason != null) return
+        if (instantRetry != null || saveBlockReason != null) return
         if (isSaving || input.isBlank()) return
         isSaving = true
         saveScope.launch {
@@ -868,6 +1136,22 @@ class InstantSheetState private constructor(
     }
 
     internal suspend fun submitForBatch(target: PikoPathBreadcrumb): Result<List<String>?> {
+        val browser = shareTree
+        if (browser != null && browser.isLazyMode) {
+            isSaving = true
+            try {
+                if (saveBlockReason != null) return Result.failure(IllegalStateException(saveBlockReason))
+                if (!browser.hasSelection) return Result.failure(IllegalStateException(tr("未勾选文件", "No files selected", "ファイルが選択されていません", "선택한 파일이 없습니다", "未勾選檔案")))
+                val outcome = if (effectiveSaveAsReference) {
+                    saveShareTreeAsReferences(target, browser)
+                } else {
+                    saveShareTreeRestore(target, browser)
+                }
+                return outcome.map { it.createdIds }
+            } finally {
+                isSaving = false
+            }
+        }
         val plan = savePlan
         val toSave = if (effectiveSaveAsReference) referenceItemsToSave else itemsToSave
         isSaving = true
@@ -877,10 +1161,6 @@ class InstantSheetState private constructor(
                 saveBlockReason != null -> {
                     PikoLog.d(TAG, "Rejected batch row before submission: blocked (target=${logFolder(target.id)})")
                     Result.failure(IllegalStateException(saveBlockReason))
-                }
-                saveIssue?.requiresInspection == true -> {
-                    PikoLog.d(TAG, "Rejected batch row before submission: prior save requires inspection (target=${logFolder(target.id)})")
-                    Result.failure(IllegalStateException(tr("本次保存结果待确认，请先在任务页核对", "This save result is unconfirmed. Check Tasks first", "今回の保存結果は未確認です。先にタスク画面で確認してください", "이번 저장 결과가 미확인입니다. 먼저 작업 페이지에서 확인해 주세요", "本次儲存結果待確認，請先在任務頁核對")))
                 }
                 effectiveSaveAsReference && toSave.isEmpty() -> {
                     PikoLog.d(TAG, "Rejected batch row before submission: selected items lack references (target=${logFolder(target.id)})")
@@ -920,9 +1200,11 @@ class InstantSheetState private constructor(
         resolvedKey = magnet
         resolveJob?.cancel()
         resolution = null
+        shareTree = null
         tree = null
         canonical = null
-        selectedIndices = emptySet()
+        selectionState = CompactIndexSelection.EMPTY
+        subtitleIndexSet = emptySet()
         sourceSelectionEdited = false
         selectionPicked = false
         errorMessage = null
@@ -971,21 +1253,37 @@ class InstantSheetState private constructor(
             errorMessage = tr("云端未收录，可使用离线下载", "Not indexed in the cloud; cloud download available", "クラウドに未収録です。クラウドダウンロードを利用できます", "클라우드에 미등록된 항목입니다. 클라우드 다운로드를 이용할 수 있습니다", "雲端未收錄，可使用離線下載")
             return
         }
+        if (isLazyShareMode) {
+            tree = null
+            canonical = null
+            subtitleIndexSet = emptySet()
+            folderNameEdited = false
+            resolution = data
+            expandedGroups.clear()
+            showsOnlyUnindexed = false
+            folderName = data.resource.name
+            selectionState = CompactIndexSelection.EMPTY
+            selectionPicked = false
+            if (isRoot) scope.launch { refreshRemainingBytes() }
+            return
+        }
         isAnalyzing = true
+        val parse = preferences.nameParsingFlow.first() && data.items.size <= LARGE_ANALYSIS_THRESHOLD
         val inputs = data.items.map { MediaFileInput(it.file.path, it.file.size) }
-        val parse = preferences.nameParsingFlow.first()
         val built = withContext(Dispatchers.Default) {
             if (parse) buildInstantTree(inputs, data.resource.name) else buildRawInstantTree(inputs, data.resource.name)
         }
         val names = if (parse) withContext(Dispatchers.Default) { canonicalNamesOf(data) } else null
         tree = built
         canonical = names
+        subtitleIndexSet = built.rows.flatMapTo(HashSet()) { it.subtitleIndices }
         folderNameEdited = false
         resolution = data
         expandedGroups.clear()
         showsOnlyUnindexed = false
         folderName = built.folderName
-        selectedIndices = if (data.items.size == 1 && normalizedMagnet == null) setOf(0) else built.defaultSelection
+        val initialSel = if (data.items.size == 1 && normalizedMagnet == null) setOf(0) else built.defaultSelection
+        selectionState = CompactIndexSelection.fromSet(data.items.size, initialSel)
         selectionPicked = false
         if (isRoot) scope.launch { refreshRemainingBytes() }
     }
@@ -1057,7 +1355,7 @@ class InstantSheetState private constructor(
         val account = saveAccount?.takeIf { it == driveRepo.currentAccount } ?: return false
         if (saveRecords.pendingConflict(account, saveParent?.id ?: target.id, files.map { it.file }, excluding = instantAttemptId,
                 containerName = containerName, names = names, keepStructure = keepStructure)) {
-            errorMessage = tr("目标位置有进行中或待确认的保存任务，请先在任务页处理", "A save to this destination is running or unconfirmed. Check Tasks first", "同じ保存先への保存が進行中または未確認です。先にタスク画面で確認してください", "같은 대상에 저장이 진행 중이거나 미확인입니다. 먼저 작업 페이지에서 확인해 주세요", "目標位置有進行中或待確認的儲存任務，請先至任務頁處理")
+            errorMessage = tr("目标位置已有进行中的保存任务，请稍后再试", "A save to this destination is already running", "同じ保存先への保存が進行中です", "같은 대상에 저장이 진행 중입니다", "目標位置已有進行中的儲存任務，請稍後再試")
             return false
         }
         instantAttemptId = saveRecords.beginAttempt(account, title, target, files.map { it.file }, instantAttemptId,
@@ -1071,16 +1369,36 @@ class InstantSheetState private constructor(
         submitted: List<InstantFileItem>,
         targetIsFreshFolder: Boolean = false,
     ): Result<List<String>> {
-        val execution = InstantSaveExecutor(instantRepo, driveRepo, requireNotNull(saveAccount)).execute(
-            plan, submitted, targetIsFreshFolder, effectiveSaveAsReference, previewedIds.toMap(),
-            referenceSource(), normalizedMagnet ?: findShareLink(input), saveParent?.id,
-        )
+        val account = requireNotNull(saveAccount)
+        val attemptId = instantAttemptId
+        val execution = try {
+            InstantSaveExecutor(instantRepo, driveRepo, account).execute(
+                plan, submitted, targetIsFreshFolder, effectiveSaveAsReference, previewedIds.toMap(),
+                referenceSource(), normalizedMagnet ?: findShareLink(input), saveParent?.id,
+                onProgress = { done, total, status, detail ->
+                    if (attemptId != null) {
+                        saveRecords.updateAttemptProgress(
+                            id = attemptId,
+                            account = account,
+                            done = done,
+                            total = total,
+                            status = status,
+                            detail = detail,
+                        )
+                    }
+                },
+            )
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            instantAttemptId?.let { saveRecords.dismissRunningAttempt(it, account) }
+            instantAttemptId = null
+            throw cancelled
+        }
         val result = execution.response
         val receipt = execution.receipt
         if (!effectiveSaveAsReference) submitted.filter { it.file.path in execution.confirmedPaths }
             .forEach { item -> item.file.gcid?.let(previewedIds::remove) }
         instantAttemptId?.let { saveRecords.finishAttempt(it, receipt) }
-        val complete = receipt.confirmed.keys.containsAll(plan.files.filter { it.file.gcid != null }.map { it.file.path }) && !receipt.requiresInspection
+        val complete = receipt.confirmed.keys.containsAll(plan.files.filter { it.file.gcid != null }.map { it.file.path })
         return if (complete) {
             saveIssue = null
             instantRetry = null
@@ -1089,7 +1407,7 @@ class InstantSheetState private constructor(
             saveIssue = receipt
             val missing = result.exceptionOrNull() is InstantContentUnavailableException && plan.files.size == 1
             instantRetry = if (missing) null else plan.copy(receipt = receipt)
-            if (missing) result else Result.failure(InstantSaveIncomplete(receipt, result.exceptionOrNull() ?: IllegalStateException(tr("仍有待确认的保存结果", "Some save results are unconfirmed", "未確認の保存結果があります", "아직 미확인 저장 결과가 있습니다", "仍有待確認的儲存結果"))))
+            if (missing) result else Result.failure(InstantSaveIncomplete(receipt, result.exceptionOrNull() ?: IllegalStateException(tr("部分文件保存失败", "Some files failed to save", "一部のファイルを保存できませんでした", "일부 파일 저장에 실패했습니다", "部分檔案儲存失敗"))))
         }
     }
 
@@ -1108,9 +1426,8 @@ class InstantSheetState private constructor(
     private suspend fun resumeInstant(): Result<List<String>> {
         val plan = instantRetry ?: return Result.failure(IllegalStateException(tr("没有可重试的保存", "No saves to retry", "再試行できる保存がありません", "다시 시도할 저장 작업이 없습니다", "沒有可重試的儲存")))
         if (!canReceiveAt(plan.target)) return Result.failure(IllegalStateException(errorMessage))
-        if (plan.receipt.unconfirmedFolder != null) return Result.failure(IllegalStateException(tr("文件夹创建结果待确认，暂无法重复创建", "Folder creation is unconfirmed; cannot recreate yet", "フォルダーの作成結果が未確認のため、再作成できません", "폴더 생성 결과가 미확인 상태이므로 다시 만들 수 없습니다", "資料夾建立結果待確認，暫無法重複建立")))
         val remaining = plan.files.filter { it.file.path in (plan.receipt.failed + plan.receipt.notAttempted) }
-        if (remaining.isEmpty()) return Result.failure(IllegalStateException(tr("无已确认失败的文件，请先在任务页核对结果", "No confirmed failed files. Check results in Tasks first", "未保存と確認されたファイルがありません。先にタスク画面で結果を確認してください", "저장 실패로 확인된 파일이 없습니다. 먼저 작업 페이지에서 결과를 확인해 주세요", "無已確認失敗的檔案，請先至任務頁核對結果")))
+        if (remaining.isEmpty()) return Result.failure(IllegalStateException(tr("没有需要重试的文件", "No failed files to retry", "再試行するファイルがありません", "다시 시도할 파일이 없습니다", "沒有需要重試的檔案")))
         instantAttemptId?.let { id -> saveRecords.beginAttempt(requireNotNull(saveAccount), plan.target.name, plan.target, plan.files.map { it.file }, id) }
         return executeInstant(plan, remaining).onSuccess { ids ->
             val container = savedContainer
@@ -1168,12 +1485,14 @@ class InstantSheetState private constructor(
             ) { errorMessage = it }
         } else {
             val r = incomplete.receipt
-            errorMessage = r.message
+            val causeMessage = incomplete.cause?.let {
+                dev.piko.shared.notice.PikoErrorMapper.failure(tr("保存", "Save", "保存", "저장", "儲存"), it)
+            }
+            errorMessage = if (r.confirmed.isEmpty() && causeMessage != null) causeMessage else r.message
             logFailure(
                 TAG,
-                "Instant save finished with incomplete confirmation (attempt=${instantAttemptId ?: "none"}, target=${logFolder(r.targetId)}, " +
-                    "confirmed=${r.confirmed.size}, unconfirmed=${r.unconfirmed.size}, namingUnconfirmed=${r.namingUnconfirmed.size}, " +
-                    "failed=${r.failed.size}, notAttempted=${r.notAttempted.size}, unconfirmedFolder=${r.unconfirmedFolder != null})",
+                "Instant save finished with partial failure (attempt=${instantAttemptId ?: "none"}, target=${logFolder(r.targetId)}, " +
+                    "confirmed=${r.confirmed.size}, failed=${r.failed.size}, notAttempted=${r.notAttempted.size})",
             )
         }
     }
@@ -1220,20 +1539,8 @@ class InstantSheetState private constructor(
         private const val TAG = "Instant"
         private const val AUTO_RESOLVE_DEBOUNCE_MS = 350L
         private const val BATCH_INDEX_STRIDE = 1_000_000
+        private const val LARGE_ANALYSIS_THRESHOLD = 2_000
 
-        /**
-         * 一次解析最多展开多少个文件夹。
-         *
-         * 以前是 64：一个大合集的子目录就能撞上，后面的片子全部读不到，用户只看到一句
-         * 「清单不完整」。512 覆盖绝大多数合集，按每批 8 个并发列表请求算，也就多几十轮，
-         * 还不至于触发网盘限流；再多就该引导用户分批引用了。
-         */
-        private const val MAX_SHARE_FOLDERS = 512
-
-        /**
-         * 各文件的规范名。没有一个文件会改名时为 null。
-         * 按种子里的目录分组，与网盘里同目录的规则一致：撞名、字幕跟随只在同一层里看。
-         */
         private fun canonicalNamesOf(data: MagnetResolutionResult): CanonicalNames? {
             val files = data.items.map { it.file }
             val inputs = files.map { AvNamingItem(it.name, group = it.path.substringBeforeLast('/', "")) }

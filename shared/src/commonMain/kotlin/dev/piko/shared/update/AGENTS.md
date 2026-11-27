@@ -1,6 +1,6 @@
 # 应用内更新
 
-Android 与桌面端均支持应用内检查与安装更新。跨平台版本检查、多语言更新说明解析与分段下载位于本目录（`GithubReleaseClient`、`GithubReleases.kt`），具体安装落地由各平台分别实现：Android 移交系统 `PackageInstaller`；macOS 经 `apply-update-mac.sh` 整包替换 `Piko.app`；Linux 仅针对 AppImage 执行纯 Kotlin `.zsync` 块级差分替换（详见 `../../../../../../../../desktopApp/AGENTS.md`）；Windows 由 `DesktopAppUpdater` 与 `apply-update.ps1` 执行带事务回滚的补丁替换、便携版 `image.zip` 按需 Range 提取或 MSI 整包重装。
+Android 与桌面端均支持应用内检查与安装更新。跨平台版本检查、多语言更新说明解析与分段下载位于本目录（`GithubReleaseClient`、`GithubReleases.kt`），具体安装落地由各平台分别实现：Android 经 `FileProvider` + `ACTION_VIEW` 移交系统或第三方安装器（避免 `PackageInstaller` 会话触发 Google Play Protect 对侧载包的启发式误报）；macOS 经 `apply-update-mac.sh` 整包替换 `Piko.app`；Linux 仅针对 AppImage 执行纯 Kotlin `.zsync` 块级差分替换（详见 `../../../../../../../../desktopApp/AGENTS.md`）；Windows 由 `DesktopAppUpdater` 复制随包 JRE 至临时目录并以 `javaw.exe -jar` 启动纯 `java.base` 更新器 `WindowsUpdateApplier`（彻底避免调用 `powershell.exe -ExecutionPolicy Bypass` 引发安全软件 LOLBin 行为误报），执行带事务回滚的补丁替换、便携版 `image.zip` 按需 Range 提取或 MSI 整包重装。
 
 ## 版本检查、安全边界与多语言更新说明
 
@@ -15,7 +15,8 @@ Android 与桌面端均支持应用内检查与安装更新。跨平台版本检
 
 - 发版前在 `.github/changelogs/<version>.md` 中编写 `# zh-Hans`、`# zh-Hant`、`# en`、`# ja`、`# ko` 五段更新说明。`release.yml` 最开头的第一个前置 job 对正式 tag 发版执行硬性门控校验（缺失或任一语言为空即在数秒内失败阻断，不浪费后续测试与编译时间；`workflow_dispatch` 演练不强制要求），且前置校验与 `release` job 均优先从 `origin/main` 读取该文件（回退至 tag 提交树），支持漏写或修订文案后推送到 `main` 直接单任务 Rerun `release` job 幂等覆盖草稿附件与 SLSA 证明。
 - `release` job 将 `zh-Hans` 拼接在 `.github/release-notes.md` 的 `## 下载` 附件表之前作为 GitHub Release 页面正文（保持中文默认展示并兼容旧版客户端：`GithubReleases.kt` 的 `updateNotesOf` 读到 `## 下载` 即截断，修改该标题须同步修改 `.github/release-notes.md`，由 `ReleaseNotesTest` 守护），同时将 `zh-Hans` 写入 `release.json` 的 `body` 字段，并将全部五种语言写入 `release.json` 的 `localized_notes` 字段。
-- 客户端请求 `api.github.com` 成功但响应体本身不含 `localized_notes` 时，`GithubReleaseClient` 会按 API 公布的 `release.json` 权威 SHA-256 摘要经 `ReleaseAsset.urls` 下载并校验 `release.json`，提取 `localized_notes` 供 `UpdateDialog` 按 `PikoLocale.effectiveLanguage` 展示对应语言更新说明（缺失时依次回退至 `zh-Hans` 与截断后的默认 `body`）。
+- 客户端请求 `api.github.com` 成功但响应体本身不含 `localized_notes` 时，`GithubReleaseClient` 会按 API 公布的 `release.json` 权威 SHA-256 摘要经 `ReleaseAsset.urls` 下载并校验 `release.json`，提取 `localized_notes` 供 `UpdateDialog` 按 `PikoLocale.effectiveLanguage` 展示对应语言更新说明（缺失时依次回退至 `zh-Hans` 与截断后的默认 `body`）；更新说明解析支持 `##`/`###` 标题层级与多级嵌套列表（由 `ReleaseNotesTest` 守护）。
+- **非阻塞后台下载、分阶段遥测与失败恢复（`AppUpdateService`、`UpdateDialog`）**：更新下载协程归属应用级 `serviceScope`（`startDownload` / `cancelDownload`），关闭 `UpdateDialog` 时下载在后台继续执行，并由侧边栏 `SidebarAccountRow` 与设置「关于」卡片持续呈现下载环与就绪态「重启并更新」入口。`UpdateStatus.Downloading` 携带 `downloadedBytes`、`totalBytes`、`bytesPerSec`、`stage`（`UpdateStage.Downloading` / `Verifying` / `Staging`）与 `modeLabel`（如 zstd 差分 / 补丁 / 按需镜像 / MSI / DMG / AppImage / APK），由 `UpdateProgressTracker` 按 `>=1%` 或 `>=250ms` 节流并在 `downloadLock` 下单调上报，消除逐块重组与阶段竞争。任何失败态（包括 `ChecksumMismatchException` 与启动自动提示模式）均同时提供「重试」与「打开下载页」两个出口，杜绝无解死胡同。
 
 ## Windows 更新架构与老客户端兼容契约
 
@@ -25,7 +26,7 @@ Android 与桌面端均支持应用内检查与安装更新。跨平台版本检
 
 1. **传统补丁与 MSI 通道（`files.json`、`app.zip`、`.msi` 及 zstd 差分包）**：
    - `app.zip` 除包含每次编译必变的启动器、应用 jar、AOT 缓存与 `Piko.cfg` 外，还包含相对于所有仍在服役的已公开旧版（`1.0.0` 以外全部带清单的已发布版本，由 `.github/scripts/update-bases.sh` 拉取比对）新增或发生变化的 JRE 运行时、mpv 与原生库文件，并在 `files.json` 中统一标记 `patch = true`（`UpdateArtifactsTask`）。
-   - 针对近期版本的 zstd 二进制差分包（`piko-windows-<架构>-<版本>-from-<旧版本>.zip`）在客户端通过 FFM 直接调用随包 `app/resources/zstd/` 目录下的原生 `libzstd`（`desktopApp/.../update/ZstdPatch.kt`），x64 与 arm64 完全同路：由于 `zstd-jni` 的 `win_aarch64` 动态库仅导出标准 C 函数而未编译 JNI 桥接符号，其 Java 包装类在 Windows ARM64 上不可用，因此运行时彻底剥离 `zstd-jni` Java 依赖，仅在构建期从各平台 jar 提取原生 DLL（`1.1.0` 及更早的 ARM64 客户端仍调用 `zstd-jni` 类，会自动降级回退至整文件替换；`release.yml` 在 `windows-11-arm` 打包机上直接运行 `:desktopApp:desktopTest` 验证真实 DLL 加载与差分还原）。
+   - 针对近期版本（当前与上一 `minor` 系列并上最近 5 个已公开版本，见 `.github/scripts/delta-updates.sh`）的 zstd 二进制差分包（`piko-windows-<架构>-<版本>-from-<旧版本>.zip`）在客户端通过 FFM 直接调用随包 `app/resources/zstd/` 目录下的原生 `libzstd`（`desktopApp/.../update/ZstdPatch.kt`），x64 与 arm64 完全同路：由于 `zstd-jni` 的 `win_aarch64` 动态库仅导出标准 C 函数而未编译 JNI 桥接符号，其 Java 包装类在 Windows ARM64 上不可用，因此运行时彻底剥离 `zstd-jni` Java 依赖，仅在构建期从各平台 jar 提取原生 DLL（`1.1.0` 及更早的 ARM64 客户端仍调用 `zstd-jni` 类，会自动降级回退至整文件替换；`release.yml` 在 `windows-11-arm` 打包机上直接运行 `:desktopApp:desktopTest` 验证真实 DLL 加载与差分还原）。
 2. **便携版全量按需提取通道（`image.zip`）**：包含整个应用目录的逐条目压缩包。当新版客户端的便携版因本机文件被改动或版本早于补丁基准而无法通过 `app.zip` 补丁校验时，`ImageZip.kt` 通过 HTTP Range 先拉取 `image.zip` 末尾的 ZIP 中央目录，计算差异后仅按 Range 下载本机缺失或哈希不一致的条目（例如跨 JDK 升级仅需下载约 `34 MB` 而非全量 `116 MB`；若镜像不支持 Range 则回退整包下载）。MSI 安装版在补丁失配时照常回退至 `.msi` 整包重装。
 
 ### 不可破坏的老客户端发版契约
@@ -40,8 +41,8 @@ Android 与桌面端均支持应用内检查与安装更新。跨平台版本检
 
 ### Windows 补丁事务日志、回滚与 MSI 修复兼容
 
-- **崩溃一致性事务（`apply-update.ps1`）**：脚本等待启动器与 JVM 子进程双双退出（超时未退则写入失败标记并重新拉起旧版；安装目录无写权限如便携版置于 `Program Files` 下时客户端直接仅提供下载页），在改动任何文件前先在安装目录落盘并独占锁定 `.piko-update.journal` 事务日志。文件操作严格遵循 `新增文件 -> 替换既有文件 -> 最后更新 Piko.cfg` 的顺序（遇杀毒软件或系统索引器短暂占用文件句柄时退避重试约 `7 秒`），提交完成后删除日志；若中途断电或脚本被强杀，下次启动时 `DesktopAppUpdater.create` 检测到未被独占锁定的残留 `.piko-update.journal`，立即以 `-Mode recover` 移交脚本并自行退出，由脚本依据日志完整回滚至旧版、记录失败提示后重启旧版（日志存在期间 `.old` 与 `.new` 备份绝不当作普通残留清理）。该机制由真跑 PowerShell 的 `ApplyUpdateScriptTest` 与 `package-smoke/windows.ps1` 场景 7 端到端验证。
-- **MSI 就地补丁与 Windows Installer 修复（Repair）兼容**：MSI 安装版同样优先采用就地打补丁以节省流量与时间。Windows Installer 执行修复（控制面板「修复」或默认 `msiexec /f` 即 `omus` 模式）时，对于无 PE 版本号的文件（如 `.jar`、`app.aot`），只要其**创建时间早于修改时间**即视为用户修改过的文件而予以保留；对于带 PE 版本号的 `Piko.exe`，高版本不会被旧版覆盖。因此 `apply-update.ps1` 在替换补丁文件后显式继承原文件的创建时间（`1.1.0` 旧脚本升级那一跳则依赖 Windows 默认开启的 NTFS 15 秒文件名隧道机制自动继承创建时间），并按清单将类路径 jar 的修改时间还原至与 `-Dpiko.classpath-mtime` 一致的构建时刻，确保修复操作要么完好保留补丁，要么在强制全量重装（`/fa`）时干净退回可正常启动并再次提示更新的旧版，绝不损坏安装镜像（注意：就地补丁不修改 Windows「已安装应用」列表中登记的初始 MSI 版本号）。
+- **崩溃一致性事务（`WindowsUpdateApplier`）**：更新器先将随包 `runtime/` 独立拷贝至临时目录并完成 `ready` 文件握手确认后再通知主进程退出（防止拷贝的运行时不可用时主进程白白退出；已完成更新遗留的临时辅助目录由下次启动后台线程按属主 PID 存活态安全回收），随后按 `<pid>:<startEpochMillis>` 等待启动器与 JVM 子进程双双退出（超时未退则写入失败标记并重新拉起旧版；安装目录无写权限如便携版置于 `Program Files` 下时客户端直接仅提供下载页），在改动任何文件前先在安装目录落盘并以强制文件锁（`FileChannel.tryLock`）独占锁定 `.piko-update.journal` 事务日志。文件操作严格遵循 `新增文件 -> 替换既有文件 -> 最后更新 Piko.cfg` 的顺序（遇杀毒软件或系统索引器短暂占用文件句柄时退避重试约 `7 秒`），提交完成后删除日志；若中途断电或进程被强杀，下次启动时 `DesktopAppUpdater.create` 检测到未被独占锁定的残留 `.piko-update.journal`，立即以 `recover` 模式移交更新器并自行退出，依据日志完整回滚至旧版、记录失败提示后重启旧版（日志存在期间 `.old` 与 `.new` 备份绝不当作普通残留清理）。该机制由 `ApplyUpdateScriptTest` 与 `package-smoke/windows.ps1` 场景 7 端到端验证。
+- **MSI 就地补丁与 Windows Installer 修复（Repair）兼容**：MSI 安装版同样优先采用就地打补丁以节省流量与时间。Windows Installer 执行修复（控制面板「修复」或默认 `msiexec /f` 即 `omus` 模式）时，对于无 PE 版本号的文件（如 `.jar`、`app.aot`），只要其**创建时间早于修改时间**即视为用户修改过的文件而予以保留；对于带 PE 版本号的 `Piko.exe`，高版本不会被旧版覆盖。因此 `WindowsUpdateApplier` 在替换补丁文件后显式继承原文件的创建时间（`1.1.0` 旧脚本升级那一跳则依赖 Windows 默认开启的 NTFS 15 秒文件名隧道机制自动继承创建时间），并按清单将类路径 jar 的修改时间还原至与 `-Dpiko.classpath-mtime` 一致的构建时刻，确保修复操作要么完好保留补丁，要么在强制全量重装（`/fa`）时干净退回可正常启动并再次提示更新的旧版，绝不损坏安装镜像（注意：就地补丁不修改 Windows「已安装应用」列表中登记的初始 MSI 版本号）。
 
 ## 端到端安装与历史升级冒烟测试
 

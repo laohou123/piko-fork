@@ -29,8 +29,10 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import kotlinx.coroutines.launch
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
@@ -50,17 +52,22 @@ import dev.piko.data.auth.SessionManager
 import dev.piko.shared.log.PikoLog
 import java.util.concurrent.ConcurrentHashMap
 import dev.piko.shared.media.player.PlaybackBackend
+import dev.piko.shared.media.storyboard.StoryboardIdrDecoder
 import kotlinx.coroutines.CancellationException
 import dev.piko.ui.LocalPikoServices
 import dev.piko.ui.platform.BackgroundTransferAccess
 import dev.piko.ui.platform.DownloadLocationPicker
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.runBlocking
 import dev.piko.ui.platform.ExternalVideoPlayer
 import dev.piko.ui.platform.LandscapeLock
 import dev.piko.ui.platform.LinkAssociation
 import dev.piko.ui.platform.LocalFileActions
 import dev.piko.ui.platform.PikoPlatform
+import dev.piko.ui.platform.PlayerNetworkType
+import dev.piko.ui.platform.PlayerSystemStatusInfo
 import dev.piko.ui.platform.PreviewBackend
 import dev.piko.ui.platform.CoverPicker
 import dev.piko.ui.platform.UploadPicker
@@ -74,8 +81,12 @@ import dev.piko.ui.screens.player.findActivity
 import dev.piko.update.AppUpdateService
 import java.io.File
 import android.graphics.Bitmap
+import android.media.MediaDataSource
+import android.media.MediaMetadataRetriever
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import coil3.BitmapImage
 import coil3.SingletonImageLoader
 import coil3.request.CachePolicy
@@ -103,6 +114,7 @@ class AndroidPikoPlatform(
 
     override val formFactor: FormFactor = FormFactor.Mobile
     override val motionStyle: MotionStyle = MotionStyle.Expressive
+    override val supportsPredictiveBack: Boolean = true
 
     override val revealsLastTypedPassword: Boolean = true
 
@@ -126,6 +138,23 @@ class AndroidPikoPlatform(
 
     override val supportsBlur: Boolean = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
 
+    override val appSecurity: AndroidAppSecurity = AndroidAppSecurity(context)
+
+    override fun observeSystemStatus(): Flow<PlayerSystemStatusInfo?> =
+        AndroidSystemStatus.observe(context).map { snapshot ->
+            PlayerSystemStatusInfo(
+                batteryPercent = snapshot.batteryPercent,
+                isCharging = snapshot.isCharging,
+                networkType = when (snapshot.networkKind) {
+                    AndroidNetworkKind.Wifi -> PlayerNetworkType.Wifi
+                    AndroidNetworkKind.Ethernet -> PlayerNetworkType.Ethernet
+                    AndroidNetworkKind.Cellular -> PlayerNetworkType.Cellular
+                    AndroidNetworkKind.Offline -> PlayerNetworkType.Offline
+                    AndroidNetworkKind.Unknown -> null
+                },
+            )
+        }
+
     override fun openUrl(url: String) {
         startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
     }
@@ -140,6 +169,10 @@ class AndroidPikoPlatform(
 
     override fun copyToClipboard(label: String, text: String) {
         clipboard.setPrimaryClip(ClipData.newPlainText(label, text))
+    }
+
+    override suspend fun listSubtitleFonts(): List<String> = withContext(Dispatchers.IO) {
+        AndroidSubtitleFonts.discoverFontFamilies()
     }
 
     override val localFiles: LocalFileActions = AndroidLocalFiles()
@@ -180,6 +213,8 @@ class AndroidPikoPlatform(
 
     override val videoPreview: VideoPreviewSupport = MpvPreviewSupport()
 
+    override val htmlViewer: dev.piko.ui.platform.HtmlViewerSupport = AndroidHtmlViewerSupport()
+
     // 清单里的 intent-filter 已让 Piko 出现在磁力链接与种子文件的选择器里，默认由用户在选择器里点「始终」。
     // 应用没有接口替用户设定：RoleManager 只管浏览器、电话、短信这类角色，「默认打开」页只管验证过的 http 链接
     override val linkAssociation: LinkAssociation? = null
@@ -192,13 +227,13 @@ class AndroidPikoPlatform(
 
         override fun requestUnrestricted() {
             val packageUri = Uri.parse("package:${context.packageName}")
-            val requested = runCatching {
+            val opened = runCatching {
                 context.startActivity(
-                    Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, packageUri)
+                    Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS, packageUri)
                         .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
                 )
             }.isSuccess
-            if (!requested) {
+            if (!opened) {
                 startActivity(Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
             }
         }
@@ -241,6 +276,88 @@ class AndroidPikoPlatform(
             PikoLog.w(TAG, "Failed to query domain verification state", e)
             false
         }
+    }
+
+    private val previewDecodeSemaphore = Semaphore(2)
+
+    override suspend fun decodeVideoPreviewFrame(bytes: ByteArray, maxWidthPx: Int): ImageBitmap? {
+        if (bytes.size < 376) return null
+        return previewDecodeSemaphore.withPermit {
+            withContext(Dispatchers.IO) {
+                val retriever = MediaMetadataRetriever()
+                try {
+                    retriever.setDataSource(object : MediaDataSource() {
+                        override fun getSize(): Long = bytes.size.toLong()
+                        override fun readAt(position: Long, buffer: ByteArray, offset: Int, size: Int): Int {
+                            if (position < 0L || position >= bytes.size) return -1
+                            val start = position.toInt()
+                            val count = minOf(size, bytes.size - start)
+                            bytes.copyInto(buffer, destinationOffset = offset, startIndex = start, endIndex = start + count)
+                            return count
+                        }
+                        override fun close() = Unit
+                    })
+                    extractScaledFrame(retriever, timeUs = 0L, maxWidthPx = maxWidthPx)
+                } catch (cancel: CancellationException) {
+                    throw cancel
+                } catch (_: Throwable) {
+                    null
+                } finally {
+                    runCatching { retriever.release() }
+                }
+            }
+        }
+    }
+
+    override suspend fun decodeLocalVideoPreviewFrame(path: String, positionMillis: Long, maxWidthPx: Int): ImageBitmap? {
+        if (path.isBlank()) return null
+        return previewDecodeSemaphore.withPermit {
+            withContext(Dispatchers.IO) {
+                val retriever = MediaMetadataRetriever()
+                try {
+                    if (path.startsWith("content://")) {
+                        retriever.setDataSource(context, Uri.parse(path))
+                    } else {
+                        retriever.setDataSource(path)
+                    }
+                    extractScaledFrame(retriever, timeUs = positionMillis.coerceAtLeast(0L) * 1_000L, maxWidthPx = maxWidthPx)
+                } catch (cancel: CancellationException) {
+                    throw cancel
+                } catch (_: Throwable) {
+                    null
+                } finally {
+                    runCatching { retriever.release() }
+                }
+            }
+        }
+    }
+
+    override fun createStoryboardIdrDecoder(): StoryboardIdrDecoder = AndroidStoryboardIdrDecoder()
+
+    override fun decodeEncodedImageBitmap(bytes: ByteArray): ImageBitmap? =
+        AndroidStoryboardIdrDecoder.decodeEncodedImage(bytes)
+
+    private fun extractScaledFrame(retriever: MediaMetadataRetriever, timeUs: Long, maxWidthPx: Int): ImageBitmap? {
+        val targetMax = maxWidthPx.coerceIn(64, 640)
+        val raw = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            retriever.getScaledFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC, targetMax, targetMax)
+                ?: retriever.getScaledFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST, targetMax, targetMax)
+        } else {
+            retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                ?: retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)
+        } ?: return null
+        val maxSide = maxOf(raw.width, raw.height)
+        val finalBitmap = if (maxSide > targetMax && maxSide > 0) {
+            val scale = targetMax.toFloat() / maxSide
+            val w = (raw.width * scale).toInt().coerceAtLeast(2)
+            val h = (raw.height * scale).toInt().coerceAtLeast(2)
+            val scaled = Bitmap.createScaledBitmap(raw, w, h, true)
+            if (scaled !== raw) raw.recycle()
+            scaled
+        } else {
+            raw
+        }
+        return finalBitmap.asImageBitmap()
     }
 
     override fun dismissAppLinkPrompt() {
@@ -396,6 +513,25 @@ class AndroidPikoPlatform(
         }
     }
 
+    override fun blurCoilBitmap(input: Bitmap, radiusPx: Int): Bitmap? {
+        val w = input.width
+        val h = input.height
+        if (w <= 0 || h <= 0) return null
+        val readable = if (input.config == Bitmap.Config.ARGB_8888) {
+            input
+        } else {
+            input.copy(Bitmap.Config.ARGB_8888, false) ?: return null
+        }
+        return try {
+            val pixels = IntArray(w * h)
+            readable.getPixels(pixels, 0, w, 0, 0, w, h)
+            val blurred = BackdropBlurKernel.blurArgb(pixels, w, h, radiusPx)
+            Bitmap.createBitmap(blurred, w, h, Bitmap.Config.ARGB_8888)
+        } finally {
+            if (readable !== input) readable.recycle()
+        }
+    }
+
     override val deviceSummary: String =
         "Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT}), ${Build.MANUFACTURER} ${Build.MODEL}, ${Build.SUPPORTED_ABIS.firstOrNull()}"
 
@@ -431,13 +567,13 @@ class AndroidPikoPlatform(
 
     private inner class AndroidLocalFiles : LocalFileActions {
         override fun thumbnailModel(path: String): Any? = when {
-            path.startsWith("content:") -> path
+            path.startsWith("content:") -> path.takeIf(::exists)
             path.startsWith("file:", ignoreCase = true) -> runCatching { File(java.net.URI(path)) }.getOrNull()?.takeIf { it.exists() }
             File(path).exists() -> File(path)
             else -> null
         }
 
-        override fun exists(path: String): Boolean = File(path).exists()
+        override fun exists(path: String): Boolean = isAndroidLocalPathPresent(context, path)
 
         override fun openExternally(path: String, isMedia: Boolean) {
             // 文件夹下载的「打开文件夹」传进来的是文件夹，交给文件管理器；按文件的 MIME 发出去没有应用接
@@ -470,16 +606,23 @@ class AndroidPikoPlatform(
                     .onFailure { PikoLog.w(TAG, "Failed to resolve SAF document ID for containing folder (authority=$authority)", it) }
                     .getOrNull() ?: return
                 val parentId = documentId.substringBeforeLast('/', documentId)
-                DocumentsContract.buildTreeDocumentUri(authority, parentId)
+                runCatching { DocumentsContract.buildTreeDocumentUri(authority, parentId) }
+                    .onFailure { PikoLog.w(TAG, "Failed to build SAF tree URI for containing folder (authority=$authority)", it) }
+                    .getOrNull() ?: return
             } else {
                 val file = File(path)
                 if (!file.exists()) return
-                FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file.parentFile ?: file)
+                val authority = "${context.packageName}.fileprovider"
+                val parent = file.parentFile ?: file
+                runCatching { FileProvider.getUriForFile(context, authority, parent) }
+                    .recoverCatching { FileProvider.getUriForFile(context, authority, file) }
+                    .onFailure { PikoLog.w(TAG, "Failed to build FileProvider URI for containing folder", it) }
+                    .getOrNull() ?: return
             }
             startActivity(
                 Intent(Intent.ACTION_VIEW)
                     .setDataAndType(uri, "vnd.android.document/directory")
-                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION),
+                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION),
             )
         }
 
@@ -516,7 +659,7 @@ class AndroidPikoPlatform(
             startActivity(
                 Intent(Intent.ACTION_VIEW)
                     .setDataAndType(uri, "vnd.android.document/directory")
-                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION),
+                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION),
             )
         }
 
@@ -581,30 +724,52 @@ class AndroidPikoPlatform(
 
         @Composable
         override fun rememberLauncher(onPicked: (String) -> Unit): () -> Unit {
+            val latestOnPicked by rememberUpdatedState(onPicked)
+            val pick = rememberPickerLauncher { picked -> if (picked != null) latestOnPicked(picked) }
+            return { pick("") }
+        }
+
+        @Composable
+        override fun rememberPickerLauncher(onResult: (String?) -> Unit): (initialPath: String) -> Unit {
+            val latestOnResult by rememberUpdatedState(onResult)
             val launcher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
-                val selected = result.data?.data ?: return@rememberLauncherForActivityResult
+                val selected = if (result.resultCode == Activity.RESULT_OK) result.data?.data else null
+                if (selected == null) {
+                    latestOnResult(null)
+                    return@rememberLauncherForActivityResult
+                }
                 val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
                 runCatching { context.contentResolver.takePersistableUriPermission(selected, flags) }
                     .onFailure { PikoLog.w(TAG, "Failed to persist download folder URI permission (authority=${selected.authority})", it) }
                 val serialized = selected.toString()
                 cachedDisplayNames.remove(serialized)
-                onPicked(serialized)
+                latestOnResult(serialized)
             }
-            return {
-                val initialUri = DocumentsContract.buildTreeDocumentUri(
+            return { initialPath ->
+                val initialUri = initialPath.takeIf { it.startsWith("content:") }?.let { raw ->
+                    runCatching {
+                        val tree = Uri.parse(raw)
+                        DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree))
+                    }.getOrNull()
+                } ?: DocumentsContract.buildTreeDocumentUri(
                     "com.android.externalstorage.documents",
                     "primary:Download/Piko",
                 )
-                launcher.launch(
-                    Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
-                        putExtra(DocumentsContract.EXTRA_INITIAL_URI, initialUri)
-                        addFlags(
-                            Intent.FLAG_GRANT_READ_URI_PERMISSION or
-                                Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
-                                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION,
-                        )
-                    },
-                )
+                runCatching {
+                    launcher.launch(
+                        Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+                            putExtra(DocumentsContract.EXTRA_INITIAL_URI, initialUri)
+                            addFlags(
+                                Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                                    Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                                    Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION,
+                            )
+                        },
+                    )
+                }.onFailure {
+                    PikoLog.w(TAG, "Failed to launch download folder picker", it)
+                    latestOnResult(null)
+                }
             }
         }
     }
@@ -700,6 +865,44 @@ class AndroidPikoPlatform(
     }
 }
 
+internal fun isAndroidLocalPathPresent(context: Context, path: String): Boolean {
+    if (path.isBlank()) return false
+    if (path.startsWith("content:")) {
+        val uri = Uri.parse(path)
+        val resolver = context.contentResolver
+        if (DocumentsContract.isDocumentUri(context, uri)) {
+            return runCatching {
+                resolver.query(
+                    uri,
+                    arrayOf(DocumentsContract.Document.COLUMN_DOCUMENT_ID),
+                    null,
+                    null,
+                    null,
+                )?.use { cursor -> cursor.moveToFirst() } == true
+            }.getOrDefault(false)
+        }
+        if (DocumentsContract.isTreeUri(uri)) {
+            return runCatching {
+                val docUri = DocumentsContract.buildDocumentUriUsingTree(uri, DocumentsContract.getTreeDocumentId(uri))
+                resolver.query(
+                    docUri,
+                    arrayOf(DocumentsContract.Document.COLUMN_DOCUMENT_ID),
+                    null,
+                    null,
+                    null,
+                )?.use { cursor -> cursor.moveToFirst() } == true
+            }.getOrDefault(false)
+        }
+        return runCatching {
+            resolver.openAssetFileDescriptor(uri, "r")?.use { true } == true
+        }.getOrDefault(false)
+    }
+    if (path.startsWith("file:", ignoreCase = true)) {
+        return runCatching { File(java.net.URI(path)).exists() }.getOrDefault(false)
+    }
+    return File(path).exists()
+}
+
 /**
  * 界面隐藏时一并收起系统栏，看图不被状态栏与导航条压住；从边缘滑动可临时唤出。
  * Dialog 有自己的窗口，要从 DialogWindowProvider 取，改 Activity 的窗口不起作用。
@@ -718,5 +921,166 @@ private fun ImmersiveSystemBars(visible: Boolean) {
         } else {
             controller.hide(WindowInsetsCompat.Type.systemBars())
         }
+    }
+}
+
+/**
+ * 扫描 Android 系统字体目录（与 `MpvConfig.fontsConfig` 交给 libass fontconfig 的目录完全一致）
+ * 并直接解析 OpenType `name` 表（Name ID 16 优先，回退 Name ID 1），确保返回的每个字体族名都能被 libass 精确命中。
+ */
+internal object AndroidSubtitleFonts {
+    @Volatile
+    private var cachedFamilies: List<String>? = null
+
+    private val FONT_DIRS = listOf("/system/fonts", "/product/fonts")
+    private val PRIORITY_FONTS = listOf(
+        "Noto Sans CJK SC",
+        "Noto Sans CJK TC",
+        "Noto Sans CJK JP",
+        "Noto Sans CJK KR",
+        "Noto Serif CJK SC",
+        "Noto Serif CJK TC",
+        "MiSans",
+        "HarmonyOS Sans SC",
+        "HarmonyOS Sans",
+        "OPPO Sans",
+        "Roboto",
+        "Noto Sans",
+        "Noto Serif",
+        "Droid Sans Mono",
+        "Roboto Mono",
+    )
+
+    fun discoverFontFamilies(): List<String> {
+        cachedFamilies?.let { return it }
+        return synchronized(this) {
+            cachedFamilies?.let { return@synchronized it }
+            val seen = LinkedHashMap<String, String>()
+            for (dirPath in FONT_DIRS) {
+                val dir = File(dirPath)
+                val files = dir.listFiles() ?: continue
+                for (file in files) {
+                    if (!file.isFile) continue
+                    val ext = file.extension.lowercase()
+                    if (ext != "ttf" && ext != "otf" && ext != "ttc") continue
+                    runCatching { extractOpenTypeFamilyNames(file) }
+                        .getOrDefault(emptyList())
+                        .forEach { raw ->
+                            val name = raw.trim()
+                            val key = name.lowercase()
+                            if (name.isEmpty() || name.startsWith(".")) return@forEach
+                            if ("emoji" in key || "clock" in key || "symbol" in key || "signwriting" in key || "math" in key) return@forEach
+                            seen.putIfAbsent(key, name)
+                        }
+                }
+            }
+            val priority = PRIORITY_FONTS.withIndex().associate { it.value.lowercase() to it.index }
+            val sorted = seen.values.sortedWith(
+                compareBy<String>({ priority[it.lowercase()] ?: Int.MAX_VALUE }, { it.lowercase() }),
+            )
+            cachedFamilies = sorted
+            sorted
+        }
+    }
+
+    fun findCachedFamily(requested: String): String? {
+        val target = requested.trim()
+        if (target.isEmpty()) return null
+        return cachedFamilies?.firstOrNull { it.equals(target, ignoreCase = true) }
+    }
+
+    fun findInstalledFamily(requested: String): String? {
+        val target = requested.trim()
+        if (target.isEmpty()) return null
+        return discoverFontFamilies().firstOrNull { it.equals(target, ignoreCase = true) }
+    }
+
+    private fun extractOpenTypeFamilyNames(file: File): List<String> {
+        java.io.RandomAccessFile(file, "r").use { raf ->
+            val fileLen = raf.length()
+            if (fileLen < 12L) return emptyList()
+            val tag = raf.readInt()
+            if (tag == 0x74746366) { // 'ttcf' TrueType Collection
+                raf.skipBytes(4) // version
+                val numFonts = raf.readInt().coerceIn(0, 64)
+                val offsets = IntArray(numFonts) { raf.readInt() }
+                val names = LinkedHashSet<String>()
+                for (offset in offsets) {
+                    if (offset > 0 && offset.toLong() + 12L <= fileLen) {
+                        readSfntFamilyName(raf, offset.toLong(), fileLen)?.let(names::add)
+                    }
+                }
+                return names.toList()
+            }
+            return listOfNotNull(readSfntFamilyName(raf, 0L, fileLen))
+        }
+    }
+
+    private fun readSfntFamilyName(raf: java.io.RandomAccessFile, baseOffset: Long, fileLen: Long): String? {
+        raf.seek(baseOffset)
+        val sfntVersion = raf.readInt()
+        if (sfntVersion != 0x00010000 && sfntVersion != 0x4F54544F && sfntVersion != 0x74727565) return null
+        val numTables = raf.readUnsignedShort().coerceAtMost(256)
+        raf.skipBytes(6) // searchRange, entrySelector, rangeShift
+        var nameTableOffset = -1L
+        var nameTableLength = 0
+        for (i in 0 until numTables) {
+            if (raf.filePointer + 16L > fileLen) break
+            val tableTag = raf.readInt()
+            raf.skipBytes(4) // checksum
+            val offset = raf.readInt().toLong() and 0xFFFFFFFFL
+            val length = raf.readInt()
+            if (tableTag == 0x6E616D65) { // 'name'
+                nameTableOffset = offset
+                nameTableLength = length
+                break
+            }
+        }
+        if (nameTableOffset <= 0L || nameTableLength <= 6 || nameTableOffset + nameTableLength > fileLen) return null
+        // Limit single name table read to 256 KiB to avoid excessive allocation on malformed files.
+        val readLen = minOf(nameTableLength, 256 * 1024)
+        val bytes = ByteArray(readLen)
+        raf.seek(nameTableOffset)
+        raf.readFully(bytes)
+        val buf = java.nio.ByteBuffer.wrap(bytes).order(java.nio.ByteOrder.BIG_ENDIAN)
+        buf.short // format
+        val count = buf.short.toInt() and 0xFFFF
+        val stringOffset = buf.short.toInt() and 0xFFFF
+        var bestTypographic: String? = null
+        var bestFamily: String? = null
+        var bestTypographicScore = -1
+        var bestFamilyScore = -1
+        for (i in 0 until count) {
+            if (buf.remaining() < 12) break
+            val platformId = buf.short.toInt() and 0xFFFF
+            val encodingId = buf.short.toInt() and 0xFFFF
+            val languageId = buf.short.toInt() and 0xFFFF
+            val nameId = buf.short.toInt() and 0xFFFF
+            val length = buf.short.toInt() and 0xFFFF
+            val offset = buf.short.toInt() and 0xFFFF
+            if (nameId != 1 && nameId != 16) continue
+            val start = stringOffset + offset
+            if (start < 0 || length <= 0 || start + length > bytes.size) continue
+            val decoded = when (platformId) {
+                3, 0 -> String(bytes, start, length, Charsets.UTF_16BE)
+                1 -> if (encodingId == 0) String(bytes, start, length, Charsets.ISO_8859_1) else null
+                else -> null
+            }?.trim()?.takeIf { it.isNotEmpty() } ?: continue
+            val score = when {
+                platformId == 3 && languageId == 0x0409 -> 4 // Windows English US
+                platformId == 3 -> 3
+                platformId == 0 -> 2
+                platformId == 1 && languageId == 0 -> 1
+                else -> 0
+            }
+            if (nameId == 16 && score > bestTypographicScore) {
+                bestTypographic = decoded
+                bestTypographicScore = score
+            } else if (nameId == 1 && score > bestFamilyScore) {
+                bestFamily = decoded
+                bestFamilyScore = score
+            }
+        }
+        return bestTypographic ?: bestFamily
     }
 }

@@ -10,10 +10,19 @@ private val VIDEO_EXTENSIONS = setOf(
     "ts", "vob", "webm", "wmv", "wtv",
 )
 private val IMAGE_EXTENSIONS = setOf("avif", "bmp", "gif", "heic", "jpeg", "jpg", "png", "webp")
-private val AUDIO_EXTENSIONS = setOf("mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "ape", "mka")
+private val AUDIO_EXTENSIONS = setOf(
+    "mp3", "flac", "wav", "m4a", "aac", "ogg", "opus", "ape", "mka",
+    "wma", "aiff", "alac", "wv", "dsf", "dff", "tta", "ac3", "dts",
+)
 private val ARCHIVE_EXTENSIONS = setOf("zip", "rar", "7z", "tar", "gz", "xz", "bz2")
 // 种子里常夹带字幕，单列一类，不与 nfo、txt 一起算作文档
 private val SUBTITLE_EXTENSIONS = setOf("srt", "ass", "ssa", "vtt", "sub", "sup", "idx", "smi", "sami")
+private val MARKDOWN_EXTENSIONS = setOf("md", "markdown", "mdown", "mkd")
+private val PLAIN_TEXT_EXTENSIONS = setOf(
+    "txt", "log", "json", "yaml", "yml", "xml", "ini", "conf", "cfg",
+    "csv", "tsv", "toml", "nfo", "srt", "ass", "ssa", "vtt",
+)
+private val HTML_EXTENSIONS = setOf("html", "htm", "xhtml")
 
 /** 只按扩展名的文件大类。网盘列表的图标、秒传面板的按类勾选共用这一套。 */
 enum class FileCategory { VIDEO, AUDIO, IMAGE, ARCHIVE, SUBTITLE, DOCUMENT }
@@ -43,6 +52,10 @@ fun String.fileCategory(): FileCategory {
 
 fun String.isPlayableVideo(): Boolean = substringAfterLast('.', "").lowercase() in VIDEO_EXTENSIONS
 
+fun String.isPlayableAudio(): Boolean = substringAfterLast('.', "").lowercase() in AUDIO_EXTENSIONS
+
+fun String.isPlayableMedia(): Boolean = isPlayableVideo() || isPlayableAudio()
+
 fun String.isPreviewableImage(): Boolean = substringAfterLast('.', "").lowercase() in IMAGE_EXTENSIONS
 
 /**
@@ -56,6 +69,14 @@ fun FileStat.isPlayableVideo(): Boolean = !isFolder && (
         (params.containsKey("duration") && params.containsKey("width"))
     )
 
+fun FileStat.isPlayableAudio(): Boolean = !isFolder && (
+    name.isPlayableAudio() ||
+        mimeType.startsWith("audio/") ||
+        (params.containsKey("duration") && !params.containsKey("width") && !isPlayableVideo() && !isPreviewableImage())
+    )
+
+fun FileStat.isPlayableMedia(): Boolean = isPlayableVideo() || isPlayableAudio()
+
 /**
  * 网盘文件的大类。除扩展名外还认服务端的 mime 与元数据（见 [isPlayableVideo]），扩展名非标时
  * 也能归对类；磁力解析出的文件只有名字，用 String 的版本。对文件夹无意义，调用方先分开。
@@ -64,7 +85,7 @@ fun FileStat.fileCategory(): FileCategory {
     val byName = name.fileCategory()
     return when {
         isPlayableVideo() -> FileCategory.VIDEO
-        byName == FileCategory.AUDIO -> FileCategory.AUDIO
+        isPlayableAudio() -> FileCategory.AUDIO
         isPreviewableImage() -> FileCategory.IMAGE
         else -> byName
     }
@@ -72,4 +93,23 @@ fun FileStat.fileCategory(): FileCategory {
 
 fun FileStat.isPreviewableImage(): Boolean = !isFolder && (
     name.isPreviewableImage() || mimeType.startsWith("image/")
+    )
+
+fun String.isMarkdownDocument(): Boolean = substringAfterLast('.', "").lowercase() in MARKDOWN_EXTENSIONS
+
+fun String.isPlainTextDocument(): Boolean = substringAfterLast('.', "").lowercase() in PLAIN_TEXT_EXTENSIONS
+
+fun String.isReadableTextDocument(): Boolean = isMarkdownDocument() || isPlainTextDocument()
+
+fun String.isHtmlDocument(): Boolean = substringAfterLast('.', "").lowercase() in HTML_EXTENSIONS
+
+fun FileStat.isMarkdownDocument(): Boolean = !isFolder && name.isMarkdownDocument()
+
+fun FileStat.isReadableTextDocument(): Boolean = !isFolder && (
+    name.isReadableTextDocument() ||
+        (mimeType.startsWith("text/") && !name.isHtmlDocument() && mimeType != "text/html" && mimeType != "application/xhtml+xml")
+    )
+
+fun FileStat.isHtmlDocument(): Boolean = !isFolder && (
+    name.isHtmlDocument() || mimeType == "text/html" || mimeType == "application/xhtml+xml"
     )

@@ -1,0 +1,172 @@
+package dev.piko.ui.screens.player
+
+import dev.piko.shared.i18n.tr
+
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
+import dev.piko.shared.data.LeasedFile
+import dev.piko.shared.data.VaultEntry
+import dev.piko.shared.log.logFailure
+import dev.piko.shared.log.logFile
+import dev.piko.ui.LocalPikoServices
+import dev.piko.ui.components.SheetAction
+import dev.piko.ui.components.rememberDownloadLauncher
+import dev.piko.ui.platform.LocalPikoPlatform
+import dev.piko.ui.screens.drive.DriveActions
+import dev.piko.ui.screens.share.ShareDialog
+import io.github.nihildigit.pikpak.FileKind
+import io.github.nihildigit.pikpak.FileStat
+import kotlinx.coroutines.launch
+
+/**
+ * 完整播放器设置面板里作用于正在播的文件的操作：下载、复制直链、星标、分享。
+ *
+ * 播放器手里只有文件 ID 与名字，下载要的大小与 gcid、分享框要的类型都得查一次详情；点了才查，不预先请求。
+ * 本机副本（[isLocalPlayback]）已经下过了，不给下载。分享框在这里画，提示经 [onMessage] 交给播放器的 Snackbar。
+ */
+@Composable
+fun rememberPlayerFileActions(fileId: String, isLocalPlayback: Boolean, onMessage: (String) -> Unit): List<SheetAction> {
+    if (fileId.isEmpty() || dev.piko.shared.data.LocalLocation.isLocal(fileId)) return emptyList()
+    val services = LocalPikoServices.current
+    val platform = LocalPikoPlatform.current
+    val scope = rememberCoroutineScope()
+    val message by rememberUpdatedState(onMessage)
+    var sharing by remember { mutableStateOf<FileStat?>(null) }
+    val downloads = rememberDownloadLauncher()
+    val isVaulted = VaultEntry.isVaulted(fileId)
+    val isNonVaultLeased = LeasedFile.isLeased(fileId) && !isVaulted
+
+    var isStarred by remember(fileId) { mutableStateOf(false) }
+    LaunchedEffect(fileId, isNonVaultLeased) {
+        if (isNonVaultLeased) return@LaunchedEffect
+        fun refreshStar() {
+            scope.launch {
+                if (isVaulted) {
+                    val entryId = VaultEntry.entryIdOf(fileId)
+                    isStarred = entryId != null && services.driveRepository.vaultStars.isStarred(entryId)
+                } else {
+                    services.driveRepository.starredFiles()
+                        .logFailure(TAG, "Failed to load starred files in player for ${logFile(fileId, "")}")
+                        .onSuccess { files -> isStarred = files.any { it.id == fileId } }
+                }
+            }
+        }
+        refreshStar()
+        services.driveRepository.folderChanges.collect {
+            refreshStar()
+        }
+    }
+
+    fun withFile(action: (FileStat) -> Unit) {
+        scope.launch {
+            val resolved = LeasedFile.resolvedFileOf(fileId)
+            if (resolved != null) {
+                action(
+                    FileStat(
+                        kind = FileKind.FILE,
+                        id = fileId,
+                        name = resolved.name,
+                        size = resolved.size.toString(),
+                        hash = resolved.gcid.orEmpty(),
+                    ),
+                )
+                return@launch
+            }
+            services.driveRepository.getFileDetail(fileId)
+                .logFailure(TAG, "Failed to load file detail in player for ${logFile(fileId, "")}")
+                .onSuccess { detail ->
+                    action(
+                        FileStat(
+                            kind = FileKind.FILE,
+                            id = detail.id,
+                            parentId = detail.parentId,
+                            name = detail.name,
+                            size = detail.size,
+                            hash = detail.hash,
+                            mimeType = detail.mimeType,
+                            fileExtension = detail.fileExtension,
+                            params = detail.params,
+                        ),
+                    )
+                }
+                .onFailure { message(tr("未找到此文件，可能已被删除", "File not found. It may have been deleted", "ファイルが見つかりません。削除された可能性があります", "파일을 찾을 수 없습니다. 삭제되었을 수 있습니다", "找不到此檔案，可能已被刪除")) }
+        }
+    }
+
+    sharing?.let { file ->
+        ShareDialog(
+            files = listOf(file),
+            onDismiss = { sharing = null },
+            onCopied = { message(tr("已复制分享链接", "Share link copied", "共有リンクをコピーしました", "공유 링크를 복사했습니다", "已複製分享連結")) },
+        )
+    }
+
+    val currentLanguage = dev.piko.shared.i18n.PikoLocale.effectiveLanguage
+    // 名字与图标取自网盘的同名操作，两处叫法一致；下载、复制直链、星标、分享排成一排
+    return remember(fileId, isLocalPlayback, isNonVaultLeased, isVaulted, isStarred, downloads, services, platform, scope, currentLanguage) {
+        buildList {
+            if (!isLocalPlayback) {
+                add(
+                    DriveActions.download(
+                        onClick = {
+                            val resolved = LeasedFile.resolvedFileOf(fileId)
+                            if (resolved != null) {
+                                downloads.downloadResolved(listOf(resolved), "") { notice ->
+                                    message(notice ?: tr("已加入下载", "Added to downloads", "ダウンロードに追加しました", "다운로드에 추가했습니다", "已加入下載"))
+                                }
+                            } else {
+                                withFile { file -> downloads.download(listOf(file)) { notice -> message(notice ?: tr("已加入下载", "Added to downloads", "ダウンロードに追加しました", "다운로드에 추가했습니다", "已加入下載")) } }
+                            }
+                        },
+                    ),
+                )
+                add(
+                    DriveActions.copyDownloadLink {
+                        scope.launch {
+                            val url = services.mediaRepository.fetchDownloadUrl(fileId)
+                                .logFailure(TAG, "Failed to fetch download URL in player for ${logFile(fileId, "")}")
+                                .getOrNull()
+                            if (!url.isNullOrBlank()) {
+                                platform.copyToClipboard(tr("下载链接", "Download link", "ダウンロードリンク", "다운로드 링크", "下載連結"), url)
+                                message(tr("已复制下载链接", "Download link copied", "ダウンロードリンクをコピーしました", "다운로드 링크를 복사했습니다", "已複製下載連結"))
+                            } else {
+                                message(tr("未能获取下载链接", "Failed to get download link", "ダウンロードリンクを取得できませんでした", "다운로드 링크를 가져오지 못했습니다", "無法取得下載連結"))
+                            }
+                        }
+                    },
+                )
+            }
+            if (!isNonVaultLeased) {
+                add(
+                    DriveActions.star(
+                        starred = isStarred,
+                        onClick = {
+                            val target = !isStarred
+                            isStarred = target
+                            scope.launch {
+                                services.driveRepository.setStarred(listOf(fileId), target)
+                                    .onSuccess { message(if (target) tr("已添加星标", "Starred", "スターを付けました", "별표를 추가했습니다", "已新增星號") else tr("已取消星标", "Unstarred", "スターを外しました", "별표를 해제했습니다", "已取消星號")) }
+                                    .logFailure(TAG, "Failed to update star=$target in player for ${logFile(fileId, "")}")
+                                    .onFailure {
+                                        isStarred = !target
+                                        message(if (target) tr("添加星标失败", "Failed to add star", "スターを付けられませんでした", "별표를 추가하지 못했습니다", "新增星號失敗") else tr("取消星标失败", "Failed to remove star", "スターを外せませんでした", "별표를 해제하지 못했습니다", "取消星號失敗"))
+                                    }
+                            }
+                        },
+                    ),
+                )
+                if (!isVaulted) {
+                    add(DriveActions.share { withFile { sharing = it } })
+                }
+            }
+        }
+    }
+}
+
+private const val TAG = "Player"

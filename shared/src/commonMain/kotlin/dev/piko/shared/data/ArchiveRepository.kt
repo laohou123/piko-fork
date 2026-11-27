@@ -28,10 +28,11 @@ import kotlinx.coroutines.withContext
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.TimeSource
 
-class ArchiveSubmissionUnconfirmed(cause: Throwable) : RuntimeException(cause.message, cause)
-
 /** 服务端解压。压缩包的解析与写入都在 PikPak 那边完成，本机不下载任何内容。 */
-class ArchiveRepository(private val clientManager: PikoClientProvider) {
+class ArchiveRepository(
+    private val clientManager: PikoClientProvider,
+    private val primePollInterval: kotlin.time.Duration = PRIME_POLL_INTERVAL,
+) {
     // 消息会原样显示在失败的那一行上
     private val client get() = clientManager.currentClient.value ?: error(tr("未登录", "Not signed in", "ログインしていません", "로그인하지 않았습니다", "尚未登入"))
 
@@ -48,15 +49,7 @@ class ArchiveRepository(private val clientManager: PikoClientProvider) {
             // 先列一层再提交。解压接口对从没解析过的加密包照单全收，要等任务失败才知道缺密码
             // （2026-09-25 实测，新传的 ZipCrypto 包连提交两次都是如此）；列目录则当场报缺密码或密码错误
             current.listArchive(file.id, gcid, password = password)
-            try {
-                current.decompressArchive(file.id, gcid, toParentId = null, password = password, paths = paths)
-            } catch (failure: Throwable) {
-                when {
-                    failure is CancellationException || failure is ArchivePasswordException -> throw failure
-                    failure is PikPakException && failure.errorCode > 0 && (failure.httpStatus ?: 200) < 500 && failure.httpStatus != 408 -> throw failure
-                    else -> throw ArchiveSubmissionUnconfirmed(failure)
-                }
-            }
+            current.decompressArchive(file.id, gcid, toParentId = null, password = password, paths = paths)
         }
     }
 
@@ -110,7 +103,7 @@ class ArchiveRepository(private val clientManager: PikoClientProvider) {
                 TaskPhase.COMPLETE -> return progress.fileId
                 TaskPhase.ERROR -> error(progress.errorDescription.ifEmpty { tr("解压失败", "Extraction failed", "解凍に失敗しました", "압축 해제 실패", "解壓縮失敗") })
             }
-            delay(PRIME_POLL_INTERVAL)
+            delay(primePollInterval)
         }
         error(tr("解压超时", "Extraction timed out", "解凍がタイムアウトしました", "압축 해제 시간이 초과되었습니다", "解壓縮逾時"))
     }
@@ -119,7 +112,7 @@ class ArchiveRepository(private val clientManager: PikoClientProvider) {
     private suspend fun awaitTree(owner: PikPakClient, archiveId: String): Boolean {
         repeat(TREE_POLLS) {
             if (owner.getFile(archiveId).archiveTree != null) return true
-            delay(PRIME_POLL_INTERVAL)
+            delay(primePollInterval)
         }
         return false
     }

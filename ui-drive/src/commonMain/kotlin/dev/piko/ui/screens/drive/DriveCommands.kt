@@ -1,0 +1,205 @@
+package dev.piko.ui.screens.drive
+
+import dev.piko.shared.data.ArchiveEntryId
+import dev.piko.shared.data.isArchiveVolume
+import dev.piko.shared.data.isDriveFolderId
+import dev.piko.shared.data.isExtractableArchive
+import dev.piko.shared.data.isVaulted
+import dev.piko.shared.data.isImportPreview
+import dev.piko.shared.state.FolderStructureOps
+import dev.piko.shared.upload.isUploading
+import dev.piko.data.repository.isPlayableVideo
+import io.github.nihildigit.pikpak.FileStat
+
+/*
+ * 宽窗口网盘页命令栏的显隐规则，以及条目操作做不做得了（[itemCommands]）。命令栏上的每一样东西都要在眼下真有意义：
+ * 做不了的不摆，别处已经摆着的不重复。规则只写在这里，命令栏照 [DriveCommands] 画，不再在各处零散地判断。
+ *
+ * 命令栏只放作用于当前位置的命令，不放作用于条目的操作，点中一项与多选都是：条目操作经右键菜单与长按操作面板
+ * 与快捷键。多选时在任一选中项上右键，菜单作用于全部选中的，窄窗口顶栏的「操作」与条目长按打开同一个批量面板。
+ * 信息流复用原入口：多选时限定到选中的视频，只需传入可播放视频数量。
+ *
+ * 眼下的状态由两样东西决定，全在 [CommandInputs] 里：
+ * - 在哪（[CommandPlace]）：网盘根目录、文件夹、搜索结果、星标这类库、最近添加与播放历史、回收站、压缩包里。
+ * - 剪贴板里有没有东西，眼前的列表有几项、有几类，是否在多选里。
+ */
+
+/** 眼前在哪。库里的子文件夹是真的文件夹，算 [FOLDER]。 */
+internal enum class CommandPlace {
+    ROOT,
+    FOLDER,
+
+    /** 目录内过滤或全盘搜索的结果：不是一个目录，往里新建、粘贴、查重都说不清落在哪。 */
+    SEARCH,
+
+    /** 星标：条目是散在全盘的真文件，能改能移，只是这里不是一个能往里放东西的目录。 */
+    LIBRARY,
+
+    /** 最近添加：同 [LIBRARY]，多一个移除记录。 */
+    RECENT,
+
+    /** 播放历史：同 [RECENT]，另能整个清空。最近添加没有清空，两者因此分开。 */
+    HISTORY,
+
+    /** 回收站：只能恢复与彻底删除。 */
+    TRASH,
+
+    /** 压缩包里（见 ArchiveLocation）：条目不在网盘里，只能打开、下载文件与解压选中的几项。 */
+    ARCHIVE,
+    IMPORT_PREVIEW,
+    LOCAL,
+}
+
+internal class CommandInputs(
+    val place: CommandPlace,
+    /** 人在网盘根目录上（路径栈只有根）。 */
+    val atRoot: Boolean,
+    /** 处于多选模式（可以尚未勾选条目）。 */
+    val selecting: Boolean,
+    val clipboardFull: Boolean,
+    /** 眼前列表里的条目数。 */
+    val itemCount: Int,
+    /** 列表里的条目已经全选上了。 */
+    val allSelected: Boolean,
+    /** 列表里有几类文件，以及是否正按类型筛着。 */
+    val typeCount: Int,
+    val filtering: Boolean,
+    /** 平台放得了信息流的片段。 */
+    val feedSupported: Boolean,
+    /** 设置里的文件名解析总开关，番号识别跟着它。 */
+    val nameParsing: Boolean,
+    val selectedVideoCount: Int = 0,
+    val selectedGalleryCount: Int = selectedVideoCount,
+)
+
+/**
+ * 目录命令分为三组：主操作与写入动作、视图控制、位置工具与整理。
+ * 窄窗口分别放在 FAB、列表页眉与浏览顶栏的「更多」中；宽窗口由命令栏承载。
+ */
+internal data class DriveCommands(
+    val home: Boolean,
+    /** 「新建」菜单：新建文件夹、上传。 */
+    val create: Boolean,
+    val paste: Boolean,
+    /** 清空回收站、清空播放历史。是这一页的主操作，不在「更多」里，见 PrimaryActionButton。 */
+    val emptyPlace: Boolean,
+    val selectAll: Boolean,
+    val findDuplicates: Boolean,
+    /** 按番号规范命名当前文件夹。桌面在命令栏查找重复旁边，窄窗口在浏览顶栏的「更多」里，同一个条件。 */
+    val canonicalNaming: Boolean,
+    val sort: Boolean,
+    val filter: Boolean,
+    val gallery: Boolean,
+    val feed: Boolean,
+    val addLink: Boolean,
+)
+
+/**
+ * 作用于几项条目的操作做不做得了。右键菜单、操作面板与移动端多选顶栏都照它，同一个操作在各处出现的条件一致；
+ * 某类条目自己多出的操作（视频的外部播放器、文件夹的查重）不在这里，由 fileActions 按类型加。
+ */
+internal class ItemCommands(
+    val cutCopy: Boolean,
+    val rename: Boolean,
+    val share: Boolean,
+    val moveToTrash: Boolean,
+    /** 回收站的恢复与彻底删除，取代上面那一组。 */
+    val restoreOrDelete: Boolean,
+    val moveCopyTo: Boolean,
+    val download: Boolean,
+    val downloadAtQuality: Boolean,
+    val extract: Boolean,
+    val removeRecord: Boolean,
+    /** 选中范围仍有可归档的文件。 */
+    val vault: Boolean,
+    /** 网盘上下文中的文件夹可取消归档，具体标记由条目提供。 */
+    val unvault: Boolean,
+    /** 单个真实云端文件夹（排除本地挂载、回收站、压缩包、导入预览）可查看子树空间分布。 */
+    val viewSpaceMap: Boolean = false,
+    /** 归档条目与普通文件均可移动与剪切；复制与分享仍仅限实体文件。 */
+    val moveTo: Boolean = moveCopyTo,
+    val cut: Boolean = cutCopy,
+    /** 当前真实云端目录中选中 1 个及以上普通云端文件夹时可拆开/铺平。 */
+    val unwrapOrFlatten: Boolean = false,
+    /** 当前真实云端目录中选中 2 个及以上普通云端文件夹时可合并。 */
+    val mergeFolders: Boolean = false,
+)
+
+internal fun itemCommands(place: CommandPlace, targets: List<FileStat>, fullyVaultedFolders: Set<String> = emptySet()): ItemCommands {
+    val inTrash = place == CommandPlace.TRASH
+    val inArchive = place == CommandPlace.ARCHIVE
+    val eventLog = place == CommandPlace.RECENT || place == CommandPlace.HISTORY
+    val hasTargets = targets.isNotEmpty()
+    // 上传中、压缩包内、导入预览和本地只读条目不能写入；归档条目与普通文件同等支持重命名、移动、剪切、星标与移除
+    val local = place == CommandPlace.LOCAL || targets.any { dev.piko.shared.data.LocalLocation.isLocal(it.id) }
+    val editable = hasTargets && !local && !inArchive && targets.none { it.isUploading || it.isImportPreview }
+    val settled = editable && targets.none { it.isVaulted }
+    val vaultContext = settled && (place == CommandPlace.ROOT || place == CommandPlace.FOLDER || place == CommandPlace.SEARCH)
+    val inRealFolder = place == CommandPlace.ROOT || place == CommandPlace.FOLDER
+    val allEligibleFolders = inRealFolder && settled && targets.all(FolderStructureOps::isEligibleCloudFolder)
+    return ItemCommands(
+        cutCopy = settled && !inTrash,
+        rename = editable && !inTrash,
+        share = settled && !inTrash,
+        moveToTrash = hasTargets && !local && !inTrash && !inArchive,
+        restoreOrDelete = hasTargets && !local && inTrash,
+        moveCopyTo = settled && !inTrash,
+        moveTo = editable && !inTrash,
+        cut = editable && !inTrash,
+        // 文件夹整个下载，见 PikoDownloadCoordinator.enqueueFolders；压缩包里的文件夹不在网盘里，列不出内容，只下文件
+        download = hasTargets && !local && !inTrash && targets.any { !it.isUploading && !(inArchive && it.isFolder) && (!it.isImportPreview || it.isFolder || it.hash.isNotBlank()) },
+        downloadAtQuality = hasTargets && !local && !inTrash && !inArchive && targets.any {
+            !it.isUploading && !it.isVaulted && !it.isImportPreview && (it.isFolder || it.isPlayableVideo())
+        },
+        // 压缩包里解压的是选中的几项本身，不是选中项里的压缩包
+        extract = hasTargets && !local && !inTrash && (inArchive || targets.any { !it.isVaulted && !it.isImportPreview && (it.isExtractableArchive || it.isArchiveVolume) }),
+        removeRecord = hasTargets && !local && eventLog,
+        // 回收站与压缩包里的不在网盘里。库（星标、最近添加、播放历史、查重的结果）里要做的是回到原处、下载、移走或删除，
+        // 不给：移动端面板在最近添加里已满 8 行，见 MobilePanelSizeTest。搜索结果的条目仍在各自的文件夹里，清单按所在文件夹写，照常给
+        vault = vaultContext && targets.any { !it.isFolder || it.id !in fullyVaultedFolders },
+        unvault = vaultContext,
+        viewSpaceMap = targets.size == 1 && !local && !inTrash && !inArchive &&
+            place != CommandPlace.IMPORT_PREVIEW &&
+            targets.single().let {
+                it.isFolder && !it.trashed && !it.isUploading && !it.isVaulted && !it.isImportPreview &&
+                    !ArchiveEntryId.isEntry(it.id) && isDriveFolderId(it.id)
+            },
+        unwrapOrFlatten = allEligibleFolders,
+        mergeFolders = allEligibleFolders && targets.size >= 2,
+    )
+}
+
+internal fun driveCommands(input: CommandInputs): DriveCommands = with(input) {
+    val importPreview = place == CommandPlace.IMPORT_PREVIEW
+    val folder = place == CommandPlace.ROOT || place == CommandPlace.FOLDER
+    val local = place == CommandPlace.LOCAL
+    val inTrash = place == CommandPlace.TRASH
+    DriveCommands(
+        home = importPreview || !atRoot,
+        // 多选时左端换成「已选 N 项」；搜索结果不是目录
+        create = folder && !selecting,
+        paste = clipboardFull && folder,
+        // 清空只在有东西可清时。与 libraryPageActions 对应：只有回收站与播放历史有清空
+        emptyPlace = (inTrash || place == CommandPlace.HISTORY) && itemCount > 0,
+        // 只在多选里：没进多选时它是一个随时摆着、用不上的按钮；平时全选靠主修饰键+A 与空白处右键
+        selectAll = selecting && itemCount > 0 && !allSelected,
+        // 查重的范围是眼前这个目录，搜索结果与库都不是目录
+        findDuplicates = folder && itemCount > 0,
+        // 范围同查重；关了文件名解析就认不出番号，扫出来必然是空的
+        canonicalNaming = folder && itemCount > 0 && nameParsing,
+        // 库里按各自的先后（添加、播放的时间）排；一项以下没得排
+        sort = (importPreview || local || folder || place == CommandPlace.SEARCH) && itemCount >= 2,
+        // 只有一类时筛了等于没筛；筛着的时候要留着，才撤得掉
+        filter = typeCount >= 2 || filtering,
+        gallery = !importPreview && if (selecting) {
+            selectedGalleryCount > 0 && place != CommandPlace.TRASH && place != CommandPlace.ARCHIVE
+        } else folder || local,
+        feed = !importPreview && feedSupported && if (selecting) {
+            selectedVideoCount > 0 && place != CommandPlace.TRASH && place != CommandPlace.ARCHIVE
+        } else folder || local,
+        // 默认存进眼前的目录（InstantSheetState.followDriveFolder）。库、查重、压缩包的栈顶是 piko: 一类的虚拟 ID，
+        // 存不进去，会退到 My Packs 并提示「当前目录已不存在」。搜索时栈顶仍是搜索所在的目录，地址栏也还写着它，
+        // 照常给；否则一输入搜索词命令栏右端就跳
+        addLink = folder || place == CommandPlace.SEARCH,
+    )
+}

@@ -11,6 +11,8 @@ import androidx.compose.runtime.setValue
 import dev.piko.data.auth.PikoUserPreferences
 import dev.piko.shared.data.DriveChangeJournal
 import dev.piko.shared.data.PikoDriveRepository
+import dev.piko.shared.data.VaultEntry
+import dev.piko.shared.data.VaultStore
 import dev.piko.shared.data.runSuspendCatching
 import dev.piko.shared.log.PikoLog
 import dev.piko.shared.log.logFailure
@@ -56,6 +58,7 @@ class BatchRenameState(
     /** 用户配了 MetaTube 时可以从那里取片名；为 null 时没有这个选项。 */
     private val metaTube: MetaTubeService? = null,
     private val tree: RenameTree? = null,
+    private val fixedCanonicalTree: Boolean = tree != null,
 ) {
     enum class Phase { EDITING, RUNNING, DONE }
 
@@ -66,7 +69,10 @@ class BatchRenameState(
     // region 按番号规范命名
 
     /** 规则固定为按番号规范命名，见类注释。 */
-    val isNamingTree: Boolean get() = tree != null
+    val isNamingTree: Boolean get() = fixedCanonicalTree
+
+    /** 是否带有目录树扫描结果（含按番号规范命名整棵树，以及普通批量重命名切换至递归子目录）。 */
+    val hasSubtreeLocations: Boolean get() = tree != null
 
     /** 一棵树里的项所在的目录，预览据此标出它在哪一层；不是一棵树或是树根时为 null。 */
     fun locationOf(id: String): String? = tree?.locations?.get(id)
@@ -94,12 +100,12 @@ class BatchRenameState(
         updateFindBlocks(emptyList())
         updateReplaceBlocks(emptyList())
         if (textMode) options = options.copy(search = "", replacement = "")
-        if (tree == null) excludedIds = excludedIds + sources.filter { it.isFolder }.map { it.id }
+        if (!isNamingTree) excludedIds = excludedIds + sources.filter { it.isFolder }.map { it.id }
         avNaming = true
     }
 
     fun stopAvNaming() {
-        if (tree != null) return
+        if (isNamingTree) return
         avNaming = false
     }
 
@@ -151,7 +157,7 @@ class BatchRenameState(
                 if (metaTubeJob !== job) return@launch
                 metaTubeTitles = metaTubeTitles + found
                 metaTubeProgress = null
-                if (tree != null && siblingNames != null) excludeProblems()
+                if (isNamingTree && siblingNames != null) excludeProblems()
             }
         }
     }
@@ -397,7 +403,7 @@ class BatchRenameState(
      * 里面的文件就不再算在资源里、改成带片名的名字，一下变了一片；几千项的树每点一次也要整棵重新解析。
      */
     private val treeNames: Map<String, String>? by derivedStateOf {
-        tree ?: return@derivedStateOf null
+        if (!isNamingTree || tree == null) return@derivedStateOf null
         sources.map { it.id }.zip(CanonicalAvRule(canonicalTitles).apply(sources, sources.map { it.name })).toMap()
     }
 
@@ -410,7 +416,7 @@ class BatchRenameState(
      * 多选时规则还会再变，手改过的项不跟着规则走，反而看不出哪些是规则的结果。
      */
     fun setOverride(id: String, name: String?) {
-        if (tree == null) return
+        if (!isNamingTree) return
         overrides = if (name == null) overrides - id else overrides + (id to name)
     }
 
@@ -488,19 +494,41 @@ class BatchRenameState(
 
     init {
         loadSiblings()
-        if (tree != null) startAvNaming() else if (initialAvNaming && avNamingAvailable) startAvNaming()
+        if (isNamingTree) startAvNaming() else if (initialAvNaming && avNamingAvailable) startAvNaming()
         metaTube?.let { service ->
             scope.launch {
                 metaTubeAvailable = service.enabled.first()
                 // 整理一棵树时片名值得等，打开即查；可以跳过，也可以取消勾选不用。多选时仍由人勾选
-                if (tree != null && metaTubeAvailable) updateUseMetaTubeTitles(true)
+                if (isNamingTree && metaTubeAvailable) updateUseMetaTubeTitles(true)
             }
+        }
+    }
+
+    /** 在单层与递归子目录之间切换时保留已编辑的规则，避免重新输入。 */
+    fun copyDraftFrom(other: BatchRenameState) {
+        textMode = other.textMode
+        options = other.options
+        findBlocks = other.findBlocks
+        replaceBlocks = other.replaceBlocks
+        pendingFindText = other.pendingFindText
+        pendingReplaceText = other.pendingReplaceText
+        findInsertAt = other.findInsertAt
+        replaceInsertAt = other.replaceInsertAt
+        stripPrefix = other.stripPrefix
+        stripSuffix = other.stripSuffix
+        if (other.avNaming && avNamingAvailable) {
+            avNaming = true
+            excludedIds = excludedIds + sources.filter { it.isFolder }.map { it.id }
+            if (other.useMetaTubeTitles) updateUseMetaTubeTitles(true)
+        } else {
+            avNaming = false
         }
     }
 
     fun loadSiblings() {
         siblingsFailed = false
         val selectedIds = sources.map { it.id }.toSet()
+        val selectedVaultEntryIds = sources.mapNotNullTo(HashSet()) { VaultEntry.entryIdOf(it.id) }
         scope.launch {
             val names = tree?.siblingNames.orEmpty().toMutableMap()
             for (parentId in sources.map { it.parentId }.distinct().filter { it !in names }) {
@@ -511,11 +539,17 @@ class BatchRenameState(
                             siblingsFailed = true
                             return@launch
                         }
-                names[parentId] = listing.filter { it.id !in selectedIds }.map { it.name }.toSet()
+                val visibleReal = listing.filterNot { VaultStore.looksLikeManifest(it) || VaultStore.isRecoveryFile(it) }
+                val vaultedSiblings = if (listing.any(VaultStore::looksLikeManifest)) {
+                    val entries = driveRepo.driveTreeIndex.vaultEntries(parentId)
+                        ?: driveRepo.vault.read(parentId, listing).getOrDefault(emptyList())
+                    entries.filter { it.isArchived && it.id !in selectedVaultEntryIds }.map { it.name }
+                } else emptyList()
+                names[parentId] = visibleReal.filter { it.id !in selectedIds }.mapTo(HashSet()) { it.name } + vaultedSiblings
             }
             siblingNames = names
             // 片名还在查时等查完再做，规范名还会变
-            if (tree != null && metaTubeProgress == null) excludeProblems()
+            if (isNamingTree && metaTubeProgress == null) excludeProblems()
         }
     }
 
@@ -524,7 +558,7 @@ class BatchRenameState(
         if (!canRename) return
         val plan = plan
         // 一棵树没用查找替换，记下的会是一组空的选项
-        if (tree == null) {
+        if (!isNamingTree) {
             scope.launch {
                 runSuspendCatching { BatchRenameMemory.save(preferences, memory.remember(effectiveOptions)) }
                     .logFailure(TAG, "Failed to save batch rename memory")
@@ -534,8 +568,9 @@ class BatchRenameState(
         phase = Phase.RUNNING
         val affectedFolders = plan.steps.mapTo(HashSet()) { it.source.parentId }.size
         val mode = when {
-            tree != null -> "canonical-tree"
+            isNamingTree -> "canonical-tree"
             else -> buildString {
+                if (tree != null) append("recursive-")
                 append(if (textMode) "regex" else "blocks")
                 if (avNaming) append("+canonical-av")
             }
@@ -550,9 +585,9 @@ class BatchRenameState(
             try {
                 run.execute(plan)
             } finally {
-                val touched = plan.steps.mapTo(HashSet()) { it.source.parentId }
+                val touched = plan.steps.filterNot { VaultEntry.isVaulted(it.source.id) }.mapTo(HashSet()) { it.source.parentId }
                 if (touched.isNotEmpty()) {
-                    if (wasStopped || run.failures.isNotEmpty() || run.unconfirmed.isNotEmpty()) {
+                    if (wasStopped || run.failures.isNotEmpty()) {
                         driveRepo.applyChange(dev.piko.shared.data.DriveChange.ContentsChanged(touched))
                     } else {
                         driveRepo.notifyFoldersRefreshed(touched)
@@ -562,16 +597,23 @@ class BatchRenameState(
                 PikoLog.i(
                     TAG,
                     "Batch rename finished: succeeded=$succeededCount/${plan.changeCount}, failed=${failures.size}, " +
-                        "unconfirmed=${run.unconfirmed.size}, steps=${run.renamed.size}, swaps=${run.swapsExecuted}, " +
-                        "rolledBack=${run.rolledBack}, stopped=$wasStopped, elapsedMs=${started.elapsedNow().inWholeMilliseconds}",
+                        "steps=${run.renamed.size}, vaultFolders=${run.vaultReverts.size}, " +
+                        "swaps=${run.swapsExecuted}, rolledBack=${run.rolledBack}, stopped=$wasStopped, elapsedMs=${started.elapsedNow().inWholeMilliseconds}",
                 )
                 phase = Phase.DONE
                 // 改成了的记进改动记录，提示带「撤销」；一项也没改成的只报结果
-                if (run.renamed.isNotEmpty()) {
-                    driveRepo.changes.record(DriveChangeJournal.Change.Rename(run.renamed.toList(), summary()))
-                    _messages.tryEmit("")
-                } else {
-                    _messages.tryEmit(summary())
+                when {
+                    run.renamed.isNotEmpty() -> {
+                        driveRepo.changes.record(
+                            DriveChangeJournal.Change.Rename(run.renamed.toList(), summary(), vaultReverts = run.vaultReverts.toMap()),
+                        )
+                        _messages.tryEmit("")
+                    }
+                    run.vaultReverts.isNotEmpty() -> {
+                        driveRepo.changes.record(DriveChangeJournal.Change.Vault(run.vaultReverts.toMap(), summary()))
+                        _messages.tryEmit("")
+                    }
+                    else -> _messages.tryEmit(summary())
                 }
             }
         }

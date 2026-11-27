@@ -408,7 +408,9 @@ class ProxyLoopbackReplayTest {
                     bufferBudget = BufferBudget(maxReadAheadBytes = 512L * 1024),
                 ),
             )
-            awaitUntil("epoch 推进在 0ms 内取消旧世代投机预读") { speculativeInFlight.get() == 0 }
+            awaitUntil("epoch 推进在 0ms 内取消旧世代投机预读") {
+                speculativeInFlight.get() == 0 && harness.activeCdnRequests.get() <= 1
+            }
             assertFalse(lookAheadGate.isCompleted)
             assertEquals(1, harness.activeCdnRequests.get(), "旧连接当前正在读的单块 Required 不得被误杀")
 
@@ -814,7 +816,7 @@ class ProxyLoopbackReplayTest {
         val stream = proxy.register(harness.byteSource, "cached-seek-reuse.mkv", demand)
         var openConn: dev.piko.shared.media.testing.OpenResponse? = null
         try {
-            val conn = openRequest(stream.url, range = "bytes=0-").also {
+            val conn = openRequest(stream.url, range = "bytes=0-", receiveBufferSize = 16 * 1024).also {
                 it.socket.soTimeout = 10_000
                 openConn = it
             }
@@ -1002,15 +1004,16 @@ class ProxyLoopbackReplayTest {
                         channel.close()
                     } catch (t: Throwable) {
                         channel.close(t)
-                    } finally {
-                        activeCdnRequests.decrementAndGet()
                     }
                 }
                 val completionHandle = request.executionContext.invokeOnCompletion { cause ->
                     channel.cancel(cause)
                     producerJob.cancel()
                 }
-                producerJob.invokeOnCompletion { completionHandle.dispose() }
+                producerJob.invokeOnCompletion {
+                    completionHandle.dispose()
+                    activeCdnRequests.decrementAndGet()
+                }
                 streamScope.launch {
                     while (producerJob.isActive && !channel.isClosedForWrite && !channel.isClosedForRead) {
                         delay(5)

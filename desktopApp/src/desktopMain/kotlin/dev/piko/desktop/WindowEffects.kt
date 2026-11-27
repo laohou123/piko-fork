@@ -6,7 +6,7 @@ import androidx.compose.runtime.LaunchedEffect
 import dev.piko.desktop.winrt.TaskbarProgress
 import dev.piko.desktop.winrt.WindowChrome
 import dev.piko.download.DownloadStatus
-import dev.piko.shared.download.PikoDownloadCoordinator
+import dev.piko.shared.download.DownloadService
 import java.awt.Component
 import java.awt.Container
 import java.awt.Dimension
@@ -75,29 +75,82 @@ private object PixelAlignedLayout : LayoutManager {
 @Composable
 fun TitleBarThemeEffect(window: Window, dark: Boolean) {
     DisposableEffect(window, dark) {
-        if (isMacOs) MacOs.setWindowAppearance(window, dark) else WindowChrome.setDarkTitleBar(window, dark)
+        when {
+            isMacOs -> MacOs.setWindowAppearance(window, dark)
+            isLinux -> applyLinuxWindowBackground(window, dark)
+            else -> WindowChrome.setDarkTitleBar(window, dark)
+        }
         onDispose {}
+    }
+}
+
+private fun applyLinuxWindowBackground(window: Window, dark: Boolean) {
+    runCatching {
+        val bg = if (dark) java.awt.Color.BLACK else java.awt.Color.WHITE
+        window.background = bg
+        if (window is JFrame) {
+            window.rootPane.background = bg
+            window.contentPane.background = bg
+        }
+        syncAwtChildBackgrounds(window, bg)
+    }
+}
+
+private fun syncAwtChildBackgrounds(container: Container, bg: java.awt.Color) {
+    for (child in container.components) {
+        child.background = bg
+        if (child is Container) syncAwtChildBackgrounds(child, bg)
     }
 }
 
 /** 任务栏按钮（macOS 是 Dock 图标）上显示正在进行的下载的总进度。暂停与失败的任务不计入，没有进行中的任务时清除。 */
 @Composable
-fun TaskbarDownloadProgress(window: Window, downloads: PikoDownloadCoordinator) {
+fun TaskbarDownloadProgress(window: Window, downloads: DownloadService) {
     LaunchedEffect(window, downloads) {
+        var lastMode = 0
+        var lastPermille = -1
+        var lastUpdateNanos = 0L
+        var lastDockPercent: Int? = -1
         downloads.tasks.collect { tasks ->
             val active = tasks.values.filter { it.status == DownloadStatus.DOWNLOADING || it.status == DownloadStatus.PENDING }
             val total = active.sumOf { it.totalBytes }
             if (isMacOs) {
-                MacOs.setDockProgress(if (active.isEmpty() || total <= 0) null else (active.sumOf { it.downloadedBytes } * 100 / total).toInt())
+                val percent = if (active.isEmpty() || total <= 0) null else (active.sumOf { it.downloadedBytes } * 100 / total).toInt()
+                if (percent != lastDockPercent) {
+                    lastDockPercent = percent
+                    MacOs.setDockProgress(percent)
+                }
                 return@collect
             }
             when {
-                active.isEmpty() -> TaskbarProgress.clear(window)
+                active.isEmpty() -> {
+                    if (lastMode != 0) {
+                        TaskbarProgress.clear(window)
+                        lastMode = 0
+                        lastPermille = -1
+                    }
+                }
                 // 总大小未知，给不出百分比
-                total <= 0 -> TaskbarProgress.setState(window, TaskbarProgress.State.INDETERMINATE)
+                total <= 0 -> {
+                    if (lastMode != 1) {
+                        TaskbarProgress.setState(window, TaskbarProgress.State.INDETERMINATE)
+                        lastMode = 1
+                        lastPermille = -1
+                    }
+                }
                 else -> {
-                    TaskbarProgress.setState(window, TaskbarProgress.State.NORMAL)
-                    TaskbarProgress.setProgress(window, active.sumOf { it.downloadedBytes }, total)
+                    val completed = active.sumOf { it.downloadedBytes }.coerceIn(0L, total)
+                    val permille = (completed * 1000L / total).toInt()
+                    val now = System.nanoTime()
+                    if (lastMode != 2) {
+                        TaskbarProgress.setState(window, TaskbarProgress.State.NORMAL)
+                        lastMode = 2
+                    }
+                    if (permille != lastPermille && (lastPermille < 0 || permille == 1000 || now - lastUpdateNanos >= 250_000_000L)) {
+                        TaskbarProgress.setProgress(window, completed, total)
+                        lastPermille = permille
+                        lastUpdateNanos = now
+                    }
                 }
             }
         }

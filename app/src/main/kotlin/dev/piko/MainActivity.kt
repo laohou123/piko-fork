@@ -7,7 +7,9 @@ import dev.piko.shared.log.PikoLog
 import dev.piko.data.auth.AppLanguage
 
 import android.Manifest
+import android.app.KeyguardManager
 import android.content.ContentResolver
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
@@ -20,16 +22,37 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.areStatusBarsVisible
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.Lock
+import androidx.compose.material3.Button
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.dp
+import dev.piko.ui.theme.PikoTheme
 import androidx.core.content.ContextCompat
 import androidx.core.content.IntentCompat
 import androidx.core.view.ViewCompat
@@ -49,16 +72,26 @@ import dev.piko.ui.hasBackgroundWork
 import dev.piko.ui.fileWorkChanges
 import dev.piko.ui.VideoPlayerHost
 import dev.piko.ui.screens.player.MediampVideoPlayerScreen
+import dev.piko.ui.theme.Appearance
+import dev.piko.ui.theme.SeedTheme
+import dev.piko.ui.theme.ThemeMode
 import dev.piko.ui.theme.appearanceFlow
 import dev.piko.ui.theme.isDark
 import dev.piko.platform.installMotionScale
 import dev.piko.util.PikPakAppLink
+import java.io.InputStream
+import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 
 /**
  * Main application entry activity using Single Activity architecture.
@@ -70,6 +103,9 @@ import kotlinx.coroutines.withContext
  * - Material 3 Motion: m3-material-mirror/pages/styles/motion.md
  */
 class MainActivity : ComponentActivity() {
+
+    private var openTorrentJob: Job? = null
+    private var pendingLockedIntent: Intent? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         val systemLocale = android.content.res.Resources.getSystem().configuration.locales.get(0) ?: Locale.getDefault()
@@ -85,8 +121,16 @@ class MainActivity : ComponentActivity() {
 
         val app = PikoApplication.instance
         val appearanceFlow = app.sessionManager.appearanceFlow(app.platform.supportsDynamicColor)
-        // 同步读一次再 setContent：异步给初值的话，首帧按系统取色画出来，随即跳成用户选的主题
-        val initialAppearance = runBlocking { appearanceFlow.first() }
+        // 从预加载的无锁偏好快照同步构造初始外观，既避免主线程 runBlocking 又避免首帧闪回默认主题
+        val initialSnapshot = app.sessionManager.currentSnapshot
+        val initialAppearance = Appearance(
+            mode = ThemeMode.entries.find { it.name.equals(initialSnapshot.themeMode, ignoreCase = true) } ?: ThemeMode.SYSTEM,
+            seed = SeedTheme.colorEntries.find { it.name == initialSnapshot.themeSeed },
+            dynamicColorAvailable = app.platform.supportsDynamicColor,
+            pureBlack = initialSnapshot.pureBlack,
+            einkMode = initialSnapshot.einkMode,
+            motionPreference = initialSnapshot.motionPreference,
+        )
         // 播放器仍在 app 模块，以应用内覆盖层的方式交给共享主界面
         val videoPlayer = VideoPlayerHost.InApp { screen, onClose ->
             MediampVideoPlayerScreen(
@@ -103,6 +147,10 @@ class MainActivity : ComponentActivity() {
         setContent {
             val appearance by appearanceFlow.collectAsStateWithLifecycle(initialAppearance)
             val darkTheme = appearance.isDark()
+            val appSecurity = app.platform.appSecurity
+            val hideInRecents by appSecurity.hideInRecents.collectAsStateWithLifecycle()
+            val appLockEnabled by appSecurity.appLockEnabled.collectAsStateWithLifecycle()
+            val isLocked by appSecurity.locked.collectAsStateWithLifecycle()
             // 系统栏图标的深浅默认看系统的夜间模式。应用强制浅色而系统是深色时，状态栏会是
             // 浅色图标压在浅色背景上，所以改为按应用实际的深浅判断。导航栏遮罩沿用库的默认值
             DisposableEffect(darkTheme) {
@@ -112,15 +160,47 @@ class MainActivity : ComponentActivity() {
                 )
                 onDispose {}
             }
-            PikoApp(
-                onLanguageChanged = ::applyLanguage,
-                services = app.services,
-                platform = app.platform,
-                appearance = appearance,
-                videoPlayer = videoPlayer,
-            )
-            AskForNotificationsOnFirstWork(app.services)
-            if (isHeightCompact()) HideStatusBarWhileShort()
+            LaunchedEffect(hideInRecents, appLockEnabled) {
+                appSecurity.applyWindowSecurity(this@MainActivity)
+            }
+            LaunchedEffect(isLocked) {
+                if (!isLocked) {
+                    pendingLockedIntent?.let { deferred ->
+                        pendingLockedIntent = null
+                        handleIntentNow(deferred)
+                    }
+                }
+            }
+            if (isLocked) {
+                PikoTheme(appearance = appearance) {
+                    AppLockOverlay(
+                        activity = this@MainActivity,
+                        appSecurity = appSecurity,
+                    )
+                }
+            } else {
+                PikoApp(
+                    onLanguageChanged = ::applyLanguage,
+                    services = app.services,
+                    platform = app.platform,
+                    appearance = appearance,
+                    videoPlayer = videoPlayer,
+                )
+                AskForNotificationsOnFirstWork(app.services)
+                if (isHeightCompact()) HideStatusBarWhileShort()
+            }
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        PikoApplication.instance.platform.appSecurity.onAppForegrounded()
+    }
+
+    override fun onStop() {
+        super.onStop()
+        if (!isChangingConfigurations) {
+            PikoApplication.instance.platform.appSecurity.onAppBackgrounded()
         }
     }
 
@@ -147,6 +227,15 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleIntent(intent: Intent?) {
+        if (intent == null) return
+        if (PikoApplication.instance.platform.appSecurity.locked.value) {
+            pendingLockedIntent = intent
+            return
+        }
+        handleIntentNow(intent)
+    }
+
+    private fun handleIntentNow(intent: Intent?) {
         if (intent == null) return
         if (intent.getBooleanExtra(EXTRA_OPEN_TRANSFERS, false)) {
             PikoApplication.instance.services.requestOpenTransfers()
@@ -179,10 +268,13 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun isOwnFileProviderUri(uri: Uri): Boolean =
+        uri.authority.equals("${packageName}.fileprovider", ignoreCase = true)
+
     /** 打开的 .torrent 文件。按类型认而不按扩展名：content: URI 的路径多半不带文件名。 */
     private fun torrentUri(intent: Intent): Uri? {
         if (intent.action != Intent.ACTION_VIEW) return null
-        val uri = intent.data?.takeIf { it.scheme == ContentResolver.SCHEME_CONTENT } ?: return null
+        val uri = intent.data?.takeIf { it.scheme == ContentResolver.SCHEME_CONTENT && !isOwnFileProviderUri(it) } ?: return null
         val mimeType = intent.type ?: runCatching { contentResolver.getType(uri) }
             .onFailure { PikoLog.w("IncomingLink", "Failed to query MIME type for incoming URI (authority=${uri.authority})", it) }
             .getOrNull()
@@ -192,20 +284,41 @@ class MainActivity : ComponentActivity() {
     /** 与桌面端拖进种子相同，在本地换算成磁力链接。读取放在后台：文档提供者可能现从网络取内容。 */
     private fun openTorrent(uri: Uri) {
         val app = PikoApplication.instance
-        app.appScope.launch(Dispatchers.IO) {
+        openTorrentJob?.cancel()
+        openTorrentJob = app.appScope.launch {
             val magnet = try {
-                val bytes = app.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-                if (bytes == null) {
-                    PikoLog.w("IncomingLink", "ContentResolver returned null stream for .torrent URI (authority=${uri.authority})")
-                    null
-                } else {
-                    TorrentMagnet.fromBytes(bytes).also { parsed ->
-                        if (parsed == null) {
-                            PikoLog.w("IncomingLink", "Failed to parse .torrent payload (${bytes.size} bytes)")
+                withTimeout(TORRENT_READ_TIMEOUT_MS) {
+                    val streamRef = AtomicReference<InputStream?>(null)
+                    val readJob = async(Dispatchers.IO) {
+                        runInterruptible {
+                            app.contentResolver.openInputStream(uri)?.use { stream ->
+                                streamRef.set(stream)
+                                TorrentMagnet.readBoundedBytes(stream, TorrentMagnet.MAX_TORRENT_BYTES)
+                            }
+                        }
+                    }
+                    val bytes = try {
+                        readJob.await()
+                    } finally {
+                        streamRef.getAndSet(null)?.let { stream -> runCatching { stream.close() } }
+                        readJob.cancel()
+                    }
+                    when {
+                        bytes == null -> {
+                            PikoLog.w("IncomingLink", "Unavailable or oversized .torrent URI (authority=${uri.authority})")
+                            null
+                        }
+                        else -> withContext(Dispatchers.Default) { TorrentMagnet.fromBytes(bytes) }.also { parsed ->
+                            if (parsed == null) {
+                                PikoLog.w("IncomingLink", "Failed to parse .torrent payload (${bytes.size} bytes)")
+                            }
                         }
                     }
                 }
-            } catch (cancel: kotlinx.coroutines.CancellationException) {
+            } catch (timeout: TimeoutCancellationException) {
+                PikoLog.w("IncomingLink", "Timed out reading .torrent URI (authority=${uri.authority})", timeout)
+                null
+            } catch (cancel: CancellationException) {
                 throw cancel
             } catch (e: Exception) {
                 PikoLog.w("IncomingLink", "Failed to read or parse .torrent URI (authority=${uri.authority})", e)
@@ -227,8 +340,8 @@ class MainActivity : ComponentActivity() {
                 IntentCompat.getParcelableArrayListExtra(intent, Intent.EXTRA_STREAM, Uri::class.java).orEmpty()
             else -> emptyList()
         }
-        // AndroidPikoUploadSources 只认 content: URI
-        return uris.filter { it.scheme == ContentResolver.SCHEME_CONTENT }
+        // AndroidPikoUploadSources 只认外部提供的 content: URI，拒绝自身 FileProvider URI 避免回环读取私有目录
+        return uris.filter { it.scheme == ContentResolver.SCHEME_CONTENT && !isOwnFileProviderUri(it) }
     }
 
     /**
@@ -271,6 +384,92 @@ class MainActivity : ComponentActivity() {
  * 每次 Activity 组合生命周期内最多问一次（Activity 重建后若仍未授权会再次检查）；拒绝两次后系统自己也不再弹。
  */
 @Composable
+private fun AppLockOverlay(
+    activity: ComponentActivity,
+    appSecurity: dev.piko.platform.AndroidAppSecurity,
+) {
+    var errorText by remember { mutableStateOf<String?>(null) }
+    val legacyCredentialLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { result ->
+        if (result.resultCode == android.app.Activity.RESULT_OK) {
+            appSecurity.markUnlocked()
+        }
+    }
+
+    fun requestUnlock() {
+        errorText = null
+        val handled = appSecurity.promptBiometricUnlock(
+            activity = activity,
+            onSuccess = { errorText = null },
+            onError = { msg -> if (msg.isNotBlank()) errorText = msg },
+        )
+        if (!handled) {
+            val km = activity.getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+            @Suppress("DEPRECATION")
+            val intent = km?.createConfirmDeviceCredentialIntent(
+                tr("解锁应用", "Unlock app", "ロックを解除", "앱 잠금 해제", "解鎖應用程式"),
+                tr("请验证设备锁屏以继续访问", "Confirm device screen lock to continue", "続行するには端末のロックを解除してください", "계속하려면 기기 잠금을 해제하세요", "請驗證裝置螢幕鎖定以繼續存取"),
+            )
+            if (intent != null) {
+                legacyCredentialLauncher.launch(intent)
+            } else if (!appSecurity.canUseDeviceLock()) {
+                // 设备锁屏密码已被用户在系统设置中关闭，自动停用应用锁避免永久锁死
+                appSecurity.setAppLockEnabled(false)
+            } else {
+                errorText = tr(
+                    "无法调起系统身份验证，请重试",
+                    "Unable to launch system authentication. Try again.",
+                    "システム認証を起動できませんでした。再試行してください。",
+                    "시스템 인증을 시작할 수 없습니다. 다시 시도해 주세요.",
+                    "無法啟動系統身分驗證，請重試",
+                )
+            }
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        requestUnlock()
+    }
+
+    Surface(
+        modifier = Modifier.fillMaxSize(),
+        color = MaterialTheme.colorScheme.background,
+    ) {
+        Column(
+            modifier = Modifier.fillMaxSize().padding(32.dp),
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Icon(
+                imageVector = Icons.Outlined.Lock,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(48.dp),
+            )
+            Spacer(Modifier.height(16.dp))
+            Text(
+                text = tr("应用已锁定", "App locked", "アプリはロックされています", "앱이 잠겨 있습니다", "應用程式已鎖定"),
+                style = MaterialTheme.typography.titleLarge,
+                color = MaterialTheme.colorScheme.onBackground,
+            )
+            if (!errorText.isNullOrBlank()) {
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    text = errorText.orEmpty(),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+            Spacer(Modifier.height(24.dp))
+            Button(onClick = ::requestUnlock) {
+                Text(tr("验证并解锁", "Unlock", "ロックを解除", "잠금 해제", "驗證並解鎖"))
+            }
+        }
+    }
+}
+
+@Composable
 private fun AskForNotificationsOnFirstWork(services: PikoServices) {
     if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return
     val context = LocalContext.current
@@ -290,6 +489,7 @@ private fun AskForNotificationsOnFirstWork(services: PikoServices) {
 }
 
 private const val TORRENT_MIME_TYPE = "application/x-bittorrent"
+private const val TORRENT_READ_TIMEOUT_MS = 15_000L
 
 /**
  * 窗口高度 compact（横握的手机）时收起状态栏，下滑临时唤出；导航条不动。整个应用一个入口，按窗口高度生效。

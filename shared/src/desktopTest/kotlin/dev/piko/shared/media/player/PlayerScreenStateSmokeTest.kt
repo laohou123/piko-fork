@@ -61,6 +61,7 @@ class PlayerScreenStateSmokeTest {
                 initialFileId = "f1",
                 initialFileName = cloud.fileName,
                 resolveLocalPath = resolveLocalPath,
+                recoveryDelaysMillis = longArrayOf(20L, 40L, 80L),
             ).apply {
                 // 与两端调用方一致：列表总会填一次。不填时第一次打开要等满播放列表的超时
                 playlist = emptyList()
@@ -160,7 +161,7 @@ class PlayerScreenStateSmokeTest {
         assertEquals(1, messages.count { "转码" in it })
 
         // 走完三级就停下，不能在失败之间来回打转
-        delay(1_000)
+        delay(200)
         assertEquals(3, backend.opens.size)
     }
 
@@ -173,14 +174,14 @@ class PlayerScreenStateSmokeTest {
         }
         val state = newState()
 
-        // 首次打开加三次退避重连（0.5 s、1.5 s、4 s），之后才把错误交给用户
+        // 首次打开加三次退避重连，之后才把错误交给用户
         val opens = backend.awaitOpens(4, timeoutMillis = 20_000)
         opens.drop(1).forEach { reconnect ->
             assertTrue(reconnect.urlOrNull()!!.startsWith("http://127.0.0.1:"), "重连应当原路走代理，不是换源")
             assertEquals(50_000L, reconnect.startMillis, "重连应当从断点续上")
         }
         eventually("退避用尽后报错") { state.errorMessage != null }
-        delay(1_000)
+        delay(200)
         assertEquals(4, backend.opens.size)
     }
 
@@ -282,6 +283,7 @@ class PlayerScreenStateSmokeTest {
         assertEquals(true, secondUrl.isMpegTsTranscode)
         assertEquals(180_000L, secondOpen.startMillis)
         assertEquals(512L * 1024L, state.mediaInfo?.sizeBytes)
+        assertEquals(1024L * 1024L, state.mediaInfo?.originalSizeBytes, "播放转码流时仍须保留原画文件大小供 ABR 计算原画码率")
 
         val block = 256L * 1024L
         assertEquals(
@@ -428,6 +430,180 @@ class PlayerScreenStateSmokeTest {
         leavePlayer(state)
     }
 
+    @Test
+    fun releaseFlushesCloudPlayHistoryEvenWhenBackendStopZeroesDuration() = runBlocking {
+        // 服务端 metadata 不带时长（durationSeconds=0），时长完全依赖后端；且模拟真实后端 stop() 立即将 durationMillis 清零
+        val zeroDurCloud = FakePikPakCloud(
+            origin = FakePikPakCloud.payload(1024 * 1024),
+            transcode = FakePikPakCloud.payload(512 * 1024),
+            durationSeconds = 0,
+        )
+        val syncPositions = RecordedPositions(syncPlayHistory = true)
+        val syncRepo = PikoMediaRepository(zeroDurCloud.provider, syncPositions.preferences)
+        backend.zeroDurationOnStop = true
+
+        val state = withContext(stateThread) {
+            PlayerScreenState(
+                repository = syncRepo,
+                backend = backend,
+                scope = scope,
+                initialFileId = "f1",
+                initialFileName = zeroDurCloud.fileName,
+            ).apply { playlist = emptyList() }
+        }
+        backend.awaitOpens(1)
+        backend.emit(PlaybackBackendEvent.Ready)
+        backend.progress(positionMillis = 130_000L, durationMillis = 600_000L)
+
+        leavePlayer(state)
+        syncRepo.flushPlayHistory(timeoutMillis = 3_000L)
+
+        assertEquals(130_000L, syncPositions.saved["f1"])
+        assertEquals(1, zeroDurCloud.playEvents.size, "Closing must report cloud play history using cached duration before stop() zeroes it")
+        assertEquals("f1", zeroDurCloud.playEvents[0].fileId)
+        assertEquals(130L, zeroDurCloud.playEvents[0].playSeconds)
+        assertEquals(600L, zeroDurCloud.playEvents[0].playDuration)
+    }
+
+    @Test
+    fun closingDuringQualitySwitchReloadPreservesAccumulatedProgress() = runBlocking {
+        positions.syncPlayHistoryFlow.value = true
+        val state = newState()
+        backend.awaitOpens(1)
+        backend.emit(PlaybackBackendEvent.Ready)
+        backend.progress(positionMillis = 180_000L, durationMillis = 600_000L)
+
+        // 切换画质重新打开 480P，但新流尚未出首帧（startedThisAttempt=false, resumePositionVerified=false）即关闭播放器
+        withContext(stateThread) { state.selectQuality("480P") }
+        backend.awaitOpens(2)
+        leavePlayer(state)
+        repository.flushPlayHistory(timeoutMillis = 3_000L)
+
+        assertEquals(180_000L, positions.saved["f1"], "Local progress accumulated before quality reload must not be lost")
+        assertTrue(
+            cloud.playEvents.any { it.fileId == "f1" && it.playSeconds == 180L && it.playDuration == 600L },
+            "Cloud play history must retain verified progress when closing during quality reload, got: ${cloud.playEvents}",
+        )
+    }
+
+    @Test
+    fun preReadyPositionUpdateStillVerifiesResumeAndReportsProgress() = runBlocking {
+        positions.syncPlayHistoryFlow.value = true
+        positions.saved["f1"] = 120_000L
+        val state = newState()
+        backend.awaitOpens(1)
+
+        // 模拟后端在 Ready 事件之前就先把位置与时长推进到续播落点，之后不再变动位置
+        backend.progress(positionMillis = 120_500L, durationMillis = 600_000L)
+        backend.emit(PlaybackBackendEvent.Ready)
+        delay(150)
+
+        withContext(stateThread) { state.pause() }
+        repository.flushPlayHistory(timeoutMillis = 3_000L)
+
+        assertTrue(
+            cloud.playEvents.any { it.fileId == "f1" && it.playSeconds == 120L && it.playDuration == 600L },
+            "Pre-Ready position update must verify resume once Ready arrives, got: ${cloud.playEvents}",
+        )
+        leavePlayer(state)
+    }
+
+    @Test
+    fun switchToImmediatelyFollowedByCloseStillReportsPreviousEpisode() = runBlocking {
+        positions.syncPlayHistoryFlow.value = true
+        val state = newState()
+        backend.awaitOpens(1)
+        backend.emit(PlaybackBackendEvent.Ready)
+        backend.progress(positionMillis = 95_000L, durationMillis = 600_000L)
+
+        // 切集后立刻关闭窗口并取消播放器 UI scope：上一集进度仍须经仓库级队列可靠提交
+        withContext(stateThread) {
+            state.switchTo("f2", "ep2.mkv")
+        }
+        leavePlayer(state)
+        repository.flushPlayHistory(timeoutMillis = 3_000L)
+
+        assertEquals(95_000L, positions.saved["f1"])
+        assertTrue(
+            cloud.playEvents.any { it.fileId == "f1" && it.playSeconds == 95L && it.playDuration == 600L },
+            "Previous episode report must survive immediate player close after switchTo, got: ${cloud.playEvents}",
+        )
+    }
+
+    @Test
+    fun switchingAccountBeforeClosingPlayerReportsHistoryToOriginalSessionAccount() = runBlocking {
+        val cloudA = FakePikPakCloud(origin = FakePikPakCloud.payload(1024 * 1024))
+        val cloudB = FakePikPakCloud(origin = FakePikPakCloud.payload(1024 * 1024))
+        val currentClientFlow = kotlinx.coroutines.flow.MutableStateFlow(cloudA.provider.currentClient.value)
+        val switchableProvider = object : dev.piko.shared.data.PikoClientProvider {
+            override val currentClient: kotlinx.coroutines.flow.StateFlow<io.github.nihildigit.pikpak.PikPakClient?> = currentClientFlow
+        }
+        val syncPositions = RecordedPositions(syncPlayHistory = true)
+        val switchableRepo = PikoMediaRepository(switchableProvider, syncPositions.preferences)
+
+        val state = withContext(stateThread) {
+            PlayerScreenState(
+                repository = switchableRepo,
+                backend = backend,
+                scope = scope,
+                initialFileId = "f1",
+                initialFileName = cloudA.fileName,
+            ).apply { playlist = emptyList() }
+        }
+        backend.awaitOpens(1)
+        backend.emit(PlaybackBackendEvent.Ready)
+        backend.progress(positionMillis = 150_000L, durationMillis = 600_000L)
+
+        // 用户先切换登录账号至 B，随后关闭旧播放器：最终播放历史必须上报给开播时归属的账号 A，绝不污染账号 B
+        currentClientFlow.value = cloudB.provider.currentClient.value
+        leavePlayer(state)
+        switchableRepo.flushPlayHistory(timeoutMillis = 3_000L)
+
+        assertTrue(
+            cloudA.playEvents.any { it.fileId == "f1" && it.playSeconds == 150L && it.playDuration == 600L },
+            "Original account A must receive final play history report, got: ${cloudA.playEvents}",
+        )
+        assertTrue(cloudB.playEvents.isEmpty(), "Switched-to account B must never receive old session play history: ${cloudB.playEvents}")
+    }
+
+    @Test
+    fun endedWithLaggingBackendPositionNeverOverwritesZeroResetOrCompletedHistory() = runBlocking {
+        positions.syncPlayHistoryFlow.value = true
+        val state = newState()
+        backend.awaitOpens(1)
+        backend.emit(PlaybackBackendEvent.Ready)
+        // 模拟 EOF 时后端最后一次上报的 positionMillis 仍滞后在距片尾 >10s 处（580s / 600s）
+        backend.progress(positionMillis = 580_000L, durationMillis = 600_000L)
+        backend.emit(PlaybackBackendEvent.Ended)
+
+        leavePlayer(state)
+        repository.flushPlayHistory(timeoutMillis = 3_000L)
+
+        assertEquals(0L, positions.saved["f1"], "Ended reset to 0ms must not be overwritten by lagging backend position on close")
+        assertEquals(600L, cloud.playEvents.lastOrNull { it.fileId == "f1" }?.playSeconds, "Completed play history must stay at full duration")
+    }
+
+    @Test
+    fun seekBufferingStallDoesNotTriggerFalseAutoQualityDowngrade() = runBlocking {
+        backend.simulateNativeGenerations = true
+        val state = newState()
+        backend.awaitOpens(1)
+        backend.emit(PlaybackBackendEvent.Ready)
+        backend.progress(positionMillis = 30_000L, durationMillis = 600_000L)
+        assertEquals(dev.piko.shared.media.ORIGINAL_QUALITY, state.autoResolvedQuality)
+
+        // 发起拖动定位并保持后端处于 seek 缓冲等待态 4.5s（超过稳态 3s 卡顿降档阈值）
+        withContext(stateThread) {
+            state.seekTo(300_000L)
+            Snapshot.sendApplyNotifications()
+        }
+        delay(4_500L)
+
+        assertEquals(1, backend.opens.size, "Buffering caused by active seek must not trigger ABR stall downgrade")
+        assertEquals(dev.piko.shared.media.ORIGINAL_QUALITY, state.autoResolvedQuality)
+        leavePlayer(state)
+    }
+
     private fun java.net.HttpURLConnection.useCode(): Int = try {
         responseCode
     } finally {
@@ -462,6 +638,7 @@ class PlayerScreenStateSmokeTest {
         val opens = CopyOnWriteArrayList<Opened>()
         var onOpen: suspend FakeBackend.() -> Unit = {}
         var simulateNativeGenerations: Boolean = false
+        var zeroDurationOnStop: Boolean = false
         override var requiresAsyncStopDrain: Boolean = false
         @Volatile var stopCalls: Int = 0
         var onStopDrain: suspend () -> Unit = {}
@@ -488,7 +665,7 @@ class PlayerScreenStateSmokeTest {
                 Snapshot.sendApplyNotifications()
             }
             // 让 state holder 里的 snapshotFlow 收集者先跑完
-            delay(200)
+            delay(40)
         }
 
         suspend fun awaitOpens(count: Int, timeoutMillis: Long = 10_000): List<Opened> {
@@ -519,6 +696,10 @@ class PlayerScreenStateSmokeTest {
         override fun stop() {
             check(Thread.currentThread().name.startsWith("player-state")) {
                 "PlaybackBackend.stop() must be invoked on the main state thread, was ${Thread.currentThread().name}"
+            }
+            if (zeroDurationOnStop) {
+                durationMillis = 0L
+                positionMillis = 0L
             }
             stopCalls += 1
         }

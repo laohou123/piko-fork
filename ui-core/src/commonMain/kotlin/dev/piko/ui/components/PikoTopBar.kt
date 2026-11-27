@@ -1,0 +1,197 @@
+package dev.piko.ui.components
+
+import dev.piko.shared.i18n.tr
+
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.ui.Alignment
+import dev.piko.ui.platform.captionExclusion
+import dev.piko.ui.platform.windowDragArea
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.add
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarColors
+import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.TopAppBarScrollBehavior
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalWindowInfo
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
+import dev.piko.ui.adaptive.readableSidePadding
+import dev.piko.ui.platform.rememberCaptionSlot
+import dev.piko.ui.theme.LocalFramed
+import dev.piko.ui.theme.FrameTopRowHeight
+import androidx.compose.ui.graphics.Color
+
+/**
+ * 列表离开顶端时顶栏换成滚动态的填充色（M3 top app bar 的 on scroll），按列表眼下的位置判断：[atTop]
+ * 读列表状态，例如 `{ state.firstVisibleItemIndex == 0 && state.firstVisibleItemScrollOffset == 0 }`。
+ *
+ * 不用 pinnedScrollBehavior 自带的那一套：它经 nestedScroll 把滚动量累加进 contentOffset，只增减不校正，
+ * 换了一份内容也不清零。网盘页换文件夹、恢复上次的滚动位置、我的分享取消几项后变短，列表明明在顶端、
+ * 甚至根本滚不动，顶栏仍是滚动态的颜色。这里每逢 [atTop] 变化直接写 contentOffset：在顶端为 0，
+ * 否则写到最小，overlappedFraction 即为 1。调用方不要再挂它的 nestedScrollConnection，两边会互相改写。
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun rememberListScrollTint(atTop: () -> Boolean): TopAppBarScrollBehavior {
+    val behavior = TopAppBarDefaults.pinnedScrollBehavior()
+    val latestAtTop by rememberUpdatedState(atTop)
+    LaunchedEffect(behavior) {
+        snapshotFlow { latestAtTop() }.collect { top ->
+            behavior.state.contentOffset = if (top) 0f else -Float.MAX_VALUE
+        }
+    }
+    return behavior
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun PikoTopBar(
+    title: String,
+    modifier: Modifier = Modifier,
+    navigationIcon: (@Composable () -> Unit)? = null,
+    onBackClick: (() -> Unit)? = null,
+    /** 放不下时按优先级收进「更多」，见 [AdaptiveBar]。 */
+    actions: List<BarItem> = emptyList(),
+    scrollBehavior: TopAppBarScrollBehavior? = null,
+    colors: TopAppBarColors = TopAppBarDefaults.topAppBarColors(
+        containerColor = MaterialTheme.colorScheme.surface,
+        scrolledContainerColor = MaterialTheme.colorScheme.surfaceContainer,
+        titleContentColor = MaterialTheme.colorScheme.onSurface,
+    ),
+    /**
+     * 页面内容按 [readableSidePadding] 收在居中的一栏时为 true：返回、标题与动作一起缩进同样的量，
+     * 与下面的内容对齐；底色仍铺满。否则宽窗口里标题贴在最左、内容在正中，两者对不上。
+     */
+    alignToReadableWidth: Boolean = false,
+    /** 不论宽窄都只在竖三点菜单里的项，排在收起的 [actions] 之后。非空时竖三点一直在。 */
+    moreActions: List<SheetAction> = emptyList(),
+    persistentActions: (@Composable () -> Unit)? = null,
+) {
+    if (alignToReadableWidth) {
+        val density = LocalDensity.current
+        val initialWidthPx = LocalWindowInfo.current.containerSize.width
+        var barWidthPx by remember(initialWidthPx) { mutableIntStateOf(initialWidthPx) }
+        val barWidth = with(density) { barWidthPx.toDp() }
+        // 不用 BoxWithConstraints：PikoTopBarContent 内的 AdaptiveBar 承载工具提示与溢出菜单弹层
+        Box(modifier.onSizeChanged { if (it.width > 0) barWidthPx = it.width }) {
+            PikoTopBarContent(title, Modifier, navigationIcon, onBackClick, actions, moreActions, scrollBehavior, colors, readableSidePadding(barWidth), persistentActions)
+        }
+    } else {
+        PikoTopBarContent(title, modifier, navigationIcon, onBackClick, actions, moreActions, scrollBehavior, colors, 0.dp, persistentActions)
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun PikoTopBarContent(
+    title: String,
+    modifier: Modifier,
+    navigationIcon: (@Composable () -> Unit)?,
+    onBackClick: (() -> Unit)?,
+    actions: List<BarItem>,
+    moreActions: List<SheetAction>,
+    scrollBehavior: TopAppBarScrollBehavior?,
+    colors: TopAppBarColors,
+    sideInset: Dp,
+    persistentActions: (@Composable () -> Unit)?,
+) {
+    // 贴着窗口右上角时（标题栏并进内容），窗口按钮接在动作按钮后面
+    val caption = rememberCaptionSlot()
+    // 有外框时顶栏落在外框色上（见 PikoScaffold），滚动后也不换色：页头与内容已由下面的卡片分开，
+    // 再给顶栏换一层底色就又多出一个长方形
+    val barColors = if (LocalFramed.current) {
+        TopAppBarDefaults.topAppBarColors(
+            containerColor = Color.Transparent,
+            scrolledContainerColor = Color.Transparent,
+            titleContentColor = MaterialTheme.colorScheme.onSurface,
+        )
+    } else {
+        colors
+    }
+    val barHeight = if (LocalFramed.current) FrameTopRowHeight else TopAppBarDefaults.TopAppBarExpandedHeight
+    TopAppBar(
+        title = {
+            // 标题、动作与窗口按钮一起交给 AdaptiveBar 排，TopAppBar 自己的 actions 不用：它先量动作、标题拿剩下的，
+            // 动作一多标题就被挤没。动作放不下时收进「更多」，标题至少留 TitleMinWidth
+            AdaptiveBar(
+                trailing = actions,
+                middle = {
+                    // 在窗口顶上时标题这一格铺满返回与动作之间的空白，整块是拖动区：原来只有窗口按钮前那一截能拖，
+                    // 设置这类只有标题的页，顶上一大片空白按住不动。高度写死为顶栏高：标题格的高度不设上限，
+                    // fillMaxHeight 会把整条顶栏撑到窗口那么高（实测）
+                    Box(
+                        modifier = if (caption.atTop) Modifier.fillMaxWidth().height(barHeight).windowDragArea() else Modifier,
+                        contentAlignment = Alignment.CenterStart,
+                    ) {
+                        Text(
+                            text = title,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            style = MaterialTheme.typography.titleLargeEmphasized,
+                        )
+                    }
+                },
+                middleMinWidth = titleMinWidthOf(title),
+                reserveMiddle = true,
+                fillMiddle = true,
+                alwaysMore = moreActions.isNotEmpty(),
+                moreActions = moreActions,
+                end = {
+                    androidx.compose.foundation.layout.Row {
+                        if (persistentActions != null) {
+                            Box(Modifier.captionExclusion(enabled = caption.atTop)) { persistentActions() }
+                        }
+                        caption.buttons?.invoke()
+                    }
+                },
+                dragWindow = caption.atTop,
+            )
+        },
+        modifier = modifier.then(caption.modifier),
+        navigationIcon = {
+            if (navigationIcon != null) {
+                Box(Modifier.captionExclusion(enabled = caption.atTop)) { navigationIcon() }
+            } else if (onBackClick != null) {
+                IconButton(onClick = onBackClick, modifier = Modifier.captionExclusion(enabled = caption.atTop)) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                        contentDescription = tr("返回", "Back", "戻る", "뒤로", "返回"),
+                    )
+                }
+            }
+        },
+        windowInsets = TopAppBarDefaults.windowInsets.add(WindowInsets(left = sideInset, right = sideInset)),
+        colors = barColors,
+        // 外框里与网盘页地址栏那一行、侧边栏的图标行同高（56dp），换页时卡片的上沿不跳；M3 默认的 64dp 会低出一截
+        expandedHeight = barHeight,
+        scrollBehavior = scrollBehavior,
+    )
+}
+
+/** 标题至少留这么宽，动作先收进「更多」：多选栏的「已选择 12 项」要读得出来；短标题（「任务」）不必空占 112dp。 */
+private fun titleMinWidthOf(title: String): Dp = when {
+    title.length <= 2 -> 52.dp
+    title.length <= 4 -> 80.dp
+    else -> 112.dp
+}

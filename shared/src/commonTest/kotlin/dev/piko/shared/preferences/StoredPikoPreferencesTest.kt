@@ -1,6 +1,7 @@
 package dev.piko.shared.preferences
 
 import dev.piko.data.auth.AppLanguage
+import dev.piko.data.auth.PlayerGestureDefaults
 import dev.piko.data.auth.SidePanelPrefs
 import dev.piko.data.auth.SnailMode
 import dev.piko.shared.auth.SecretVault
@@ -25,8 +26,10 @@ class StoredPikoPreferencesTest {
     fun structuredValuesAndRepresentativeKeysPersistWithoutOpeningSecretsOnDefaults() = runBlocking {
         val settings = FakeSettings()
         val lazyPrefs = StoredPikoPreferences(settings) { error("Secrets must stay lazy") }
-        assertTrue(lazyPrefs.spoilerBlurFlow.first())
+        assertFalse(lazyPrefs.spoilerBlurFlow.first())
         assertFalse(lazyPrefs.autoDetectClipboardLinksFlow.first())
+        assertFalse(lazyPrefs.pureBlackFlow.first())
+        assertFalse(lazyPrefs.currentSnapshot.pureBlack)
         assertEquals(SidePanelPrefs(false, null), lazyPrefs.clipPanelFlow.first())
         assertEquals(SnailMode(), lazyPrefs.snailModeFlow.first())
         assertEquals(ProxySetting(), lazyPrefs.proxySettingFlow.first())
@@ -35,6 +38,7 @@ class StoredPikoPreferencesTest {
         val prefs = preferences(settings)
         val proxy = ProxySetting(mode = ProxyMode.MANUAL, host = "localhost", port = 8080)
         prefs.setAppLanguage(AppLanguage.JA)
+        prefs.setPureBlack(true)
         prefs.setClipPanelOpen(true)
         prefs.setClipPanelWidth(320f)
         prefs.setSnailMode(SnailMode(true, 250, 125))
@@ -43,6 +47,9 @@ class StoredPikoPreferencesTest {
 
         val reopened = preferences(settings.reopen())
         assertEquals(AppLanguage.JA, reopened.appLanguageFlow.first())
+        assertTrue(reopened.pureBlackFlow.first())
+        assertTrue(reopened.currentSnapshot.pureBlack)
+        assertEquals(AppLanguage.JA, reopened.currentSnapshot.appLanguage)
         assertEquals(SidePanelPrefs(true, 320f), reopened.clipPanelFlow.first())
         assertEquals(SnailMode(true, 250, 125), reopened.snailModeFlow.first())
         assertEquals(proxy, reopened.proxySettingFlow.first())
@@ -77,13 +84,30 @@ class StoredPikoPreferencesTest {
             "player.boostSpeed" to "bad", "network.proxy" to "bad",
             "playback.file" to "bad", "ui.gridView" to "false",
         )))
-        assertEquals(0, prefs.playbackMaxHeightFlow.first())
+        assertEquals(PlayerGestureDefaults.PLAYBACK_AUTO_HEIGHT, prefs.playbackMaxHeightFlow.first())
         assertNull(prefs.downloadMaxHeightFlow.first())
         assertEquals(10, prefs.playerSeekStepSecondsFlow.first())
         assertEquals(2f, prefs.playerBoostSpeedFlow.first())
         assertEquals(ProxySetting(), prefs.proxySettingFlow.first())
         assertEquals(0L, prefs.getPlaybackPosition("file"))
         assertEquals("LIST", prefs.driveViewModeFlow.first())
+    }
+
+    @Test
+    fun legacyEinkThemeSeedMigratesToLocalEinkMode() = runBlocking {
+        val settings = FakeSettings(mapOf("ui.themeSeed" to "EINK"))
+        val prefs = preferences(settings)
+        assertEquals(true, prefs.einkModeFlow.first())
+        assertEquals(true, prefs.currentSnapshot.einkMode)
+        assertNull(prefs.themeSeedFlow.first())
+        assertNull(prefs.currentSnapshot.themeSeed)
+        assertEquals("true", settings.get("ui.einkMode"))
+        assertEquals("", settings.get("ui.themeSeed"))
+
+        prefs.setEinkMode(false)
+        prefs.setThemeSeed("RURI")
+        assertEquals(false, preferences(settings.reopen()).einkModeFlow.first())
+        assertEquals("RURI", preferences(settings.reopen()).themeSeedFlow.first())
     }
 
     @Test
@@ -180,8 +204,8 @@ class StoredPikoPreferencesTest {
         assertEquals("old-credential", prefs.loadUploadCredentials("task"))
 
         settings.failWrites = true
-        assertFailsWith<IllegalStateException> { prefs.setSpoilerBlurEnabled(false) }
-        assertTrue(prefs.spoilerBlurFlow.first())
+        assertFailsWith<IllegalStateException> { prefs.setSpoilerBlurEnabled(true) }
+        assertFalse(prefs.spoilerBlurFlow.first())
         assertFailsWith<IllegalStateException> { prefs.setSaveAsReference(true) }
         assertFalse(prefs.saveAsReferenceFlow.first())
         assertTrue(settings.snapshot().isEmpty())
@@ -189,6 +213,47 @@ class StoredPikoPreferencesTest {
         vault.failReads = true
         assertFailsWith<VaultUnavailableException> { prefs.loadUploadCredentials("task") }
         Unit
+    }
+
+    @Test
+    fun perAccountMetaTubeUrlAndSecretTokenStayIsolatedAndKeepTokensStrictlyInVault() = runBlocking {
+        val settings = FakeSettings()
+        val vault = FakeVault()
+        val opens = MutableStateFlow(0)
+        val prefs = StoredPikoPreferences(settings) { opens.value += 1; vault }
+        val accountA = "alice+1@piko.dev"
+        val accountB = "+8613800138000"
+
+        prefs.setMetaTubeUrlFor(accountA, "https://mt-a.example")
+        prefs.setMetaTubeUrlFor(accountB, "https://mt-b.example")
+        assertEquals("https://mt-a.example", prefs.metaTubeUrlFlowFor(accountA).first())
+        assertEquals("https://mt-b.example", prefs.metaTubeUrlFlowFor(accountB).first())
+        assertEquals(0, opens.value, "Reading/writing per-account URL must not open secret vault")
+
+        prefs.setMetaTubeTokenFor(accountA, "secret-token-a")
+        prefs.setMetaTubeTokenFor(accountB, "secret-token-b")
+        assertEquals(1, opens.value)
+        assertEquals("secret-token-a", prefs.metaTubeTokenFlowFor(accountA).first())
+        assertEquals("secret-token-b", prefs.metaTubeTokenFlowFor(accountB).first())
+        assertEquals("", prefs.metaTubeTokenFlow.first(), "Per-account tokens must not write into legacy global slot")
+
+        // Tokens and raw phone/email identifiers must never appear in plaintext settings.
+        val snap = settings.snapshot()
+        assertTrue(snap.values.none { "secret-token" in it })
+        assertTrue(snap.keys.none { accountA in it || accountB in it || "13800138000" in it })
+
+        val reopened = StoredPikoPreferences(settings.reopen()) { vault }
+        assertEquals("https://mt-a.example", reopened.metaTubeUrlFlowFor(accountA).first())
+        assertEquals("https://mt-b.example", reopened.metaTubeUrlFlowFor(accountB).first())
+        assertEquals("secret-token-a", reopened.metaTubeTokenFlowFor(accountA).first())
+        assertEquals("secret-token-b", reopened.metaTubeTokenFlowFor(accountB).first())
+
+        reopened.setMetaTubeTokenFor(accountA, "")
+        reopened.setMetaTubeUrlFor(accountA, "")
+        assertEquals("", reopened.metaTubeTokenFlowFor(accountA).first())
+        assertEquals("", reopened.metaTubeUrlFlowFor(accountA).first())
+        assertEquals("secret-token-b", reopened.metaTubeTokenFlowFor(accountB).first())
+        assertEquals("https://mt-b.example", reopened.metaTubeUrlFlowFor(accountB).first())
     }
 
     private fun preferences(settings: FakeSettings) = StoredPikoPreferences(settings) { FakeVault() }

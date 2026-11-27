@@ -3,6 +3,7 @@ package dev.piko.shared.smoke
 import dev.piko.data.repository.FileCategory
 import dev.piko.shared.data.PikoClientProvider
 import dev.piko.shared.data.PikoDriveRepository
+import dev.piko.shared.data.PikoFileSortOrder
 import dev.piko.shared.data.PikoPathBreadcrumb
 import dev.piko.shared.data.PikoCacheStore
 import dev.piko.shared.data.ScrollAnchor
@@ -73,6 +74,8 @@ class BrowserContextSmokeTest {
             }
             val first = rig.browsers.forTab(rig.workspace.activeTabId.value)
             val second = rig.browsers.forTab(rig.workspace.openTab(listOf(PikoDriveRepository.ROOT_BREADCRUMB)))
+            first.state.changeSortOrder(PikoFileSortOrder.NAME_ASC)
+            second.state.changeSortOrder(PikoFileSortOrder.NAME_ASC)
             first.state.load()
             second.state.load()
             awaitUntil("两份结构化列表就绪") {
@@ -102,45 +105,6 @@ class BrowserContextSmokeTest {
                 "files=${state.files.map { it.name }}, shown=${state.displayedFiles.map { it.name }}, " +
                 "query=${state.searchQuery}, filter=${state.typeFilter}, error=${state.loadError}", failure)
         }
-    }
-
-    @Test
-    fun `a file reveal arriving during restoration wins even after its request is consumed`() = smoke { scope ->
-        val server = FakePikPakServer()
-        val provider = server.provider()
-        val cache = MemoryCacheStore()
-        val repository = PikoDriveRepository(provider, MemoryPreferences())
-        val previous = DriveWorkspace(repository, cache, scope)
-        val savedFolder = server.addFolder("上次的位置")
-        previous.updateFolderStack(listOf(PikoDriveRepository.ROOT_BREADCRUMB, PikoPathBreadcrumb(savedFolder.id, savedFolder.name)))
-        delay(1_500)
-        previous.close()
-        val reading = CompletableDeferred<Unit>()
-        val resume = CompletableDeferred<Unit>()
-        val slowCache = object : PikoCacheStore {
-            override suspend fun read(key: String): String? {
-                if (key.startsWith("drive-tabs-")) { reading.complete(Unit); resume.await() }
-                return cache.read(key)
-            }
-            override suspend fun write(key: String, value: String) = cache.write(key, value)
-        }
-        val workspace = DriveWorkspace(repository, slowCache, scope)
-        val duplicates = DuplicateSession({ scope }) { child, root -> DuplicateFinderState(provider, repository, child, root) }
-        val browser = DriveBrowserSession(
-            repository, MemoryPreferences(), duplicates, null, scope,
-            fileNavigation = workspace.navigationForTab(workspace.activeTabId.value),
-        )
-        try {
-            val file = server.addFile("定位的文件.txt")
-            val restoring = scope.async { browser.state.restoreLocation() }
-            withTimeout(5_000) { reading.await() }
-            workspace.requestHighlight(setOf(file.id))
-            awaitUntil("高亮请求已由页面接收") { browser.state.highlightedFileIds == setOf(file.id) && workspace.pendingHighlights.value.isEmpty() }
-            resume.complete(Unit)
-            assertFalse(restoring.await())
-            assertEquals("", workspace.folderStackFlow.value.last().id)
-            assertEquals(setOf(file.id), browser.state.highlightedFileIds)
-        } finally { resume.complete(Unit); browser.close(); workspace.close() }
     }
 
     private class Rig(

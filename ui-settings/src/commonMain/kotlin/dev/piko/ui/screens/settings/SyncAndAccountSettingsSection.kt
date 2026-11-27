@@ -1,0 +1,758 @@
+package dev.piko.ui.screens.settings
+
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.AutoAwesome
+import androidx.compose.material.icons.outlined.Restore
+import androidx.compose.material.icons.outlined.Apps
+import androidx.compose.material.icons.outlined.CloudSync
+import androidx.compose.material.icons.outlined.Fingerprint
+import androidx.compose.material.icons.outlined.History
+import androidx.compose.material.icons.outlined.Key
+import androidx.compose.material.icons.outlined.Lan
+import androidx.compose.material.icons.outlined.Lock
+import androidx.compose.material.icons.outlined.Sync
+import androidx.compose.material.icons.outlined.VisibilityOff
+import dev.piko.ui.platform.LocalPikoPlatform
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.graphics.Color
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import dev.piko.shared.i18n.tr
+import dev.piko.shared.sync.EncryptedSyncStatus
+import dev.piko.shared.sync.PikoSettingsSync
+import dev.piko.shared.sync.MetadataBackupSync
+import dev.piko.ui.LocalPikoServices
+import dev.piko.ui.PassphraseUpdateResult
+import dev.piko.ui.components.TooltipIconButton
+import dev.piko.ui.screens.archive.SavedArchivePasswordsDialog
+import kotlin.time.Instant
+import kotlinx.coroutines.launch
+import kotlinx.datetime.TimeZone
+import kotlinx.datetime.toLocalDateTime
+
+internal fun hasAccountSectionMatches(searchQuery: String): Boolean {
+    if (searchQuery.isBlank()) return true
+    return matchesSettingsQuery(
+        searchQuery,
+        SettingsSection.Account.title,
+        "account", "账号", "退出", "切换", "会员", "sign out", "storage",
+    )
+}
+
+@Composable
+internal fun hasDataSectionMatches(searchQuery: String): Boolean {
+    if (searchQuery.isBlank()) return true
+    val services = LocalPikoServices.current
+    val platform = LocalPikoPlatform.current
+    val isFreeAccount by services.driveRepository.isFreeAccountFlow.collectAsStateWithLifecycle()
+    fun match(vararg terms: String): Boolean = matchesSettingsQuery(searchQuery, *terms)
+
+    val matchSyncSettings = match("同步设置", "Sync settings", "sync", "設定を同期", "설정 동기화", "同步設定")
+    val matchSyncHistory = match("同步播放记录", "Sync playback history", "history", "再生履歴", "재생 기록", "播放記錄")
+    val matchArchivePw = match("解压密码", "Archive password", "zip", "rar", "解凍パスワード", "압축 해제 비밀번호", "解壓縮密碼")
+    val matchEncSync = services.supportsEncryptedSync &&
+        match("加密同步口令", "Encrypted sync passphrase", "passphrase", "encrypt", "暗号化同期", "암호화 동기화")
+    val matchWebDav = isFreeAccount == false && match("WebDAV", "dav", "挂载", "播放器")
+    val matchPrivacy = platform.appSecurity != null && match(
+        "应用锁", "App lock", "伪装", "图标", "隐藏", "最近任务", "隐私", "安全",
+        "disguise", "icon", "privacy", "security", "biometric", "アプリロック", "앱 잠금", "應用程式鎖",
+    )
+    return matchSyncSettings || matchSyncHistory || matchArchivePw || matchEncSync || matchWebDav || matchPrivacy
+}
+
+internal fun hasAboutSectionMatches(searchQuery: String): Boolean {
+    if (searchQuery.isBlank()) return true
+    return matchesSettingsQuery(
+        searchQuery,
+        SettingsSection.About.title,
+        "about", "update", "version", "更新", "版本", "日志", "telegram", "关于",
+    )
+}
+
+@Composable
+internal fun AccountSettingsSection(
+    searchQuery: String,
+    firstSection: SettingsSection?,
+    onSectionPositioned: (SettingsSection, Int) -> Unit,
+    account: (@Composable ColumnScope.() -> Unit)?,
+) {
+    if (account != null && hasAccountSectionMatches(searchQuery)) {
+        SettingsSectionBlock(
+            section = SettingsSection.Account,
+            first = firstSection == SettingsSection.Account,
+            onPositioned = { onSectionPositioned(SettingsSection.Account, it) },
+            content = account,
+        )
+    }
+}
+
+/**
+ * 同步与数据：均挂在账号上并随账号切换，不放进「网络」（那里是当前设备自身的连接设置）。
+ */
+@Composable
+internal fun SyncAndDataSettingsSection(
+    searchQuery: String,
+    firstSection: SettingsSection?,
+    onSectionPositioned: (SettingsSection, Int) -> Unit,
+    onOpenWebDav: () -> Unit,
+    snackbarHostState: SnackbarHostState,
+) {
+    val services = LocalPikoServices.current
+    val platform = LocalPikoPlatform.current
+    val appSecurity = platform.appSecurity
+    val sessionManager = services.preferences
+    val scope = rememberCoroutineScope()
+    var showDisguiseDialog by remember { mutableStateOf(false) }
+    // 海报墙元数据：整份备份到网盘 .piko，以及启动时自动补刮
+    val metadataBackup = services.metadataBackup
+    var metadataJob by remember { mutableStateOf<MetadataBackupJob?>(null) }
+    val autoEnrich by sessionManager.autoEnrichOnLaunchFlow.collectAsStateWithLifecycle(initialValue = true)
+
+    val isSyncPlayHistoryEnabled by sessionManager.syncPlayHistoryFlow.collectAsStateWithLifecycle(initialValue = true)
+    val isSettingsSyncEnabled by sessionManager.settingsSyncFlow.collectAsStateWithLifecycle(initialValue = true)
+    val settingsSync = services.settingsSync
+    val syncStatus by settingsSync.status.collectAsStateWithLifecycle()
+    val lastSynced by settingsSync.lastSynced.collectAsStateWithLifecycle()
+    val isFreeAccount by services.driveRepository.isFreeAccountFlow.collectAsStateWithLifecycle()
+
+    val archivePasswordVault = services.archivePasswords
+    val archivePasswords by archivePasswordVault.passwords.collectAsStateWithLifecycle(initialValue = emptyList())
+    var showArchivePasswords by remember { mutableStateOf(false) }
+
+    val encryptedSyncStatus by services.encryptedSyncStatus.collectAsStateWithLifecycle()
+    val activeClient by services.clientManager.currentClient.collectAsStateWithLifecycle()
+    var hasSyncPassphrase by remember(activeClient?.account) { mutableStateOf(false) }
+    var showEncryptedSyncDialog by remember { mutableStateOf(false) }
+    var encryptedSyncBusy by remember { mutableStateOf(false) }
+    var encryptedSyncMismatchError by remember(activeClient?.account) { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(activeClient?.account, showEncryptedSyncDialog) {
+        hasSyncPassphrase = services.hasSyncPassphraseForCurrentAccount()
+    }
+
+    if (showArchivePasswords) {
+        SavedArchivePasswordsDialog(
+            passwords = archivePasswords,
+            onDelete = { scope.launch { archivePasswordVault.forget(it) } },
+            onDismiss = { showArchivePasswords = false },
+        )
+    }
+
+    if (showEncryptedSyncDialog) {
+        EncryptedSyncSettingsDialog(
+            status = encryptedSyncStatus,
+            hasPassphrase = hasSyncPassphrase,
+            busy = encryptedSyncBusy,
+            mismatchError = encryptedSyncMismatchError,
+            onClearMismatchError = { encryptedSyncMismatchError = null },
+            onSavePassphrase = { passphrase ->
+                encryptedSyncBusy = true
+                encryptedSyncMismatchError = null
+                scope.launch {
+                    try {
+                        val outcome = services.updateSyncPassphrase(passphrase)
+                        hasSyncPassphrase = services.hasSyncPassphraseForCurrentAccount()
+                        when (outcome) {
+                            PassphraseUpdateResult.SavedAndSynced -> {
+                                showEncryptedSyncDialog = false
+                                snackbarHostState.showSnackbar(
+                                    tr(
+                                        "已保存同步口令并完成加密同步",
+                                        "Sync passphrase saved and synced",
+                                        "同期パスフレーズを保存して同期しました",
+                                        "동기화 암호문구를 저장하고 동기화했습니다",
+                                        "已儲存同步口令並完成加密同步",
+                                    ),
+                                    withDismissAction = true,
+                                )
+                            }
+                            PassphraseUpdateResult.SavedOffline -> {
+                                showEncryptedSyncDialog = false
+                                snackbarHostState.showSnackbar(
+                                    tr(
+                                        "已保存同步口令，待网络恢复后自动同步",
+                                        "Sync passphrase saved; will sync when online",
+                                        "同期パスフレーズを保存しました（オンライン時に同期）",
+                                        "동기화 암호문구 저장됨 (온라인 상태 시 동기화)",
+                                        "已儲存同步口令，待網路恢復後自動同步",
+                                    ),
+                                    withDismissAction = true,
+                                )
+                            }
+                            PassphraseUpdateResult.KeyMismatch -> {
+                                encryptedSyncMismatchError = tr(
+                                    "口令无法解开云端密文，请核对原口令或在上方备份重置",
+                                    "Passphrase does not match cloud ciphertext; check it or reset above",
+                                    "パスフレーズがクラウドの暗号化データと一致しません",
+                                    "암호문구가 클라우드 암호문과 일치하지 않습니다",
+                                    "口令無法解開雲端密文，請核對原口令或在上方備份重設",
+                                )
+                            }
+                            PassphraseUpdateResult.Failed -> {
+                                showEncryptedSyncDialog = false
+                                snackbarHostState.showSnackbar(
+                                    tr(
+                                        "同步口令保存失败",
+                                        "Failed to save sync passphrase",
+                                        "同期パスフレーズの保存に失敗しました",
+                                        "동기화 암호문구 저장 실패",
+                                        "同步口令儲存失敗",
+                                    ),
+                                    withDismissAction = true,
+                                )
+                            }
+                        }
+                    } finally {
+                        encryptedSyncBusy = false
+                    }
+                }
+            },
+            onClearPassphrase = {
+                encryptedSyncBusy = true
+                encryptedSyncMismatchError = null
+                scope.launch {
+                    try {
+                        services.updateSyncPassphrase("")
+                        hasSyncPassphrase = services.hasSyncPassphraseForCurrentAccount()
+                        showEncryptedSyncDialog = false
+                    } finally {
+                        encryptedSyncBusy = false
+                    }
+                }
+            },
+            onResetCloud = {
+                encryptedSyncBusy = true
+                encryptedSyncMismatchError = null
+                scope.launch {
+                    try {
+                        val ok = services.resetEncryptedSyncRemote()
+                        showEncryptedSyncDialog = false
+                        val msg = if (ok) {
+                            tr(
+                                "已备份旧云端密文并用本机数据重置",
+                                "Backed up old ciphertext and reset cloud copy",
+                                "旧暗号化データをバックアップしてリセットしました",
+                                "기존 암호문을 백업하고 클라우드 데이터를 초기화했습니다",
+                                "已備份舊雲端密文並以本機資料重設",
+                            )
+                        } else {
+                            tr(
+                                "云端重置未完成，请检查网络或先设置口令",
+                                "Cloud reset failed. Check connection or set a passphrase first.",
+                                "リセットできませんでした。通信環境またはパスフレーズを確認してください",
+                                "초기화하지 못했습니다. 네트워크 또는 암호문구를 확인해 주세요",
+                                "雲端重設未完成，請檢查網路或先設定口令",
+                            )
+                        }
+                        snackbarHostState.showSnackbar(msg, withDismissAction = true)
+                    } finally {
+                        encryptedSyncBusy = false
+                    }
+                }
+            },
+            onDismiss = {
+                if (!encryptedSyncBusy) {
+                    encryptedSyncMismatchError = null
+                    showEncryptedSyncDialog = false
+                }
+            },
+        )
+    }
+
+    fun match(vararg terms: String): Boolean = matchesSettingsQuery(searchQuery, *terms)
+
+    val matchSyncSettings = match("同步设置", "Sync settings", "sync", "設定を同期", "설정 동기화", "同步設定")
+    val matchSyncHistory = match("同步播放记录", "Sync playback history", "history", "再生履歴", "재생 기록", "播放記錄")
+    val matchSyncGroup = matchSyncSettings || matchSyncHistory
+
+    val matchAutoEnrich = match("启动时自动补刮", "Enrich metadata on launch", "刮削", "元数据", "metadata", "scrape", "補完", "보완")
+    val matchBackup = metadataBackup != null &&
+        match("元数据备份", "Metadata backup", "备份", "恢复", "backup", "restore", "バックアップ", "백업")
+    val matchMetadataGroup = matchAutoEnrich || matchBackup
+
+    val matchArchivePw = match("解压密码", "Archive password", "zip", "rar", "解凍パスワード", "압축 해제 비밀번호", "解壓縮密碼")
+    val matchEncSync = services.supportsEncryptedSync &&
+        match("加密同步口令", "Encrypted sync passphrase", "passphrase", "encrypt", "暗号化同期", "암호화 동기화")
+    val matchWebDav = isFreeAccount == false && match("WebDAV", "dav", "挂载", "播放器")
+    val matchCredGroup = matchArchivePw || matchEncSync || matchWebDav
+
+    val matchAppLock = appSecurity != null && match("应用锁", "App lock", "biometric", "lock", "隐私", "安全", "アプリロック", "앱 잠금", "應用程式鎖")
+    val matchHideRecents = appSecurity != null && match("隐藏最近任务", "Hide in recents", "privacy", "screenshot", "最近任务", "防截屏", "プライバシー", "최근 앱 숨기기")
+    val matchDisguise = appSecurity != null && match("应用图标与名称", "伪装", "隐藏", "App icon", "disguise", "Todo", "Notes", "アイコン", "아이콘")
+    val matchPrivacyGroup = matchAppLock || matchHideRecents || matchDisguise
+
+    if (matchSyncGroup || matchMetadataGroup || matchCredGroup || matchPrivacyGroup) {
+        SettingsSectionBlock(
+            section = SettingsSection.Data,
+            first = firstSection == SettingsSection.Data,
+            onPositioned = { onSectionPositioned(SettingsSection.Data, it) },
+        ) {
+            if (matchSyncGroup) {
+                SettingsGroup(tr("同步", "Sync", "同期", "동기화", "同步")) {
+                    if (matchSyncSettings) {
+                        SettingsSyncRow(
+                            enabled = isSettingsSyncEnabled,
+                            status = syncStatusText(syncStatus, lastSynced),
+                            onEnabledChange = { scope.launch { sessionManager.setSettingsSyncEnabled(it) } },
+                            onSyncNow = { scope.launch { services.syncAllNow() } },
+                        )
+                    }
+                    if (matchSyncHistory) {
+                        SettingsSwitchRow(
+                            icon = Icons.Outlined.History,
+                            title = tr("同步播放记录", "Sync playback history", "再生履歴を同期", "재생 기록 동기화", "同步播放記錄"),
+                            supporting = tr(
+                                "与 PikPak 官方客户端共用播放历史与续播进度",
+                                "Share playback history and resume positions with official PikPak apps",
+                                "PikPak公式アプリと再生履歴、再開位置を共有",
+                                "PikPak 공식 앱과 재생 기록 및 이어보기 위치 공유",
+                                "與 PikPak 官方用戶端共用播放歷史與續播進度",
+                            ),
+                            checked = isSyncPlayHistoryEnabled,
+                            onCheckedChange = { scope.launch { sessionManager.setSyncPlayHistoryEnabled(it) } },
+                        )
+                    }
+                }
+            }
+
+            if (matchMetadataGroup) {
+                SettingsGroup(tr("元数据备份", "Metadata backup", "メタデータのバックアップ", "메타데이터 백업", "中繼資料備份")) {
+                    if (matchAutoEnrich) {
+                        SettingsSwitchRow(
+                            icon = Icons.Outlined.AutoAwesome,
+                            title = tr("启动时自动补刮元数据", "Enrich metadata on launch", "起動時にメタデータを自動補完", "실행 시 메타데이터 자동 보완", "啟動時自動補刮中繼資料"),
+                            supporting = tr(
+                                "开 App 后自动把还没标题/封面的作品补刮一遍，不用进海报墙等它自己发现",
+                                "Fill in missing titles and covers right after launch instead of waiting for the poster wall",
+                                "起動後にタイトルやカバーの欠けた作品を自動で補完します",
+                                "앱을 열면 제목이나 표지가 없는 작품을 자동으로 보완합니다",
+                                "開 App 後自動把還沒標題／封面的作品補刮一遍",
+                            ),
+                            checked = autoEnrich,
+                            onCheckedChange = { scope.launch { sessionManager.setAutoEnrichOnLaunch(it) } },
+                        )
+                    }
+                    if (matchBackup && metadataBackup != null) {
+                        SettingsRow(
+                            icon = Icons.Outlined.CloudSync,
+                            title = tr("备份元数据", "Back up metadata", "メタデータをバックアップ", "메타데이터 백업", "備份中繼資料"),
+                            supporting = when (metadataJob) {
+                                MetadataBackupJob.BACKUP -> tr(
+                                    "正在整理并上传，作品多时要等一会儿…",
+                                    "Collecting and uploading; this takes a while with a large library…",
+                                    "整理してアップロード中。作品が多いと少し時間がかかります…",
+                                    "정리 후 업로드 중입니다. 작품이 많으면 시간이 걸립니다…",
+                                    "整理並上傳中，作品較多時需要一點時間…",
+                                )
+                                else -> tr(
+                                    "把刮削到的标题、简介、封面与截图地址传到网盘 .piko，每次新建一份，旧备份不删",
+                                    "Upload scraped titles, summaries, cover and screenshot URLs to .piko; each run adds a file and keeps older ones",
+                                    "刮削したタイトル・あらすじ・カバー・スクリーンショットのURLを .piko に保存します。毎回新しいファイルを作り、古いバックアップは残します",
+                                    "스크래핑한 제목·줄거리·표지·스크린샷 주소를 .piko에 업로드합니다. 실행할 때마다 새 파일을 만들고 이전 백업은 남깁니다",
+                                    "把刮削到的標題、簡介、封面與截圖位址傳到網盤 .piko，每次新增一份，舊備份不刪",
+                                )
+                            },
+                            enabled = metadataJob == null,
+                            onClick = {
+                                if (metadataJob == null) {
+                                    metadataJob = MetadataBackupJob.BACKUP
+                                    scope.launch {
+                                        when (val outcome = metadataBackup.backupNow()) {
+                                            is MetadataBackupSync.BackupOutcome.Success -> snackbarHostState.showSnackbar(
+                                                tr(
+                                                    "已备份 ${outcome.works} 部作品（${outcome.bytes / 1024 / 1024} MB）",
+                                                    "Backed up ${outcome.works} works (${outcome.bytes / 1024 / 1024} MB)",
+                                                    "${outcome.works} 作品をバックアップしました（${outcome.bytes / 1024 / 1024} MB）",
+                                                    "${outcome.works}개 작품을 백업했습니다 (${outcome.bytes / 1024 / 1024} MB)",
+                                                    "已備份 ${outcome.works} 部作品（${outcome.bytes / 1024 / 1024} MB）",
+                                                ),
+                                                withDismissAction = true,
+                                            )
+                                            is MetadataBackupSync.BackupOutcome.Failure -> snackbarHostState.showSnackbar(
+                                                tr("备份失败：", "Backup failed: ", "バックアップに失敗しました：", "백업 실패: ", "備份失敗：") +
+                                                    metadataFailureText(outcome.reason),
+                                                withDismissAction = true,
+                                            )
+                                        }
+                                        metadataJob = null
+                                    }
+                                }
+                            },
+                        )
+                        SettingsRow(
+                            icon = Icons.Outlined.Restore,
+                            title = tr("恢复元数据", "Restore metadata", "メタデータを復元", "메타데이터 복원", "還原中繼資料"),
+                            supporting = when (metadataJob) {
+                                MetadataBackupJob.RESTORE -> tr(
+                                    "正在读取并写回…",
+                                    "Reading and applying…",
+                                    "読み込んで反映中…",
+                                    "읽어서 적용 중…",
+                                    "讀取並寫回中…",
+                                )
+                                else -> tr(
+                                    "用网盘上最新的一份备份补全本机；本机已有且更新过的作品会跳过。文件需重扫目录后才可播放",
+                                    "Apply the newest backup from the drive; works already newer here are skipped. Re-scan the folder to play files again",
+                                    "ドライブ上の最新バックアップを適用します。端末側が新しい作品はスキップします。再生にはフォルダの再スキャンが必要です",
+                                    "드라이브의 최신 백업을 적용합니다. 기기에 더 최신인 작품은 건너뜁니다. 재생하려면 폴더를 다시 스캔하세요",
+                                    "用網盤上最新的一份備份補全本機；本機已有且較新的作品會略過。檔案需重新掃描目錄後才可播放",
+                                )
+                            },
+                            enabled = metadataJob == null,
+                            onClick = {
+                                if (metadataJob == null) {
+                                    metadataJob = MetadataBackupJob.RESTORE
+                                    scope.launch {
+                                        when (val outcome = metadataBackup.restoreLatest()) {
+                                            is MetadataBackupSync.RestoreOutcome.Success -> snackbarHostState.showSnackbar(
+                                                tr(
+                                                    "已恢复 ${outcome.restored} 部，跳过 ${outcome.skipped} 部",
+                                                    "Restored ${outcome.restored}, skipped ${outcome.skipped}",
+                                                    "${outcome.restored} 作品を復元、${outcome.skipped} 作品をスキップ",
+                                                    "${outcome.restored}개 복원, ${outcome.skipped}개 건너뜀",
+                                                    "已還原 ${outcome.restored} 部，略過 ${outcome.skipped} 部",
+                                                ),
+                                                withDismissAction = true,
+                                            )
+                                            MetadataBackupSync.RestoreOutcome.NoBackup -> snackbarHostState.showSnackbar(
+                                                tr(
+                                                    "网盘里还没有元数据备份",
+                                                    "No metadata backup found in the drive",
+                                                    "ドライブにメタデータのバックアップがありません",
+                                                    "드라이브에 메타데이터 백업이 없습니다",
+                                                    "網盤裡還沒有中繼資料備份",
+                                                ),
+                                                withDismissAction = true,
+                                            )
+                                            is MetadataBackupSync.RestoreOutcome.Failure -> snackbarHostState.showSnackbar(
+                                                tr("恢复失败：", "Restore failed: ", "復元に失敗しました：", "복원 실패: ", "還原失敗：") +
+                                                    metadataFailureText(outcome.reason),
+                                                withDismissAction = true,
+                                            )
+                                        }
+                                        metadataJob = null
+                                    }
+                                }
+                            },
+                        )
+                    }
+                }
+            }
+            if (matchCredGroup) {
+                SettingsGroup(tr("密码与凭据", "Passwords and credentials", "パスワードと認証情報", "비밀번호 및 인증 정보", "密碼與憑證")) {
+                    if (matchArchivePw) {
+                        SettingsNavigationRow(
+                            icon = Icons.Outlined.Key,
+                            title = tr("解压密码", "Archive password", "解凍パスワード", "압축 해제 비밀번호", "解壓縮密碼"),
+                            supporting = if (archivePasswords.isEmpty()) {
+                                tr("未保存密码", "No saved passwords", "保存済みパスワードはありません", "저장된 비밀번호가 없습니다", "無已儲存密碼")
+                            } else {
+                                tr("已保存 ${archivePasswords.size} 个", "${archivePasswords.size} saved", "${archivePasswords.size} 件保存済み", "${archivePasswords.size}개 저장됨", "已儲存 ${archivePasswords.size} 個")
+                            },
+                            onClick = { showArchivePasswords = true },
+                            trailingIcon = null,
+                        )
+                    }
+                    if (matchEncSync && services.supportsEncryptedSync) {
+                        val syncPassphraseSummary = when (encryptedSyncStatus) {
+                            EncryptedSyncStatus.LockedKeyMismatch -> tr(
+                                "云端密文与当前密钥不匹配，已暂停覆盖，点击输入口令或重置",
+                                "Cloud data encrypted with another key; paused to protect data. Tap to unlock or reset.",
+                                "クラウドの暗号化データとキーが一致しません。タップして解除またはリセット",
+                                "클라우드 암호문과 키가 일치하지 않아 보호 중. 탭하여 잠금 해제 또는 초기화",
+                                "雲端密文與目前金鑰不符，已暫停覆寫，點選輸入口令或重設",
+                            )
+                            EncryptedSyncStatus.LockedNoKey -> tr(
+                                "未设置（Google 登录账号设置后可跨设备加密同步密码与配置）",
+                                "Not set (set a passphrase to encrypt and sync passwords & MetaTube on Google accounts)",
+                                "未設定（設定すると解凍パスワードやMetaTubeを端末間で暗号化同期できます）",
+                                "미설정 (설정 시 압축 해제 비밀번호 및 MetaTube를 기기 간 암호화 동기화)",
+                                "未設定（Google 登入帳號設定後可跨裝置加密同步密碼與設定）",
+                            )
+                            EncryptedSyncStatus.CorruptOrUnsupported -> tr(
+                                "云端同步文件需要更新版本或已损坏，已跳过同步以保护数据",
+                                "Cloud sync file requires a newer version or is damaged; skipped to preserve data",
+                                "クラウドの同期ファイルが新しいバージョン用か破損しているためスキップしました",
+                                "클라우드 동기화 파일이 최신 버전용이거나 손상되어 건너뛰었습니다",
+                                "雲端同步檔案需要較新版本或已損壞，已略過同步以保護資料",
+                            )
+                            EncryptedSyncStatus.Idle, EncryptedSyncStatus.Unlocked -> if (hasSyncPassphrase) {
+                                tr(
+                                    "已启用独立同步口令",
+                                    "Custom sync passphrase enabled",
+                                    "独自の同期パスフレーズを使用中",
+                                    "별도 동기화 암호문구 사용 중",
+                                    "已啟用獨立同步口令",
+                                )
+                            } else {
+                                tr(
+                                    "默认使用登录密码加密，点击可设置独立同步口令",
+                                    "Encrypted with account password by default; tap to set a custom passphrase",
+                                    "既定ではログインパスワードを使用。タップして独自パスフレーズを設定",
+                                    "기본적으로 로그인 비밀번호 사용. 탭하여 별도 암호문구 설정",
+                                    "預設使用登入密碼加密，點選可設定獨立同步口令",
+                                )
+                            }
+                        }
+                        SettingsRow(
+                            icon = Icons.Outlined.Lock,
+                            title = tr("加密同步口令", "Encrypted sync passphrase", "暗号化同期パスフレーズ", "암호화 동기화 암호문구", "加密同步口令"),
+                            supporting = syncPassphraseSummary,
+                            supportingColor = if (encryptedSyncStatus == EncryptedSyncStatus.LockedKeyMismatch) {
+                                MaterialTheme.colorScheme.error
+                            } else {
+                                Color.Unspecified
+                            },
+                            onClick = {
+                                encryptedSyncMismatchError = null
+                                showEncryptedSyncDialog = true
+                            },
+                        )
+                    }
+                    // WebDAV 仅限会员，免费账号与等级未取到时不出现
+                    if (matchWebDav && isFreeAccount == false) {
+                        SettingsNavigationRow(
+                            icon = Icons.Outlined.Lan,
+                            title = "WebDAV",
+                            supporting = tr(
+                                "供播放器、文件管理器等应用读取网盘",
+                                "Access the drive from media players and file managers",
+                                "プレーヤーやファイルマネージャーからドライブにアクセス",
+                                "플레이어 및 파일 관리자에서 드라이브 접근",
+                                "供播放器、檔案管理員等應用程式讀取雲端硬碟",
+                            ),
+                            onClick = onOpenWebDav,
+                        )
+                    }
+                }
+            }
+            if (appSecurity != null && matchPrivacyGroup) {
+                val appLockEnabled by appSecurity.appLockEnabled.collectAsStateWithLifecycle()
+                val hideInRecents by appSecurity.hideInRecents.collectAsStateWithLifecycle()
+                val activeDisguiseId by appSecurity.activeDisguiseId.collectAsStateWithLifecycle()
+                val disguiseOptions = remember(appSecurity) { appSecurity.disguiseOptions }
+                val activeDisguiseLabel = disguiseOptions.firstOrNull { it.id == activeDisguiseId }?.title
+                    ?: disguiseOptions.firstOrNull()?.title.orEmpty()
+
+                SettingsGroup(tr("隐私与安全", "Privacy & security", "プライバシーとセキュリティ", "개인정보 및 보안", "隱私與安全")) {
+                        if (matchAppLock) {
+                            SettingsSwitchRow(
+                                icon = Icons.Outlined.Fingerprint,
+                                title = tr("应用锁", "App lock", "アプリロック", "앱 잠금", "應用程式鎖"),
+                                supporting = tr(
+                                    "启动或从后台返回时通过指纹、面容或系统锁屏验证身份",
+                                    "Require biometric or device screen lock when opening or returning to the app",
+                                    "起動時やバックグラウンド復帰時に生体認証または端末ロックを要求します",
+                                    "앱을 열거나 백그라운드에서 돌아올 때 생체 인증 또는 기기 잠금을 요구합니다",
+                                    "啟動或從背景返回時透過指紋、臉部或系統螢幕鎖定驗證身分",
+                                ),
+                                checked = appLockEnabled,
+                                onCheckedChange = { enabled ->
+                                    val ok = appSecurity.setAppLockEnabled(enabled)
+                                    if (enabled && !ok) {
+                                        scope.launch {
+                                            snackbarHostState.showSnackbar(
+                                                tr(
+                                                    "请先在系统设置中开启锁屏密码或生物识别",
+                                                    "Set up a device screen lock or biometrics in system settings first",
+                                                    "先に端末設定で画面ロックまたは生体認証を設定してください",
+                                                    "먼저 시스템 설정에서 화면 잠금 또는 생체 인증을 설정하세요",
+                                                    "請先在系統設定中開啟螢幕鎖定密碼或生物辨識",
+                                                ),
+                                            )
+                                        }
+                                    }
+                                },
+                            )
+                        }
+                        if (matchHideRecents) {
+                            SettingsSwitchRow(
+                                icon = Icons.Outlined.VisibilityOff,
+                                title = tr("隐藏最近任务内容", "Hide content in recents", "最近使ったアプリで内容を隠す", "최근 앱에서 내용 숨기기", "隱藏最近使用內容"),
+                                supporting = tr(
+                                    "在系统多任务视图中隐藏界面预览并阻止截屏",
+                                    "Hide preview in system recents and block screenshots",
+                                    "マルチタスク画面でのプレビュー表示とスクリーンショットを防止します",
+                                    "최근 앱 화면에서 미리 보기를 숨기고 스크린샷을 차단합니다",
+                                    "在系統多工檢視中隱藏介面預覽並阻止擷取螢幕",
+                                ),
+                                checked = hideInRecents,
+                                onCheckedChange = { appSecurity.setHideInRecents(it) },
+                            )
+                        }
+                        if (matchDisguise) {
+                            SettingsNavigationRow(
+                                icon = Icons.Outlined.Apps,
+                                title = tr("应用图标与名称", "App icon & name", "アプリアイコンと名前", "앱 아이콘 및 이름", "應用程式圖示與名稱"),
+                                supporting = activeDisguiseLabel,
+                                onClick = { showDisguiseDialog = true },
+                                trailingIcon = null,
+                            )
+                        }
+                    }
+
+                    if (showDisguiseDialog) {
+                        SettingsChoiceDialog(
+                            icon = Icons.Outlined.Apps,
+                            title = tr("应用图标与名称", "App icon & name", "アプリアイコンと名前", "앱 아이콘 및 이름", "應用程式圖示與名稱"),
+                            description = tr(
+                                "更换桌面图标配色或伪装为日常工具图标，切换后桌面会在数秒内刷新。",
+                                "Change the launcher icon color or disguise it as an everyday utility. The home screen updates within a few seconds.",
+                                "アプリアイコンの配色変更や別アプリへの偽装ができます。変更は数秒以内にホーム画面へ反映されます。",
+                                "런처 아이콘 색상을 바꾸거나 일반 도구 앱으로 위장합니다. 변경 사항은 몇 초 내에 홈 화면에 반영됩니다.",
+                                "更換桌面圖示配色或偽裝為日常工具圖示，切換後桌面會在數秒內重新整理。",
+                            ),
+                            onDismiss = { showDisguiseDialog = false },
+                        ) {
+                            disguiseOptions.forEach { option ->
+                                SettingsChoiceOption(
+                                    title = option.title,
+                                    supporting = option.description,
+                                    selected = activeDisguiseId == option.id,
+                                    onClick = {
+                                        showDisguiseDialog = false
+                                        val switched = appSecurity.selectDisguise(option.id)
+                                        scope.launch {
+                                            snackbarHostState.showSnackbar(
+                                                if (switched) {
+                                                    tr(
+                                                        "已切换应用图标，桌面将在数秒内更新",
+                                                        "App icon updated; launcher will refresh shortly",
+                                                        "アイコンを変更しました。数秒以内に反映されます",
+                                                        "앱 아이콘이 변경되었습니다. 잠시 후 런처에 반영됩니다",
+                                                        "已切換應用程式圖示，桌面將於數秒內更新",
+                                                    )
+                                                } else {
+                                                    tr(
+                                                        "切换应用图标失败",
+                                                        "Failed to change app icon",
+                                                        "アイコンの変更に失敗しました",
+                                                        "앱 아이콘 변경에 실패했습니다",
+                                                        "切換應用程式圖示失敗",
+                                                    )
+                                                },
+                                            )
+                                        }
+                                    },
+                                )
+                            }
+                        }
+                    }
+            }
+        }
+    }
+}
+
+@Composable
+internal fun AboutSettingsSection(
+    searchQuery: String,
+    firstSection: SettingsSection?,
+    onSectionPositioned: (SettingsSection, Int) -> Unit,
+    showAbout: Boolean,
+    snackbarHostState: SnackbarHostState,
+) {
+    if (showAbout && hasAboutSectionMatches(searchQuery)) {
+        SettingsSectionBlock(
+            section = SettingsSection.About,
+            first = firstSection == SettingsSection.About,
+            onPositioned = { onSectionPositioned(SettingsSection.About, it) },
+        ) {
+            AboutSection(snackbarHostState)
+        }
+    }
+}
+
+private fun syncStatusText(status: PikoSettingsSync.Status, lastSynced: Long?): String = when (status) {
+    PikoSettingsSync.Status.SYNCING -> tr("同步中…", "Syncing…", "同期中…", "동기화 중…", "同步中…")
+    PikoSettingsSync.Status.FAILED -> tr(
+        "同步失败，将在更改设置或下次启动时重试",
+        "Sync failed; will retry when settings change or on next launch",
+        "同期に失敗しました。設定変更時または次回起動時に再試行します",
+        "동기화 실패. 설정 변경 시 또는 다음 실행 시 다시 시도합니다",
+        "同步失敗，將於變更設定或下次啟動時重試",
+    )
+    else -> lastSynced?.let {
+        val time = Instant.fromEpochMilliseconds(it).toLocalDateTime(TimeZone.currentSystemDefault())
+        val hh = time.hour.toString().padStart(2, '0')
+        val mm = time.minute.toString().padStart(2, '0')
+        tr(
+            "上次同步于 $hh:$mm",
+            "Last synced at $hh:$mm",
+            "最終同期 $hh:$mm",
+            "마지막 동기화 $hh:$mm",
+            "上次同步於 $hh:$mm",
+        )
+    } ?: tr("登录后自动同步", "Sync automatically after sign-in", "ログイン後に自動同期", "로그인 후 자동 동기화", "登入後自動同步")
+}
+
+/**
+ * 设置同步：开关与「立即同步」在同一行。立即同步只在开着时有意义，单独占一行是把一件事画成两件。
+ * 开着时说明是同步的状态，关着时说明它同步什么、存在哪。
+ */
+@Composable
+private fun SettingsSyncRow(
+    enabled: Boolean,
+    status: String,
+    onEnabledChange: (Boolean) -> Unit,
+    onSyncNow: () -> Unit,
+) {
+    SettingsSwitchRow(
+        icon = Icons.Outlined.CloudSync,
+        title = tr("同步设置", "Sync settings", "設定を同期", "설정 동기화", "同步設定"),
+        supporting = if (enabled) {
+            status
+        } else {
+            tr(
+                "将设置保存在网盘 .piko 文件夹中，在其他设备登录后自动同步",
+                "Save settings to the .piko folder in your drive and sync across devices",
+                "設定をドライブの .piko フォルダーに保存し、他の端末でログインした際に自動同期します",
+                "설정을 드라이브의 .piko 폴더에 저장하여 다른 기기에서 로그인 시 자동으로 동기화합니다",
+                "將設定儲存於雲端硬碟 .piko 資料夾中，於其他裝置登入後自動同步",
+            )
+        },
+        checked = enabled,
+        onCheckedChange = onEnabledChange,
+        extraTrailing = if (enabled) {
+            { TooltipIconButton(Icons.Outlined.Sync, tr("立即同步", "Sync now", "今すぐ同期", "지금 동기화", "立即同步"), onSyncNow) }
+        } else {
+            null
+        },
+    )
+}
+
+private enum class MetadataBackupJob { BACKUP, RESTORE }
+
+/** 服务层给的是稳定短码，这里翻成人话；认不出的直接显示原文，方便排查。 */
+private fun metadataFailureText(reason: String): String = when (reason) {
+    "not-signed-in" -> tr("未登录", "not signed in", "未ログイン", "로그인하지 않음", "尚未登入")
+    "no-library" -> tr(
+        "本机还没有索引库，请先扫描一次海报墙",
+        "No local index yet; scan the poster wall first",
+        "端末に索引がありません。先にポスターウォールをスキャンしてください",
+        "기기에 인덱스가 없습니다. 먼저 포스터 월을 스캔하세요",
+        "本機還沒有索引庫，請先掃描一次海報牆",
+    )
+    "newer-version" -> tr(
+        "备份来自更新版本的应用，请升级后再恢复",
+        "The backup comes from a newer app version; update before restoring",
+        "バックアップが新しいバージョンのものです。アプリを更新してから復元してください",
+        "백업이 더 새로운 버전의 앱에서 생성되었습니다. 업데이트 후 복원하세요",
+        "備份來自較新版本的應用程式，請更新後再還原",
+    )
+    "invalid-backup" -> tr(
+        "备份文件读不懂，可能已损坏",
+        "The backup file could not be parsed; it may be damaged",
+        "バックアップファイルを読み取れません。破損している可能性があります",
+        "백업 파일을 읽을 수 없습니다. 손상되었을 수 있습니다",
+        "備份檔案無法解析，可能已損壞",
+    )
+    else -> reason
+}

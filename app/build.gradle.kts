@@ -1,8 +1,14 @@
+import com.android.build.gradle.tasks.ProcessApplicationManifest
+import com.android.build.gradle.tasks.ProcessPackagedManifestTask
+import org.gradle.api.file.DirectoryProperty
+import javax.xml.parsers.DocumentBuilderFactory
+import org.w3c.dom.Document
+import org.w3c.dom.Element
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
     alias(libs.plugins.kotlin.serialization)
-    alias(libs.plugins.ksp)
 }
 
 // Release signing is injected by CI or a local release shell. Keeping the
@@ -25,9 +31,12 @@ val appVersionCode = providers.environmentVariable("PIKO_VERSION_CODE")
     .orElse(2001)
 require(appVersionCode.get() > 0) { "PIKO_VERSION_CODE must be greater than zero." }
 
+val isReleaseTaskRequested = gradle.startParameter.taskNames.any {
+    it.contains("Release", ignoreCase = true)
+}
 val enableAbiSplits = providers.gradleProperty("piko.enableAbiSplits")
     .map { it.toBoolean() }
-    .orElse(true)
+    .orElse(isReleaseTaskRequested)
 
 android {
     namespace = "dev.piko"
@@ -98,7 +107,7 @@ android {
 
     sourceSets {
         // 播放冒烟的样片与 generate.sh 在仓库根目录，JVM 与 Android 两边的测试共用
-        getByName("androidTest").assets.srcDir(rootProject.file("testdata/media"))
+        getByName("androidTest").assets.directories.add(rootProject.file("testdata/media").path)
     }
 
     packaging {
@@ -117,9 +126,16 @@ android {
     }
 }
 
+composeCompiler {
+    stabilityConfigurationFiles.add(rootProject.layout.projectDirectory.file("compose-stability.conf"))
+}
+
 dependencies {
-    // 状态与业务在 shared，界面在 ui；这里只剩 Activity 入口、平台实现与播放器
+    // 状态与业务在 shared，界面按职责拆在 ui-core、各领域叶模块与 ui；这里只剩 Activity 入口、平台实现与播放器
     implementation(project(":shared"))
+    implementation(project(":ui-core"))
+    implementation(project(":ui-player"))
+    implementation(project(":ui-transfers"))
     implementation(project(":ui"))
 
     // PikPak SDK (KMP)
@@ -139,7 +155,7 @@ dependencies {
     implementation(libs.androidx.lifecycle.process)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
 
-    // Compose (Material 3 Expressive 1.5.0-alpha28 via BOM)
+    // Compose (Material 3 Expressive 1.5.0-rc01 via compose-bom-beta)
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.ui.graphics)
@@ -183,4 +199,164 @@ dependencies {
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
     // 冒烟里要一个真实 Activity 挂 SurfaceView；它把 ComponentActivity 声明进 debug 清单
     debugImplementation(libs.androidx.compose.ui.test.manifest)
+}
+
+/**
+ * 防止无意间因库模块缺少 minSdk/targetSdk 声明或第三方传递依赖升级而自动注入高危敏感权限或放开不安全的清单属性。
+ */
+abstract class VerifyMergedManifestPermissionsTask : DefaultTask() {
+    @get:InputFile
+    @get:PathSensitive(PathSensitivity.NONE)
+    abstract val manifestFile: RegularFileProperty
+
+    @get:InputDirectory
+    @get:PathSensitive(PathSensitivity.RELATIVE)
+    abstract val packagedManifestsDir: DirectoryProperty
+
+    @get:Input
+    abstract val applicationId: Property<String>
+
+    @get:Input
+    abstract val allowDebuggable: Property<Boolean>
+
+    @TaskAction
+    fun verify() {
+        val packagedFiles = packagedManifestsDir.get().asFile.walkTopDown()
+            .filter { it.isFile && it.name == "AndroidManifest.xml" }
+            .sortedBy { it.invariantSeparatorsPath }
+            .toList()
+        if (packagedFiles.isEmpty()) {
+            throw GradleException("No packaged AndroidManifest.xml found under ${packagedManifestsDir.get().asFile}")
+        }
+        val appId = applicationId.get()
+        val dynamicReceiverPermission = "$appId.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION"
+        val expectedPermissions = setOf(
+            "android.permission.INTERNET",
+            "android.permission.ACCESS_NETWORK_STATE",
+            "android.permission.POST_NOTIFICATIONS",
+            "android.permission.FOREGROUND_SERVICE",
+            "android.permission.FOREGROUND_SERVICE_DATA_SYNC",
+            "android.permission.REQUEST_INSTALL_PACKAGES",
+            "android.permission.USE_BIOMETRIC",
+            dynamicReceiverPermission,
+        )
+        val allowDebug = allowDebuggable.get()
+        val builder = DocumentBuilderFactory.newInstance()
+            .apply { isNamespaceAware = true }
+            .newDocumentBuilder()
+        val allManifests = listOf(manifestFile.get().asFile) + packagedFiles
+        for (file in allManifests) {
+            val doc = builder.parse(file)
+            verifySingleManifest(doc, file.path, appId, dynamicReceiverPermission, expectedPermissions, allowDebug)
+        }
+    }
+
+    private fun verifySingleManifest(
+        doc: Document,
+        sourcePath: String,
+        appId: String,
+        dynamicReceiverPermission: String,
+        expectedPermissions: Set<String>,
+        allowDebug: Boolean,
+    ) {
+        val usesPermissions = collectNames(doc, "uses-permission")
+        if (usesPermissions != expectedPermissions) {
+            val unexpected = (usesPermissions - expectedPermissions).sorted()
+            val missing = (expectedPermissions - usesPermissions).sorted()
+            throw GradleException(
+                "Manifest uses-permission mismatch for $appId ($sourcePath): " +
+                    "unexpected=$unexpected, missing=$missing",
+            )
+        }
+        val sdk23Permissions = collectNames(doc, "uses-permission-sdk-23")
+        if (sdk23Permissions.isNotEmpty()) {
+            throw GradleException(
+                "Unexpected uses-permission-sdk-23 entries for $appId ($sourcePath): " +
+                    sdk23Permissions.sorted(),
+            )
+        }
+        val customPermissions = doc.getElementsByTagName("permission")
+        val declaredCustom = linkedSetOf<String>()
+        for (i in 0 until customPermissions.length) {
+            val element = customPermissions.item(i) as? Element ?: continue
+            val name = androidAttr(element, "name")
+            if (name != dynamicReceiverPermission) {
+                throw GradleException(
+                    "Unexpected <permission> declaration for $appId ($sourcePath): $name",
+                )
+            }
+            val protectionLevel = androidAttr(element, "protectionLevel")
+            if (protectionLevel != "signature") {
+                throw GradleException(
+                    "Permission $name must use protectionLevel=\"signature\" for $appId ($sourcePath), found \"$protectionLevel\"",
+                )
+            }
+            declaredCustom += name
+        }
+        if (dynamicReceiverPermission !in declaredCustom) {
+            throw GradleException(
+                "Missing <permission android:name=\"$dynamicReceiverPermission\"> for $appId ($sourcePath)",
+            )
+        }
+        val apps = doc.getElementsByTagName("application")
+        for (i in 0 until apps.length) {
+            val app = apps.item(i) as? Element ?: continue
+            if (androidAttr(app, "usesCleartextTraffic") == "true") {
+                throw GradleException("Disallowed android:usesCleartextTraffic=\"true\" for $appId ($sourcePath)")
+            }
+            if (!allowDebug && androidAttr(app, "debuggable") == "true") {
+                throw GradleException("Disallowed android:debuggable=\"true\" in release manifest for $appId ($sourcePath)")
+            }
+        }
+    }
+
+    private fun collectNames(doc: Document, tagName: String): Set<String> = buildSet {
+        val nodes = doc.getElementsByTagName(tagName)
+        for (i in 0 until nodes.length) {
+            val element = nodes.item(i) as? Element ?: continue
+            val name = androidAttr(element, "name")
+            if (name.isNotEmpty()) add(name)
+        }
+    }
+
+    private fun androidAttr(element: Element, attrName: String): String =
+        element.getAttributeNS("http://schemas.android.com/apk/res/android", attrName)
+            .ifEmpty { element.getAttribute("android:$attrName") }
+}
+
+val verifyDebugManifestPermissions = tasks.register<VerifyMergedManifestPermissionsTask>(
+    "verifyDebugManifestPermissions",
+) {
+    manifestFile.set(
+        tasks.named<ProcessApplicationManifest>("processDebugMainManifest").flatMap { it.mergedManifest },
+    )
+    packagedManifestsDir.set(
+        tasks.named<ProcessPackagedManifestTask>("processDebugManifestForPackage").flatMap { it.packageManifests },
+    )
+    applicationId.set("dev.piko.debug")
+    allowDebuggable.set(true)
+}
+
+val verifyReleaseManifestPermissions = tasks.register<VerifyMergedManifestPermissionsTask>(
+    "verifyReleaseManifestPermissions",
+) {
+    manifestFile.set(
+        tasks.named<ProcessApplicationManifest>("processReleaseMainManifest").flatMap { it.mergedManifest },
+    )
+    packagedManifestsDir.set(
+        tasks.named<ProcessPackagedManifestTask>("processReleaseManifestForPackage").flatMap { it.packageManifests },
+    )
+    // 上游写死 dev.piko；fork 的包名是 dev.piko.fork，权限名跟着 applicationId 走
+    applicationId.set("dev.piko.fork")
+    allowDebuggable.set(false)
+}
+
+tasks.matching { it.name == "check" }.configureEach {
+    dependsOn(verifyDebugManifestPermissions, verifyReleaseManifestPermissions)
+}
+tasks.matching { it.name == "assembleDebug" }.configureEach {
+    dependsOn(verifyDebugManifestPermissions)
+}
+tasks.matching { it.name == "assembleRelease" }.configureEach {
+    dependsOn(verifyReleaseManifestPermissions)
 }

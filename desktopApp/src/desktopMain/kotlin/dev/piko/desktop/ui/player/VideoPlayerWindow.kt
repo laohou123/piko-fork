@@ -6,7 +6,16 @@ import dev.piko.ui.ObserveMessages
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.CropSquare
+import androidx.compose.material.icons.filled.FilterNone
+import androidx.compose.material.icons.filled.PushPin
+import androidx.compose.material.icons.filled.Remove
+import androidx.compose.material.icons.outlined.PushPin
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.runtime.Composable
@@ -52,13 +61,19 @@ import dev.piko.desktop.TitleBarColors
 import dev.piko.desktop.TitleBarThemeEffect
 import dev.piko.desktop.WindowFrame
 import dev.piko.desktop.LinuxDesktop
+import dev.piko.desktop.LinuxFullscreen
+import dev.piko.desktop.ObserveLinuxFullscreenEffect
 import dev.piko.desktop.isLinux
 import dev.piko.desktop.isMacOs
 import dev.piko.desktop.rememberRememberedWindowState
+import dev.piko.desktop.winrt.SmtcActionListener
+import dev.piko.desktop.winrt.SmtcState
 import dev.piko.desktop.winrt.WinRTSupport
 import dev.piko.desktop.winrt.WindowsFullscreen
+import dev.piko.desktop.winrt.WindowsSmtcSession
 import dev.piko.shared.media.player.PlaybackBackend
 import dev.piko.shared.media.player.PlayerScreenState
+import dev.piko.shared.media.player.SubtitleStylePrefs
 import dev.piko.shared.i18n.PikoLocale
 import dev.piko.ui.LocalAppLanguage
 import dev.piko.ui.LocalPikoServices
@@ -66,10 +81,18 @@ import dev.piko.ui.PikoServices
 import dev.piko.ui.VideoPlayerRequest
 import dev.piko.ui.components.LocalPointerSource
 import dev.piko.ui.components.PointerSource
+import dev.piko.ui.components.TooltipIconButton
 import dev.piko.ui.components.trackInputModality
 import dev.piko.ui.components.trackPointerSource
+import dev.piko.ui.i18n.stringResource
 import dev.piko.ui.platform.LocalPikoPlatform
 import dev.piko.ui.platform.PikoPlatform
+import dev.piko.ui.resources.Res
+import dev.piko.ui.resources.player_maximize
+import dev.piko.ui.resources.player_minimize
+import dev.piko.ui.resources.player_restore
+import dev.piko.ui.screens.player.ListenScreen
+import dev.piko.ui.screens.player.LocalPlayerLayoutPrefs
 import dev.piko.ui.screens.player.MobilePlayerControls
 import dev.piko.ui.workbench.ShortcutsDialog
 import dev.piko.desktop.AwtDialogs
@@ -77,10 +100,13 @@ import dev.piko.ui.screens.player.rememberPlayerFileActions
 import kotlinx.coroutines.launch
 import dev.piko.ui.screens.player.PlayerLevelControl
 import dev.piko.ui.screens.player.PlayerTheme
-import dev.piko.ui.screens.player.PlayerTopBar
+import dev.piko.ui.screens.player.CustomizablePlayerTopBar
+import dev.piko.ui.screens.player.PlayerWindowActions
+import dev.piko.ui.screens.player.rememberScrubFrameCache
 import dev.piko.ui.screens.player.playlistOf
 import dev.piko.ui.screens.player.siblingMedia
 import dev.piko.ui.theme.Appearance
+import dev.piko.ui.theme.LocalWindowVisible
 import dev.piko.ui.theme.PikoTheme
 import dev.piko.shared.media.player.PLAYER_SUBTITLE_EXTENSIONS
 import dev.piko.shared.media.player.isPlayerSubtitleName
@@ -94,7 +120,6 @@ import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.filterNotNull
 import androidx.compose.runtime.snapshotFlow
-import kotlinx.coroutines.runBlocking
 import java.awt.KeyboardFocusManager
 import java.awt.Point
 import java.awt.Toolkit
@@ -102,7 +127,6 @@ import java.awt.Window
 import java.awt.image.BufferedImage
 import java.io.File
 import org.openani.mediamp.ExperimentalMediampApi
-import org.openani.mediamp.compose.MediampPlayerSurface
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -162,11 +186,13 @@ fun VideoPlayerWindow(
     var fallbackKeyHandler by remember { mutableStateOf<((KeyEvent) -> Boolean)?>(null) }
     val shortcutModifier = platform.shortcutModifier
 
+    val windowVisible = !windowState.isMinimized
     PikoWindow(
         onCloseRequest = requestClose,
         title = tr("$title - Piko 播放器", "$title - Piko Player", "$title - Pikoプレーヤー", "$title - Piko 플레이어", "$title - Piko 播放器"),
         icon = icon,
         state = windowState,
+        windowVisible = windowVisible,
         onPreviewKeyEvent = { event ->
             if (event.type == KeyEventType.KeyDown &&
                 (event.key == Key.F1 || (shortcutModifier.isPressed(event) && event.key == Key.Slash))
@@ -198,49 +224,108 @@ fun VideoPlayerWindow(
         DisposableEffect(windowId) {
             onDispose { services.onWindowClosed(windowId) }
         }
-        val fullscreen = remember(window) { WindowsFullscreen(window) }
-        // 播放窗口是独立的组合树，主窗口根部的输入来源追踪管不到这里；桌面端初始按鼠标/键盘落点就绪
+        val windowsFullscreen = remember(window) { if (WinRTSupport.isWindows) WindowsFullscreen(window) else null }
+        val linuxFullscreen = remember(window) { if (isLinux) LinuxFullscreen(window) else null }
+        ObserveLinuxFullscreenEffect(window, linuxFullscreen) { isFullscreen = it }
+        // 播放窗口是独立的组合树，主窗口根部的输入来源追踪与播放器布局偏好需要显式注入；桌面端初始按鼠标/键盘落点就绪
         val pointerSource = remember { PointerSource(initialTouchLike = false) }
         val effectiveLanguage by PikoLocale.effectiveLanguageState
+        val playerLayoutPrefs by services.preferences.playerLayoutPrefsFlow
+            .collectAsState(initial = services.preferences.currentSnapshot.playerLayout)
+        val driveAppearancePrefs by services.preferences.driveAppearancePrefsFlow
+            .collectAsState(initial = services.preferences.currentSnapshot.driveAppearance)
         CompositionLocalProvider(
             LocalAppLanguage provides effectiveLanguage,
             LocalPikoServices provides services,
             LocalPikoPlatform provides platform,
             LocalPointerSource provides pointerSource,
+            LocalWindowVisible provides windowVisible,
+            LocalPlayerLayoutPrefs provides playerLayoutPrefs,
+            dev.piko.ui.screens.drive.LocalDriveAppearancePrefs provides driveAppearancePrefs,
         ) {
-            // 只有 Windows 自己铺满屏幕（WindowsFullscreen），别处用系统的全屏
-            val usesSystemFullscreen = !WinRTSupport.isWindows
-            val inFullscreen = if (usesSystemFullscreen) windowState.placement == WindowPlacement.Fullscreen else isFullscreen
+            // Windows 走无边框全屏（WindowsFullscreen），Linux 优先走 X11 EWMH _NET_WM_STATE_FULLSCREEN（LinuxFullscreen），
+            // macOS 与 Linux 回退路径走 WindowPlacement.Fullscreen
+            val inFullscreen = isFullscreen || windowState.placement == WindowPlacement.Fullscreen
             PikoTheme(appearance = appearance) {
                 WindowFrame(
                     title = tr("$title - Piko 播放器", "$title - Piko Player", "$title - Pikoプレーヤー", "$title - Piko 플레이어", "$title - Piko 播放器"),
                     icon = icon,
                     colors = PlayerTitleBarColors,
-                    showTitleBar = !inFullscreen,
-                    // 播放器顶栏已有标题，Windows 上不再叠一条标题栏，关窗按钮放进顶栏
+                    // macOS 保留透明原生红绿灯，不再在内容上方叠第二条不透明标题栏；Windows 经 onCloseInContent 交给播放器顶栏
+                    // 全局快捷键弹窗打开时同样收起无边框拖动区，避免 Win32 HTCAPTION 拦截弹窗顶部点击
+                    showTitleBar = !inFullscreen && !isMacOs && !shortcutsOpen,
                     onCloseInContent = requestClose,
+                    immersiveFullscreen = inFullscreen,
                 ) {
+                    val toggleFullscreen = {
+                        when {
+                            windowsFullscreen != null -> {
+                                if (windowsFullscreen.isFullscreen) windowsFullscreen.exit() else windowsFullscreen.enter()
+                                isFullscreen = windowsFullscreen.isFullscreen
+                            }
+                            linuxFullscreen != null -> {
+                                // 优先经 X11 EWMH _NET_WM_STATE_FULLSCREEN 交由窗口管理器全屏，避免 AWT 独占全屏在 KDE/XWayland + GLX 下冻结；
+                                // 若 libX11 或 X11 句柄不可用则安全回退到 WindowPlacement.Fullscreen。
+                                if (windowState.placement == WindowPlacement.Fullscreen) {
+                                    windowState.placement = WindowPlacement.Floating
+                                } else if (linuxFullscreen.isFullscreen) {
+                                    if (linuxFullscreen.exit()) isFullscreen = false
+                                } else if (linuxFullscreen.enter()) {
+                                    isFullscreen = true
+                                } else {
+                                    windowState.placement = WindowPlacement.Fullscreen
+                                }
+                            }
+                            else -> {
+                                // macOS 走系统的全屏空间；按标题栏绿灯进出全屏时 placement 同样跟着变
+                                windowState.placement = if (windowState.placement == WindowPlacement.Fullscreen) {
+                                    WindowPlacement.Floating
+                                } else {
+                                    WindowPlacement.Fullscreen
+                                }
+                            }
+                        }
+                    }
+                    val framelessWindow = dev.piko.ui.platform.LocalFramelessWindow.current
+                    var alwaysOnTop by remember(window) { mutableStateOf(window.isAlwaysOnTop) }
+                    val effectiveAlwaysOnTop = framelessWindow?.isAlwaysOnTop ?: alwaysOnTop
+                    val windowActions = PlayerWindowActions(
+                        isMaximized = windowState.placement == WindowPlacement.Maximized,
+                        isFullscreen = inFullscreen,
+                        isAlwaysOnTop = effectiveAlwaysOnTop,
+                        showWindowButtons = WinRTSupport.isWindows,
+                        topChromePadding = if (isMacOs && !inFullscreen) 36.dp else 0.dp,
+                        onMinimize = { windowState.isMinimized = true },
+                        onToggleMaximize = {
+                            if (inFullscreen) {
+                                toggleFullscreen()
+                            } else {
+                                windowState.placement = if (windowState.placement == WindowPlacement.Maximized) {
+                                    WindowPlacement.Floating
+                                } else {
+                                    WindowPlacement.Maximized
+                                }
+                            }
+                        },
+                        onToggleAlwaysOnTop = {
+                            val next = !effectiveAlwaysOnTop
+                            if (framelessWindow != null) {
+                                framelessWindow.setAlwaysOnTop(next)
+                            } else {
+                                window.isAlwaysOnTop = next
+                            }
+                            alwaysOnTop = next
+                        },
+                        onClose = requestClose,
+                    )
                     VideoPlayerContent(
                         request = request,
                         services = services,
                         settings = settings,
                         window = window,
                         isFullscreen = inFullscreen,
-                        onToggleFullscreen = {
-                            if (usesSystemFullscreen) {
-                                // macOS 走系统的全屏空间，Linux 经 _NET_WM_STATE_FULLSCREEN 交给窗口管理器。
-                                // WindowsFullscreen 绕开的崩溃出在 Skiko 的 D3D 路径上，macOS 走 Metal、Linux 走 OpenGL，
-                                // 都不经过它；按标题栏绿灯进出全屏时 placement 同样跟着变
-                                windowState.placement = if (windowState.placement == WindowPlacement.Fullscreen) {
-                                    WindowPlacement.Floating
-                                } else {
-                                    WindowPlacement.Fullscreen
-                                }
-                            } else {
-                                if (fullscreen.isFullscreen) fullscreen.exit() else fullscreen.enter()
-                                isFullscreen = fullscreen.isFullscreen
-                            }
-                        },
+                        windowActions = windowActions,
+                        onToggleFullscreen = toggleFullscreen,
                         onTitleChange = { title = it },
                         onQuarterTurn = {
                             if (!inFullscreen && turnWindow(window, windowState)) windowTurned = !windowTurned
@@ -299,6 +384,7 @@ private fun VideoPlayerContent(
     settings: DesktopSettingsStore,
     window: ComposeWindow,
     isFullscreen: Boolean,
+    windowActions: PlayerWindowActions,
     onToggleFullscreen: () -> Unit,
     onTitleChange: (String) -> Unit,
     onQuarterTurn: () -> Unit,
@@ -312,10 +398,15 @@ private fun VideoPlayerContent(
     val playerJob = remember(request) { SupervisorJob() }
     val playerScope = remember(playerJob) { CoroutineScope(Dispatchers.Main.immediate + playerJob) }
     val player = remember(playerScope) { MediampPlayer(Unit, playerScope.coroutineContext) }
-    // 偏好是 StateFlow，first() 当场返回
-    val hardwareDecoding = remember { runBlocking { services.preferences.hardwareDecodingFlow.first() } }
+    // 从已预热的内存偏好快照无锁直取，不在组合首帧阻塞 EDT
+    val initialSnapshot = remember { services.preferences.currentSnapshot }
     val backend = remember(player) {
-        MediampPlaybackBackend(player, playerScope, hardwareDecoding = hardwareDecoding).also { created ->
+        MediampPlaybackBackend(
+            player,
+            playerScope,
+            hardwareDecoding = initialSnapshot.hardwareDecoding,
+            initialSubtitleStyle = initialSnapshot.subtitleStyle,
+        ).also { created ->
             // mpv 的音量在换文件时保留，只需在开窗时设一次
             settings.get(KEY_PLAYER_VOLUME).toFloatOrNull()?.let(created::setVolume)
         }
@@ -349,20 +440,36 @@ private fun VideoPlayerContent(
                         ?.takeIf { File(it).exists() }
             },
             defaultMaxHeight = { services.preferences.playbackMaxHeightFlow.first() },
+            aiSubtitleDecoder = dev.piko.desktop.media.DesktopAiSubtitlePcmDecoder(),
+            aiSubtitleVadFactory = { dev.piko.shared.media.player.JvmSileroVadLoader.create() },
+            initialAiSubtitleLanguage = initialSnapshot.aiSubtitleLanguage,
+            onPersistAiSubtitleLanguage = { services.preferences.setAiSubtitleLanguage(it) },
+            initialAiSubtitleOnDemand = initialSnapshot.aiSubtitleOnDemand,
+            onPersistAiSubtitleOnDemand = { services.preferences.setAiSubtitleOnDemand(it) },
+            initialAiSubtitleSavedSeconds = initialSnapshot.aiSubtitleSavedSeconds,
+            onAddAiSubtitleSavedSeconds = { services.preferences.addAiSubtitleSavedSeconds(it) },
         )
     }
+    val aiSubtitleState by state.aiSubtitleState.collectAsState()
     val volume = remember(backend) { Snapshot.withoutReadObservation { backend.volume }?.let { BackendVolume(backend) } }
-    val isSpoilerBlurEnabled by services.preferences.spoilerBlurFlow.collectAsState(initial = true)
+    val isSpoilerBlurEnabled by services.preferences.spoilerBlurFlow.collectAsState(
+        initial = services.preferences.currentSnapshot.spoilerBlurEnabled,
+    )
     val seekStepSeconds by services.preferences.playerSeekStepSecondsFlow
         .collectAsState(initial = PlayerGestureDefaults.SEEK_STEP_SECONDS)
     val longPressSpeed by services.preferences.playerBoostSpeedFlow.collectAsState(initial = PlayerGestureDefaults.BOOST_SPEED)
+    val subtitleStyle by services.preferences.subtitleStylePrefsFlow
+        .collectAsState(initial = initialSnapshot.subtitleStyle)
+    LaunchedEffect(backend, subtitleStyle) {
+        backend.setSubtitleStyle(subtitleStyle)
+    }
     val snackbarHostState = remember { SnackbarHostState() }
 
     LaunchedEffect(request) {
-        // 主界面给的只有视频，字幕文件总要自己列一次目录取
+        // 主界面给的只有视频，字幕文件总要自己列一次目录取；传入 currentFileId 以在单文件队列时回落到当前文件夹队列
         val siblings = services.driveRepository.siblingMedia(request.fileId)
         if (siblingVideos.isEmpty()) siblingVideos = siblings.videos
-        state.playlist = playlistOf(siblingVideos, services.preferences, siblings.subtitles)
+        state.playlist = playlistOf(siblingVideos, services.preferences, siblings.subtitles, currentFileId = request.fileId)
     }
 
     // 与 Android 相同：同目录元数据到了之后再验一次磁盘，下好的片子从当前位置换到本地文件
@@ -379,19 +486,74 @@ private fun VideoPlayerContent(
     // Linux 上 MediaMP 的画面经 GLX 与 Skiko 共享纹理，Skiko 退到软件渲染时（没有硬件 OpenGL，llvmpipe 也被它拒绝）
     // 画面一直是黑的，打开也不返回。说一句原因，免得用户对着黑屏等。渲染方式在窗口头几帧里才定下来
     if (isLinux) {
-        LaunchedEffect(window) {
-            delay(1_000)
-            if (window.renderApi.name.startsWith("SOFTWARE")) {
-                PikoLog.w("Player", "Skiko is using ${window.renderApi}; hardware OpenGL video rendering is unavailable on Linux")
+        LaunchedEffect(window, backend) {
+            delay(2_000)
+            if (window.renderApi.name.startsWith("SOFTWARE") && !hasActiveLinuxVideoSurface(backend.player)) {
+                PikoLog.w("Player", "Skiko is using ${window.renderApi} and GLX fallback surface is unavailable; unable to render video on Linux")
                 snackbarHostState.showSnackbar(tr("未检测到可用的硬件 OpenGL，无法渲染视频画面。请检查显卡驱动程序。", "Hardware OpenGL is unavailable; unable to render video. Check your graphics driver.", "利用可能なハードウェアOpenGLがないため映像を描画できません。グラフィックスドライバーを確認してください。", "사용 가능한 하드웨어 OpenGL이 없어 동영상을 렌더링할 수 없습니다. 그래픽 드라이버를 확인해 주세요.", "未偵測到可用的硬體 OpenGL，無法繪製影片畫面。請檢查顯示卡驅動程式。"), withDismissAction = true)
             }
         }
     }
 
-    // 播放防锁屏：正在播才持有，暂停与关窗时释放
-    DisposableEffect(state.isPlaying) {
+    var listenMode by remember(request) { mutableStateOf(false) }
+    val showListen = !state.isImage && (state.isAudioFile || listenMode)
+    LaunchedEffect(showListen) {
+        if (showListen && isFullscreen) onToggleFullscreen()
+    }
+
+    // Windows SMTC：将系统媒体卡片、键盘多媒体键与蓝牙耳机控制绑定到当前独立播放窗口
+    val smtcSession = remember(window, state) {
+        if (!WinRTSupport.isWindows) {
+            null
+        } else {
+            WindowsSmtcSession(
+                listener = object : SmtcActionListener {
+                    override fun onPlay() = state.play()
+                    override fun onPause() = state.pause()
+                    override fun onStop() = state.pause()
+                    override fun onNext() = state.playNext()
+                    override fun onPrevious() = state.playPrevious()
+                },
+            )
+        }
+    }
+    DisposableEffect(smtcSession, window) {
+        smtcSession?.attach(window)
+        onDispose { smtcSession?.close() }
+    }
+    LaunchedEffect(
+        smtcSession,
+        state.isImage,
+        state.isPlaying,
+        state.isLoading,
+        state.title,
+        state.currentEntry,
+        state.previousEntry,
+        state.nextEntry,
+        showListen,
+    ) {
+        val session = smtcSession ?: return@LaunchedEffect
+        val subtitle = state.currentEntry?.sectionLabel
+            ?.takeIf { it.isNotBlank() && it != state.title }
+            ?: "Piko"
+        session.sync(
+            SmtcState(
+                active = !state.isImage,
+                isPlaying = state.isPlaying,
+                isBuffering = state.isLoading,
+                title = state.title,
+                subtitle = subtitle,
+                canPrevious = state.previousEntry != null,
+                canNext = state.nextEntry != null,
+                isVideo = !showListen,
+            ),
+        )
+    }
+
+    // 播放防锁屏：仅观看视频画面且正在播时持有，听音频/暂停/关窗时释放
+    DisposableEffect(state.isPlaying, showListen) {
         val displayLease = when {
-            !state.isPlaying -> null
+            !state.isPlaying || showListen -> null
             isMacOs -> MacOs.preventSleep()
             isLinux -> LinuxDesktop.preventSleep()
             else -> WinRTSupport.acquireDisplayRequest()
@@ -458,16 +620,34 @@ private fun VideoPlayerContent(
                 modifier = Modifier.fillMaxSize(),
             )
             PlayerTheme {
-                PlayerTopBar(
+                CustomizablePlayerTopBar(
                     title = state.title,
                     episodeLabel = null,
                     isLocalPlayback = state.isLocalPlayback,
                     onBackClick = onClose,
+                    windowActions = windowActions,
                     modifier = Modifier.align(Alignment.TopCenter),
                 )
             }
+        } else if (showListen) {
+            // 纯音频文件或主动切入「听视频」：不挂载视频渲染表面以零 GPU 帧开销持续播放音频，切回视频无缝恢复画面
+            ListenScreen(
+                state = state,
+                onBackClick = { if (listenMode && !state.isAudioFile) listenMode = false else onClose() },
+                volumeControl = volume,
+                windowActions = { ListenWindowChromeButtons(windowActions) },
+                onSwitchToVideo = if (!state.isAudioFile) ({ listenMode = false }) else null,
+                topChromePadding = windowActions.topChromePadding,
+                showBackButton = false,
+                registerKeyFallback = registerKeyFallback,
+                modifier = Modifier.fillMaxSize(),
+            )
+            SnackbarHost(
+                hostState = snackbarHostState,
+                modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 16.dp),
+            )
         } else {
-            MediampPlayerSurface(backend.player, Modifier.fillMaxSize())
+            PikoMpvVideoSurface(backend.player, Modifier.fillMaxSize())
 
             val positionMillisProvider = remember(state) { { state.positionMillis } }
             val bufferedPositionMillisProvider = remember(state) { { state.bufferedPositionMillis } }
@@ -504,6 +684,24 @@ private fun VideoPlayerContent(
             val pickDriveSubtitle: (FileStat) -> Unit = remember(state) {
                 { file -> state.addDriveSubtitle(file.id, file.name) }
             }
+            val handleSubtitleStylePreview: (SubtitleStylePrefs) -> Unit = remember(backend) {
+                { backend.setSubtitleStyle(it) }
+            }
+            val handleSubtitleStyleChange: (SubtitleStylePrefs) -> Unit = remember(backend, scope, services.preferences) {
+                { updated ->
+                    val sanitized = updated.sanitize()
+                    backend.setSubtitleStyle(sanitized)
+                    scope.launch { services.preferences.setSubtitleStylePrefs(sanitized) }
+                }
+            }
+
+            val platform = LocalPikoPlatform.current
+            val scrubFrameCache = rememberScrubFrameCache(
+                state = state,
+                storyboardCache = services.storyboardCache,
+                mediaRepository = services.mediaRepository,
+                platform = platform,
+            )
 
             MobilePlayerControls(
                 title = state.title,
@@ -520,9 +718,18 @@ private fun VideoPlayerContent(
                 videoAspect = state.videoAspect,
                 qualityOptions = state.qualityOptions,
                 currentQuality = state.currentQuality,
+                autoResolvedQuality = state.autoResolvedQuality,
+                scrubFrameCache = scrubFrameCache,
+                originalSubtitleHints = state.originalSubtitleHints,
+                aiSubtitleState = aiSubtitleState,
+                onToggleAiSubtitles = state::setAiSubtitlesEnabled,
+                onSelectAiSubtitleLanguage = state::selectAiSubtitleLanguage,
+                onToggleAiSubtitleOnDemand = state::setAiSubtitleOnDemand,
                 errorMessage = state.errorMessage,
                 resumedFromMillis = state.resumedFromMillis,
                 onPlayPause = state::togglePlayPause,
+                onPausePlayback = state::pause,
+                onResumePlayback = state::play,
                 onSeek = state::seekTo,
                 onSpeedChange = state::setSpeed,
                 onAspectRatioChange = state::setAspectRatio,
@@ -564,7 +771,52 @@ private fun VideoPlayerContent(
                 onRotationChange = handleRotationChange,
                 onPickLocalSubtitle = pickLocalSubtitle.takeIf { state.canAddSubtitle },
                 onPickDriveSubtitle = pickDriveSubtitle.takeIf { state.canAddSubtitle },
+                subtitleStyle = subtitleStyle,
+                onSubtitleStylePreview = handleSubtitleStylePreview,
+                onSubtitleStyleChange = handleSubtitleStyleChange,
                 registerKeyFallback = registerKeyFallback,
+                windowActions = windowActions,
+                onSwitchToListen = { listenMode = true },
+            )
+        }
+    }
+}
+
+@Composable
+private fun RowScope.ListenWindowChromeButtons(windowActions: PlayerWindowActions) {
+    windowActions.onToggleAlwaysOnTop?.let { onPin ->
+        TooltipIconButton(
+            icon = if (windowActions.isAlwaysOnTop) Icons.Filled.PushPin else Icons.Outlined.PushPin,
+            label = if (windowActions.isAlwaysOnTop) {
+                tr("取消置顶", "Unpin", "最前面表示を解除", "고정 해제", "取消置頂")
+            } else {
+                tr("置顶", "Pin on top", "最前面に表示", "항상 위에 표시", "置頂")
+            },
+            onClick = onPin,
+            shortcut = "T",
+        )
+    }
+    if (windowActions.showWindowButtons) {
+        windowActions.onMinimize?.let { onMin ->
+            TooltipIconButton(
+                icon = Icons.Filled.Remove,
+                label = stringResource(Res.string.player_minimize),
+                onClick = onMin,
+            )
+        }
+        windowActions.onToggleMaximize?.let { onMax ->
+            val restored = windowActions.isMaximized || windowActions.isFullscreen
+            TooltipIconButton(
+                icon = if (restored) Icons.Filled.FilterNone else Icons.Filled.CropSquare,
+                label = stringResource(if (restored) Res.string.player_restore else Res.string.player_maximize),
+                onClick = onMax,
+            )
+        }
+        windowActions.onClose?.let { onClose ->
+            TooltipIconButton(
+                icon = Icons.Filled.Close,
+                label = tr("关闭", "Close", "閉じる", "닫기", "關閉"),
+                onClick = onClose,
             )
         }
     }

@@ -1,15 +1,24 @@
 package dev.piko.shared.preferences
 
 import dev.piko.data.auth.AppLanguage
+import dev.piko.data.auth.CachePolicyDefaults
+import dev.piko.data.auth.DownloadConcurrencyDefaults
+import dev.piko.data.auth.PikoPreferencesSnapshot
 import dev.piko.data.auth.PikoUserPreferences
 import dev.piko.data.auth.PlayerGestureDefaults
 import dev.piko.data.auth.SidePanelPrefs
 import dev.piko.data.auth.SnailMode
 import dev.piko.data.auth.VaultSizeFilter
 import dev.piko.data.auth.VaultSizeLimit
+import dev.piko.data.auth.accountPreferenceKey
 import dev.piko.shared.auth.SecretVault
+import dev.piko.shared.data.DriveAppearancePrefs
 import dev.piko.shared.i18n.tr
 import dev.piko.shared.log.PikoLog
+import dev.piko.shared.media.player.PlayerLayoutPrefs
+import dev.piko.shared.media.player.SubtitleStylePrefs
+import dev.piko.shared.media.player.decodePlayerLayoutPrefs
+import dev.piko.shared.media.player.encodePlayerLayoutPrefs
 import dev.piko.shared.net.ProxySetting
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
@@ -17,6 +26,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.onStart
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -48,6 +58,115 @@ class StoredPikoPreferences(
         clipAutoExtend.value = enabled
     }
 
+    private val clipVolume = MutableStateFlow(
+        settings.get(KEY_CLIP_VOLUME).toFloatOrNull()?.takeIf { it.isFinite() }?.coerceIn(0f, 1f) ?: 1f,
+    )
+    private val clipMuted = MutableStateFlow(settings.get(KEY_CLIP_MUTED) == "true")
+    override val clipVolumeFlow: Flow<Float> = clipVolume.asStateFlow()
+    override val clipMutedFlow: Flow<Boolean> = clipMuted.asStateFlow()
+    override suspend fun setClipAudio(volume: Float, muted: Boolean) {
+        val clamped = if (volume.isFinite()) volume.coerceIn(0f, 1f) else 1f
+        settings.set(KEY_CLIP_VOLUME, clamped.toString())
+        settings.set(KEY_CLIP_MUTED, muted.toString())
+        clipVolume.value = clamped
+        clipMuted.value = muted
+    }
+
+    private val playerLayout = MutableStateFlow(decodePlayerLayoutPrefs(settings.get(KEY_PLAYER_LAYOUT)))
+    override val playerLayoutPrefsFlow: Flow<PlayerLayoutPrefs> = playerLayout.asStateFlow()
+    override suspend fun setPlayerLayoutPrefs(prefs: PlayerLayoutPrefs) {
+        val sanitized = prefs.sanitize()
+        settings.set(KEY_PLAYER_LAYOUT, encodePlayerLayoutPrefs(sanitized))
+        playerLayout.value = sanitized
+    }
+
+    private val subtitleStyle = MutableStateFlow(SubtitleStylePrefs.decodeJson(settings.get(KEY_SUBTITLE_STYLE)))
+    override val subtitleStylePrefsFlow: Flow<SubtitleStylePrefs> = subtitleStyle.asStateFlow()
+    override suspend fun setSubtitleStylePrefs(prefs: SubtitleStylePrefs) {
+        val sanitized = prefs.sanitize()
+        settings.set(KEY_SUBTITLE_STYLE, sanitized.encodeJson())
+        subtitleStyle.value = sanitized
+    }
+
+    private val driveAppearance = MutableStateFlow(DriveAppearancePrefs.decodeJson(settings.get(KEY_DRIVE_APPEARANCE)))
+    override val driveAppearancePrefsFlow: Flow<DriveAppearancePrefs> = driveAppearance.asStateFlow()
+    override suspend fun setDriveAppearancePrefs(prefs: DriveAppearancePrefs) {
+        settings.set(KEY_DRIVE_APPEARANCE, prefs.encodeJson())
+        driveAppearance.value = prefs
+    }
+
+    private val skipFeedExitConfirm = MutableStateFlow(settings.get(KEY_SKIP_FEED_EXIT_CONFIRM) == "true")
+    override val skipFeedExitConfirmFlow: Flow<Boolean> = skipFeedExitConfirm.asStateFlow()
+    override suspend fun setSkipFeedExitConfirm(skip: Boolean) {
+        settings.set(KEY_SKIP_FEED_EXIT_CONFIRM, skip.toString())
+        skipFeedExitConfirm.value = skip
+    }
+
+    private val cacheMaxBytes = MutableStateFlow(
+        settings.get(KEY_CACHE_MAX_BYTES).toLongOrNull()?.coerceAtLeast(0L) ?: CachePolicyDefaults.DEFAULT_MAX_BYTES,
+    )
+    override val cacheMaxBytesFlow: Flow<Long> = cacheMaxBytes.asStateFlow()
+    override suspend fun setCacheMaxBytes(bytes: Long) {
+        val clamped = bytes.coerceAtLeast(0L)
+        settings.set(KEY_CACHE_MAX_BYTES, clamped.toString())
+        cacheMaxBytes.value = clamped
+    }
+
+    private val cacheMaxAgeDays = MutableStateFlow(
+        settings.get(KEY_CACHE_MAX_AGE_DAYS).toIntOrNull()?.coerceAtLeast(0) ?: CachePolicyDefaults.DEFAULT_MAX_AGE_DAYS,
+    )
+    override val cacheMaxAgeDaysFlow: Flow<Int> = cacheMaxAgeDays.asStateFlow()
+    override suspend fun setCacheMaxAgeDays(days: Int) {
+        val clamped = days.coerceAtLeast(0)
+        settings.set(KEY_CACHE_MAX_AGE_DAYS, clamped.toString())
+        cacheMaxAgeDays.value = clamped
+    }
+
+    private val playbackCacheEnabled = MutableStateFlow(settings.get(KEY_PLAYBACK_CACHE_ENABLED, "true") != "false")
+    override val playbackCacheEnabledFlow: Flow<Boolean> = playbackCacheEnabled.asStateFlow()
+    override suspend fun setPlaybackCacheEnabled(enabled: Boolean) {
+        settings.set(KEY_PLAYBACK_CACHE_ENABLED, enabled.toString())
+        playbackCacheEnabled.value = enabled
+    }
+
+    private val resumePlaybackEnabled = MutableStateFlow(settings.get(KEY_RESUME_PLAYBACK_ENABLED, "true") != "false")
+    override val resumePlaybackEnabledFlow: Flow<Boolean> = resumePlaybackEnabled.asStateFlow()
+    override suspend fun setResumePlaybackEnabled(enabled: Boolean) {
+        settings.set(KEY_RESUME_PLAYBACK_ENABLED, enabled.toString())
+        resumePlaybackEnabled.value = enabled
+    }
+
+    private val driveSortOrder = MutableStateFlow(settings.get("drive.sortOrder", "TIME_DESC").ifBlank { "TIME_DESC" })
+    override val driveSortOrderFlow: Flow<String> = driveSortOrder.asStateFlow()
+    override suspend fun setDriveSortOrder(order: String) {
+        val value = order.ifBlank { "TIME_DESC" }
+        settings.set("drive.sortOrder", value)
+        driveSortOrder.value = value
+    }
+
+    private val aiSubtitleLanguage = MutableStateFlow(settings.get("player.aiSubtitleLanguage"))
+    override val aiSubtitleLanguageFlow: Flow<String> = aiSubtitleLanguage.asStateFlow()
+    override suspend fun setAiSubtitleLanguage(language: String) {
+        settings.set("player.aiSubtitleLanguage", language)
+        aiSubtitleLanguage.value = language
+    }
+
+    private val aiSubtitleOnDemand = MutableStateFlow(settings.get("player.aiSubtitleOnDemand", "true").toBooleanStrictOrNull() ?: true)
+    override val aiSubtitleOnDemandFlow: Flow<Boolean> = aiSubtitleOnDemand.asStateFlow()
+    override suspend fun setAiSubtitleOnDemand(enabled: Boolean) {
+        settings.set("player.aiSubtitleOnDemand", enabled.toString())
+        aiSubtitleOnDemand.value = enabled
+    }
+
+    private val aiSubtitleSavedSeconds = MutableStateFlow(settings.get("player.aiSubtitleSavedSeconds", "0").toLongOrNull()?.coerceAtLeast(0L) ?: 0L)
+    override val aiSubtitleSavedSecondsFlow: Flow<Long> = aiSubtitleSavedSeconds.asStateFlow()
+    override suspend fun addAiSubtitleSavedSeconds(deltaSeconds: Long) {
+        if (deltaSeconds <= 0L) return
+        val next = aiSubtitleSavedSeconds.value + deltaSeconds
+        settings.set("player.aiSubtitleSavedSeconds", next.toString())
+        aiSubtitleSavedSeconds.value = next
+    }
+
     private val perFolderSort = MutableStateFlow(settings.get("drive.perFolderSort") == "true")
     override val perFolderSortFlow: Flow<Boolean> = perFolderSort.asStateFlow()
     override suspend fun setPerFolderSort(enabled: Boolean) {
@@ -76,13 +195,27 @@ class StoredPikoPreferences(
         localMounts.value = serialized
     }
 
-    private val spoiler = MutableStateFlow(settings.get(KEY_SPOILER, "true").toBoolean())
+    private val spoiler = MutableStateFlow(settings.get(KEY_SPOILER, "false").toBoolean())
     private val autoCheckUpdates = MutableStateFlow(settings.get(KEY_AUTO_CHECK_UPDATES, "true").toBoolean())
     private val autoDetectClipboardLinks = MutableStateFlow(settings.get("ui.autoDetectClipboardLinks") == "true")
     private val autoEnrichOnLaunch = MutableStateFlow(settings.get(KEY_AUTO_ENRICH_ON_LAUNCH, "true").toBoolean())
-    private val reduceMotion = MutableStateFlow(settings.get(KEY_REDUCE_MOTION) == "true")
+    private val reduceMotion = MutableStateFlow(
+        settings.get(KEY_MOTION_PREFERENCE).equals("Reduced", ignoreCase = true) ||
+            (settings.get(KEY_MOTION_PREFERENCE).isEmpty() && settings.get(KEY_REDUCE_MOTION) == "true"),
+    )
+    private val motionPreference = MutableStateFlow(
+        settings.get(KEY_MOTION_PREFERENCE).ifEmpty {
+            if (settings.get(KEY_REDUCE_MOTION) == "true") "Reduced" else null
+        },
+    )
+    private val predictiveBack = MutableStateFlow(settings.get(KEY_PREDICTIVE_BACK, "true") != "false")
+    private val maxConcurrentDownloads = MutableStateFlow(
+        DownloadConcurrencyDefaults.sanitize(settings.get(KEY_MAX_CONCURRENT_DOWNLOADS).toIntOrNull()),
+    )
     private val hardwareDecoding = MutableStateFlow(settings.get(KEY_HARDWARE_DECODING, "true").toBoolean())
-    private val playbackMaxHeight = MutableStateFlow(settings.get(KEY_PLAYBACK_MAX_HEIGHT).toIntOrNull() ?: 0)
+    private val playbackMaxHeight = MutableStateFlow(
+        settings.get(KEY_PLAYBACK_MAX_HEIGHT).toIntOrNull() ?: PlayerGestureDefaults.PLAYBACK_AUTO_HEIGHT,
+    )
     private val downloadMaxHeight = MutableStateFlow(settings.get(KEY_DOWNLOAD_MAX_HEIGHT).toIntOrNull())
     private val playerSeekStepSeconds = MutableStateFlow(
         settings.get(KEY_PLAYER_SEEK_STEP_SECONDS).toIntOrNull() ?: PlayerGestureDefaults.SEEK_STEP_SECONDS,
@@ -99,7 +232,22 @@ class StoredPikoPreferences(
     private val settingsSync = MutableStateFlow(settings.get(KEY_SETTINGS_SYNC, "true").toBoolean())
     private val syncPlayHistory = MutableStateFlow(settings.get(KEY_SYNC_PLAY_HISTORY, "true").toBoolean())
     private val themeMode = MutableStateFlow(settings.get(KEY_THEME_MODE).ifEmpty { null })
-    private val themeSeed = MutableStateFlow(settings.get(KEY_THEME_SEED).ifEmpty { null })
+    // 兼容旧版将水墨屏存成 themeSeed == "EINK" 的本机配置：平滑迁至设备本地开关 ui.einkMode，不再污染同步主题色
+    private val rawThemeSeed = settings.get(KEY_THEME_SEED).ifEmpty { null }
+    private val legacyEinkSeed = rawThemeSeed.equals("EINK", ignoreCase = true)
+    private val themeSeed = MutableStateFlow(rawThemeSeed.takeUnless { it.equals("EINK", ignoreCase = true) })
+    private val pureBlack = MutableStateFlow(settings.get(KEY_PURE_BLACK) == "true")
+    private val einkMode = MutableStateFlow(
+        when (val stored = settings.get(KEY_EINK_MODE)) {
+            "" -> legacyEinkSeed
+            else -> stored == "true"
+        },
+    ).also {
+        if (legacyEinkSeed) {
+            if (settings.get(KEY_EINK_MODE).isEmpty()) settings.set(KEY_EINK_MODE, "true")
+            settings.set(KEY_THEME_SEED, "")
+        }
+    }
     // 旧版只存了是否海报墙，没有新键时由它换算
     private val driveViewMode = MutableStateFlow(
         // 没选过时是海报墙，与 Android 相同；旧版只存了是否网格，明确关掉过的仍是列表
@@ -131,6 +279,7 @@ class StoredPikoPreferences(
     private val downloadPath = MutableStateFlow(
         settings.get(KEY_DOWNLOAD_DIR, settings.downloadDirectoryPath),
     )
+    private val askDownloadLocation = MutableStateFlow(settings.get(KEY_ASK_DOWNLOAD_LOCATION, "true") != "false")
 
     override suspend fun savePlaybackPosition(fileId: String, positionMs: Long) {
         settings.set(KEY_PLAYBACK_PREFIX + fileId, positionMs.toString())
@@ -186,6 +335,36 @@ class StoredPikoPreferences(
     override suspend fun setReduceMotion(enabled: Boolean) {
         settings.set(KEY_REDUCE_MOTION, enabled.toString())
         reduceMotion.value = enabled
+        if (enabled) {
+            settings.set(KEY_MOTION_PREFERENCE, "Reduced")
+            motionPreference.value = "Reduced"
+        } else if (motionPreference.value.equals("Reduced", ignoreCase = true)) {
+            settings.remove(KEY_MOTION_PREFERENCE)
+            motionPreference.value = null
+        }
+    }
+
+    override val motionPreferenceFlow: Flow<String?> = motionPreference.asStateFlow()
+    override suspend fun setMotionPreference(style: String?) {
+        val cleaned = style?.trim()?.takeIf { it.isNotEmpty() }
+        val isReduced = cleaned.equals("Reduced", ignoreCase = true)
+        if (cleaned == null) settings.remove(KEY_MOTION_PREFERENCE) else settings.set(KEY_MOTION_PREFERENCE, cleaned)
+        settings.set(KEY_REDUCE_MOTION, isReduced.toString())
+        motionPreference.value = cleaned
+        reduceMotion.value = isReduced
+    }
+
+    override val predictiveBackFlow: Flow<Boolean> = predictiveBack.asStateFlow()
+    override suspend fun setPredictiveBack(enabled: Boolean) {
+        settings.set(KEY_PREDICTIVE_BACK, enabled.toString())
+        predictiveBack.value = enabled
+    }
+
+    override val maxConcurrentDownloadsFlow: Flow<Int> = maxConcurrentDownloads.asStateFlow()
+    override suspend fun setMaxConcurrentDownloads(count: Int) {
+        val clamped = DownloadConcurrencyDefaults.sanitize(count)
+        settings.set(KEY_MAX_CONCURRENT_DOWNLOADS, clamped.toString())
+        maxConcurrentDownloads.value = clamped
     }
 
     override val hardwareDecodingFlow: Flow<Boolean> = hardwareDecoding.asStateFlow()
@@ -274,9 +453,63 @@ class StoredPikoPreferences(
 
     override val themeSeedFlow: Flow<String?> = themeSeed.asStateFlow()
     override suspend fun setThemeSeed(seed: String?) {
-        settings.set(KEY_THEME_SEED, seed.orEmpty())
-        themeSeed.value = seed
+        val sanitized = seed?.takeUnless { it.equals("EINK", ignoreCase = true) }
+        settings.set(KEY_THEME_SEED, sanitized.orEmpty())
+        themeSeed.value = sanitized
     }
+
+    override val pureBlackFlow: Flow<Boolean> = pureBlack.asStateFlow()
+    override suspend fun setPureBlack(enabled: Boolean) {
+        settings.set(KEY_PURE_BLACK, enabled.toString())
+        pureBlack.value = enabled
+    }
+
+    override val einkModeFlow: Flow<Boolean> = einkMode.asStateFlow()
+    override suspend fun setEinkMode(enabled: Boolean) {
+        settings.set(KEY_EINK_MODE, enabled.toString())
+        einkMode.value = enabled
+    }
+
+    override val currentSnapshot: PikoPreferencesSnapshot
+        get() = PikoPreferencesSnapshot(
+            appLanguage = language.value,
+            themeMode = themeMode.value,
+            themeSeed = themeSeed.value,
+            pureBlack = pureBlack.value,
+            einkMode = einkMode.value,
+            spoilerBlurEnabled = spoiler.value,
+            reduceMotion = reduceMotion.value,
+            motionPreference = motionPreference.value,
+            predictiveBack = predictiveBack.value,
+            maxConcurrentDownloads = maxConcurrentDownloads.value,
+            hardwareDecoding = hardwareDecoding.value,
+            playbackMaxHeight = playbackMaxHeight.value,
+            driveViewMode = driveViewMode.value,
+            driveSortOrder = driveSortOrder.value,
+            foldersFirst = foldersFirst.value,
+            perFolderSort = perFolderSort.value,
+            aiSubtitleLanguage = aiSubtitleLanguage.value,
+            aiSubtitleOnDemand = aiSubtitleOnDemand.value,
+            aiSubtitleSavedSeconds = aiSubtitleSavedSeconds.value,
+            galleryShowImages = galleryShowImages.value,
+            sidebarCollapsed = sidebarCollapsed.value,
+            showExtensions = showExtensions.value,
+            proxySetting = proxySetting.value,
+            tileSizes = tileSizes.value.mapValues { it.value.value },
+            playerLayout = playerLayout.value,
+            subtitleStyle = subtitleStyle.value,
+            driveAppearance = driveAppearance.value,
+            skipFeedExitConfirm = skipFeedExitConfirm.value,
+            cacheMaxBytes = cacheMaxBytes.value,
+            cacheMaxAgeDays = cacheMaxAgeDays.value,
+            playbackCacheEnabled = playbackCacheEnabled.value,
+            resumePlaybackEnabled = resumePlaybackEnabled.value,
+            askDownloadLocation = askDownloadLocation.value,
+            clipVolume = clipVolume.value,
+            clipMuted = clipMuted.value,
+        )
+
+    override fun currentTileSize(view: String): String = tileSize(view).value
 
     override val driveViewModeFlow: Flow<String> = driveViewMode.asStateFlow()
     override suspend fun setDriveViewMode(mode: String) {
@@ -348,6 +581,12 @@ class StoredPikoPreferences(
     }
 
     override suspend fun getDownloadDirPath(): String = downloadPath.value
+
+    override val askDownloadLocationFlow: Flow<Boolean> = askDownloadLocation.asStateFlow()
+    override suspend fun setAskDownloadLocation(enabled: Boolean) {
+        settings.set(KEY_ASK_DOWNLOAD_LOCATION, enabled.toString())
+        askDownloadLocation.value = enabled
+    }
 
     override suspend fun loadDownloadTasks(): String = settings.get(KEY_DOWNLOAD_TASKS)
 
@@ -457,6 +696,27 @@ class StoredPikoPreferences(
     override suspend fun setMetaTubeUrl(url: String) {
         settings.set(KEY_METATUBE_URL, url)
         metaTubeUrl.value = url
+    }
+
+    private val metaTubeUrlsByAccount = MutableStateFlow<Map<String, MutableStateFlow<String>>>(emptyMap())
+
+    private fun metaTubeUrlState(account: String): MutableStateFlow<String> {
+        while (true) {
+            val current = metaTubeUrlsByAccount.value
+            current[account]?.let { return it }
+            val created = MutableStateFlow(settings.get(metaTubeUrlAccountKey(account)))
+            if (metaTubeUrlsByAccount.compareAndSet(current, current + (account to created))) return created
+        }
+    }
+
+    override fun metaTubeUrlFlowFor(account: String): Flow<String> =
+        if (account.isBlank()) flowOf("") else metaTubeUrlState(account).asStateFlow()
+
+    override suspend fun setMetaTubeUrlFor(account: String, url: String) {
+        if (account.isBlank()) return
+        val key = metaTubeUrlAccountKey(account)
+        if (url.isEmpty()) settings.remove(key) else settings.set(key, url)
+        metaTubeUrlState(account).value = url
     }
 
     /** null 是还没从保管处读出来。读不出来时当作没填，与解压密码同一取舍。 */
@@ -598,6 +858,43 @@ class StoredPikoPreferences(
         settings.set(KEY_TRANSLATION_CONCURRENCY, count.toString())
         translationConcurrency.value = count
     }
+    private val metaTubeTokensByAccount = MutableStateFlow<Map<String, MutableStateFlow<String?>>>(emptyMap())
+
+    private fun metaTubeTokenState(account: String): MutableStateFlow<String?> {
+        while (true) {
+            val current = metaTubeTokensByAccount.value
+            current[account]?.let { return it }
+            val created = MutableStateFlow<String?>(null)
+            if (metaTubeTokensByAccount.compareAndSet(current, current + (account to created))) return created
+        }
+    }
+
+    override fun metaTubeTokenFlowFor(account: String): Flow<String> {
+        if (account.isBlank()) return flowOf("")
+        val state = metaTubeTokenState(account)
+        val secretKey = metaTubeTokenAccountKey(account)
+        return state.onStart {
+            if (state.value == null) {
+                val stored = withSecrets { runCatching { secrets.read(secretKey)?.decodeToString() } }
+                state.compareAndSet(
+                    null,
+                    stored.onFailure { PikoLog.w(TAG, "Failed to read per-account MetaTube token from secret vault", it) }
+                        .getOrNull().orEmpty(),
+                )
+            }
+        }.filterNotNull()
+    }
+
+    override suspend fun setMetaTubeTokenFor(account: String, token: String) {
+        if (account.isBlank()) return
+        val secretKey = metaTubeTokenAccountKey(account)
+        withSecrets {
+            runCatching {
+                if (token.isEmpty()) secrets.delete(secretKey) else secrets.write(secretKey, token.encodeToByteArray())
+            }.onFailure { PikoLog.w(TAG, "Failed to update per-account MetaTube token in secret vault", it) }.getOrThrow()
+        }
+        metaTubeTokenState(account).value = token
+    }
 
     private companion object {
         const val TAG = "Credentials"
@@ -615,6 +912,8 @@ class StoredPikoPreferences(
         const val KEY_POSTER_PREVIEW_MAX_HEIGHT = "ui.posterPreviewMaxHeight"
         const val KEY_VAULT_SIZE_FILTER = "ui.vaultSizeFilter"
         const val KEY_VAULT_SIZE_LIMIT_GB = "ui.vaultSizeLimitGb"
+        fun metaTubeUrlAccountKey(account: String) = "$KEY_METATUBE_URL.${accountPreferenceKey(account)}"
+        fun metaTubeTokenAccountKey(account: String) = "$SECRET_METATUBE_TOKEN-${accountPreferenceKey(account)}"
         const val KEY_SAVE_AS_REFERENCE = "instant.saveAsReference"
         const val KEY_FOLDERS_FIRST = "drive.foldersFirst"
 
@@ -637,12 +936,25 @@ class StoredPikoPreferences(
         const val KEY_AUTO_CHECK_UPDATES = "update.autoCheck"
         const val KEY_AUTO_ENRICH_ON_LAUNCH = "poster.autoEnrichOnLaunch"
         const val KEY_REDUCE_MOTION = "ui.reduceMotion"
+        const val KEY_MOTION_PREFERENCE = "ui.motionPreference"
+        const val KEY_PREDICTIVE_BACK = "ui.predictiveBack"
+        const val KEY_MAX_CONCURRENT_DOWNLOADS = "download.maxConcurrent"
         const val KEY_HARDWARE_DECODING = "player.hardwareDecoding"
         const val KEY_PLAYBACK_MAX_HEIGHT = "player.maxHeight"
         // 不沿用开发期的 download.maxHeight，理由同 Android 的 DOWNLOAD_MAX_HEIGHT
         const val KEY_DOWNLOAD_MAX_HEIGHT = "download.defaultMaxHeight"
         const val KEY_PLAYER_SEEK_STEP_SECONDS = "player.seekStepSeconds"
         const val KEY_PLAYER_BOOST_SPEED = "player.boostSpeed"
+        const val KEY_CLIP_VOLUME = "player.clipVolume"
+        const val KEY_CLIP_MUTED = "player.clipMuted"
+        const val KEY_PLAYER_LAYOUT = "player.layout"
+        const val KEY_SUBTITLE_STYLE = "player.subtitleStyle"
+        const val KEY_DRIVE_APPEARANCE = "drive.appearance"
+        const val KEY_SKIP_FEED_EXIT_CONFIRM = "ui.skipFeedExitConfirm"
+        const val KEY_CACHE_MAX_BYTES = "cache.maxBytes"
+        const val KEY_CACHE_MAX_AGE_DAYS = "cache.maxAgeDays"
+        const val KEY_PLAYBACK_CACHE_ENABLED = "cache.playbackEnabled"
+        const val KEY_RESUME_PLAYBACK_ENABLED = "player.resumePlayback"
         const val KEY_FOLDER_MAP_OPEN = "ui.folderMapOpen"
         const val KEY_FOLDER_MAP_PINNED = "ui.folderMapPinned"
         const val KEY_HEURISTIC = "ui.heuristicFilter"
@@ -665,7 +977,10 @@ class StoredPikoPreferences(
         // 沿用 Fluent 版设置页的键，旧值是小写的 system、light、dark，解析时不分大小写
         const val KEY_THEME_MODE = "themeMode"
         const val KEY_THEME_SEED = "ui.themeSeed"
+        const val KEY_PURE_BLACK = "ui.pureBlack"
+        const val KEY_EINK_MODE = "ui.einkMode"
         const val KEY_DOWNLOAD_DIR = "download.directory"
+        const val KEY_ASK_DOWNLOAD_LOCATION = "download.askLocation"
         const val KEY_LAST_FOLDER_ID = "drive.lastFolderId"
         const val KEY_LAST_FOLDER_NAME = "drive.lastFolderName"
         const val KEY_LAST_FOLDER_STACK = "drive.lastFolderStack"
